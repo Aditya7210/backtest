@@ -187,6 +187,7 @@ def execute_backtest_dataframe(
     cerebro.adddata(data_feed)
     cerebro.addstrategy(strategy_class)
     cerebro.addanalyzer(_TradeEventAnalyzer, _name="trade_events")
+    cerebro.addanalyzer(_ClosedTradesAnalyzer, _name="closed_trades")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trade_stats")
     cerebro.broker.setcash(initial_capital)
     cerebro.broker.setcommission(commission=commission)
@@ -196,11 +197,25 @@ def execute_backtest_dataframe(
         raise RuntimeError(f"Strategy execution failed: {exc}") from exc
 
     strategy_instance = results[0] if results else None
+    trade_events: list[str] = []
+    closed_trades: list[dict[str, Any]] = []
     if strategy_instance is not None:
         try:
-            trade_events = strategy_instance.analyzers.trade_events.get_analysis()
+            raw_events = strategy_instance.analyzers.trade_events.get_analysis()
         except Exception:
-            trade_events = []
+            raw_events = []
+        if isinstance(raw_events, list):
+            trade_events = [str(item) for item in raw_events]
+
+        try:
+            raw_closed_trades = strategy_instance.analyzers.closed_trades.get_analysis()
+        except Exception:
+            raw_closed_trades = []
+        if isinstance(raw_closed_trades, list):
+            for row in raw_closed_trades:
+                if isinstance(row, dict):
+                    closed_trades.append(dict(row))
+
         if isinstance(trade_events, list):
             for event in trade_events[:40]:
                 _log_terminal(
@@ -240,8 +255,18 @@ def execute_backtest_dataframe(
         symbol=symbol,
     )
 
-    log_file = _write_log(symbol=symbol, final_value=final_value, config=config)
-    return build_success_result(symbol=symbol, final_value=final_value, log_file=str(log_file))
+    artifacts = _write_dashboard_artifacts(
+        symbol=symbol,
+        final_value=final_value,
+        config=config,
+        trade_events=trade_events,
+        closed_trades=closed_trades,
+    )
+    return build_success_result(
+        symbol=symbol,
+        final_value=final_value,
+        log_file=str(artifacts["log_file"]),
+    )
 
 
 class _TradeEventAnalyzer(bt.Analyzer):
@@ -268,6 +293,48 @@ class _TradeEventAnalyzer(bt.Analyzer):
         return self.events
 
 
+class _ClosedTradesAnalyzer(bt.Analyzer):
+    def start(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+        self._open_dirs: dict[int, str] = {}
+        self._open_qty: dict[int, int] = {}
+
+    def notify_trade(self, trade: Any) -> None:
+        try:
+            if trade.justopened:
+                direction = "BUY" if float(trade.size) > 0 else "SELL"
+                self._open_dirs[int(trade.ref)] = direction
+                self._open_qty[int(trade.ref)] = max(1, int(abs(float(trade.size))))
+
+            if not trade.isclosed:
+                return
+
+            trade_ref = int(trade.ref)
+            direction = self._open_dirs.pop(trade_ref, "BUY")
+            qty = self._open_qty.pop(trade_ref, 1)
+            entry_px = float(trade.price)
+            exit_px = (float(trade.pnl) / qty + entry_px) if qty > 0 else entry_px
+
+            self.rows.append(
+                {
+                    "Entry Date": bt.num2date(trade.dtopen).strftime("%Y-%m-%d %H:%M:%S"),
+                    "Close Date": bt.num2date(trade.dtclose).strftime("%Y-%m-%d %H:%M:%S"),
+                    "Symbol": "",
+                    "Direction": direction,
+                    "Qty": qty,
+                    "Entry Price": round(entry_px, 2),
+                    "Exit Price": round(exit_px, 2),
+                    "Gross P&L": round(float(trade.pnl), 2),
+                    "Net P&L": round(float(trade.pnlcomm), 2),
+                }
+            )
+        except Exception:
+            return
+
+    def get_analysis(self) -> list[dict[str, Any]]:
+        return self.rows
+
+
 def _log_terminal(
     terminal: Any | None,
     message: str,
@@ -284,7 +351,14 @@ def _log_terminal(
         pass
 
 
-def _write_log(*, symbol: str, final_value: float, config: dict[str, float]) -> Path:
+def _write_dashboard_artifacts(
+    *,
+    symbol: str,
+    final_value: float,
+    config: dict[str, float],
+    trade_events: list[str],
+    closed_trades: list[dict[str, Any]],
+) -> dict[str, Path]:
     log_dir = (
         Path(__file__).resolve().parents[1]
         / "Data"
@@ -296,7 +370,28 @@ def _write_log(*, symbol: str, final_value: float, config: dict[str, float]) -> 
     safe_symbol = "".join(ch for ch in symbol if ch.isalnum() or ch in {"_", "-"})
     safe_symbol = safe_symbol or "UNKNOWN"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    log_path = log_dir / f"{safe_symbol}_execution_{timestamp}.log"
+    result_path = log_dir / f"{safe_symbol}_result_{timestamp}.csv"
+    log_path = log_dir / f"{safe_symbol}_log_{timestamp}.log"
+
+    trade_columns = [
+        "Entry Date",
+        "Close Date",
+        "Symbol",
+        "Direction",
+        "Qty",
+        "Entry Price",
+        "Exit Price",
+        "Gross P&L",
+        "Net P&L",
+    ]
+    normalized_rows = []
+    for row in closed_trades:
+        normalized = {column: row.get(column) for column in trade_columns}
+        normalized["Symbol"] = symbol
+        normalized_rows.append(normalized)
+    pd.DataFrame(normalized_rows, columns=trade_columns).to_csv(result_path, index=False)
+
+    event_lines = trade_events if trade_events else ["No trade events captured."]
     log_path.write_text(
         "\n".join(
             [
@@ -304,11 +399,15 @@ def _write_log(*, symbol: str, final_value: float, config: dict[str, float]) -> 
                 f"final_value={final_value}",
                 f"initial_capital={config['initial_capital']}",
                 f"commission={config['commission']}",
+                f"total_closed_trades={len(normalized_rows)}",
+                "",
+                "trade_events:",
+                *event_lines,
             ]
         ),
         encoding="utf-8",
     )
-    return log_path
+    return {"result_file": result_path, "log_file": log_path}
 
 
 def _write_error_log(*, symbol: str, error: str) -> Path:

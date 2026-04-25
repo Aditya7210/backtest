@@ -2,13 +2,21 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime
+from datetime import timedelta, timezone
 from html import escape
 from threading import RLock
 from typing import Literal, TypedDict
+from zoneinfo import ZoneInfo
 
 
 LogLevel = Literal["INFO", "SUCCESS", "ERROR", "WARNING"]
 _VALID_LEVELS: tuple[LogLevel, ...] = ("INFO", "SUCCESS", "ERROR", "WARNING")
+_IST_FALLBACK = timezone(timedelta(hours=5, minutes=30))
+
+try:
+    _IST_TZ = ZoneInfo("Asia/Kolkata")
+except Exception:
+    _IST_TZ = _IST_FALLBACK
 
 LEVEL_COLORS: dict[LogLevel, str] = {
     "INFO": "#AAB3BC",
@@ -39,7 +47,7 @@ class ExecutionTerminal:
         task_id: str | None = None,
         symbol: str | None = None,
     ) -> TerminalLogEntry:
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = datetime.now(_IST_TZ).strftime("%H:%M:%S")
         normalized_level = self._normalize_level(level)
         normalized_message = str(message or "").strip() or "(empty message)"
         normalized_task_id = str(task_id).strip() if task_id else None

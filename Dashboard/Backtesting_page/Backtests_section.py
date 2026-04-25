@@ -185,6 +185,10 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("execution_manager", None)
     st.session_state.setdefault("execution_task_states", {})
     st.session_state.setdefault("_execution_last_refresh_ts", 0.0)
+    st.session_state.setdefault("bt_initial_capital", 100000.0)
+    st.session_state.setdefault("bt_commission", 0.0003)
+    st.session_state.setdefault("bt_max_retries", 1)
+    st.session_state.setdefault("bt_task_timeout_seconds", 300)
     st.session_state.setdefault("instrument_mapper_bootstrap_done", False)
     st.session_state.setdefault("instrument_mapper_bootstrap_ok", True)
     st.session_state.setdefault("instrument_mapper_bootstrap_message", "")
@@ -254,10 +258,18 @@ def _process_execution_queue_tick() -> None:
 
         manager = ExecutionManager(
             {
-                "initial_capital": 100000,
-                "commission": 0.0003,
-                "max_retries": 1,
-                "task_timeout_seconds": 300,
+                "initial_capital": float(
+                    st.session_state.get("bt_initial_capital", 100000.0)
+                ),
+                "commission": float(
+                    st.session_state.get("bt_commission", 0.0003)
+                ),
+                "max_retries": int(
+                    st.session_state.get("bt_max_retries", 1)
+                ),
+                "task_timeout_seconds": float(
+                    st.session_state.get("bt_task_timeout_seconds", 300)
+                ),
             },
             terminal=_get_execution_terminal(),
         )
@@ -998,6 +1010,43 @@ def render() -> None:
                 )
                 st.caption("When enabled, Save creates a new versioned strategy file.")
 
+            with st.expander("Execution Config"):
+                cfg_col1, cfg_col2 = st.columns(2, gap="small")
+                with cfg_col1:
+                    st.number_input(
+                        "Initial Capital",
+                        min_value=1.0,
+                        step=1000.0,
+                        format="%.2f",
+                        key="bt_initial_capital",
+                        help="Starting portfolio value used by the backtest engine.",
+                    )
+                    st.number_input(
+                        "Max Retries",
+                        min_value=0,
+                        max_value=10,
+                        step=1,
+                        key="bt_max_retries",
+                        help="Retries per task after a failed execution attempt.",
+                    )
+                with cfg_col2:
+                    st.number_input(
+                        "Commission",
+                        min_value=0.0,
+                        step=0.0001,
+                        format="%.4f",
+                        key="bt_commission",
+                        help="Broker commission applied by Backtrader.",
+                    )
+                    st.number_input(
+                        "Task Timeout (seconds)",
+                        min_value=10,
+                        max_value=7200,
+                        step=10,
+                        key="bt_task_timeout_seconds",
+                        help="Maximum allowed runtime per task.",
+                    )
+
             data_mode = st.session_state.get("data_mode", "csv")
             queue_count = len(st.session_state.get("zerodha_queue", []))
             csv_count = len(st.session_state.get("selected_data_files", []))
@@ -1042,10 +1091,18 @@ def render() -> None:
                             task["strategy_class_name"] = str(selected_class_name)
 
                         config = {
-                            "initial_capital": 100000,
-                            "commission": 0.0003,
-                            "max_retries": 1,
-                            "task_timeout_seconds": 300,
+                            "initial_capital": float(
+                                st.session_state.get("bt_initial_capital", 100000.0)
+                            ),
+                            "commission": float(
+                                st.session_state.get("bt_commission", 0.0003)
+                            ),
+                            "max_retries": int(
+                                st.session_state.get("bt_max_retries", 1)
+                            ),
+                            "task_timeout_seconds": float(
+                                st.session_state.get("bt_task_timeout_seconds", 300)
+                            ),
                         }
                         _start_execution_job(tasks, config)
                     except Exception as exc:

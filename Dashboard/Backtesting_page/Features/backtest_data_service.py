@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import pandas as pd
@@ -302,12 +304,21 @@ def load_strategy_class(strategy_file_path: str, class_name: str) -> type[Any]:
     if not resolved_path.is_file():
         raise ValueError(f"Strategy file not found: {strategy_file_path}")
 
-    spec = importlib.util.spec_from_file_location("strategy_module", resolved_path)
+    module_name = (
+        "strategy_module_"
+        + hashlib.sha1(str(resolved_path).encode("utf-8")).hexdigest()
+    )
+    spec = importlib.util.spec_from_file_location(module_name, resolved_path)
     if spec is None or spec.loader is None:
         raise ValueError("Unable to load strategy module")
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
 
     if not hasattr(module, class_name):
         raise ValueError(f"Strategy class '{class_name}' not found")
