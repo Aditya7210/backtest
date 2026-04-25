@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  algo_trading:
+    build: .
+    container_name: algo_trading_app
+    working_dir: /app
+    env_file:
+      - .env
+
+    # WSLg display forwarding (run docker-compose from Ubuntu WSL terminal)
+    environment:
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+
+    volumes:
+      # Mount project folder so file changes reflect instantly (no rebuild needed)
+      - .:/app
+      - ~/.skills:/root/.skills
+      # WSLg sockets for GUI forwarding
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /mnt/wslg:/mnt/wslg
+
+    ports:
+      # Expose Streamlit port
+      - "8501:8501"
+
+    # Keep container running so you can exec into it
+    stdin_open: true
+    tty: true

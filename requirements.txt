@@ -1,0 +1,42 @@
+#For Back Testing
+backtrader
+#For Charting
+matplotlib
+#Essential for data manipulation, calculations, and preprocessing.
+pandas
+numpy
+#For Fast, Developer-Friendly Logging
+loguru
+#Zerodha kite connect for live algo trading
+kiteconnect
+#For making HTTP requests
+requests
+#For fetching data from NSE
+jugaad-data
+#For interactive charts
+plotly
+#For technical analysis
+ta-lib
+#For building web applications
+streamlit
+#For fetching data from Yahoo Finance
+yfinance
+#For fast, developer-friendly linting
+ruff
+#For fast, developer-friendly formatting
+black
+
+# ==========================================
+# PHASE 2: UI UPGRADE COMPONENTS
+# ==========================================
+streamlit-elements
+streamlit-option-menu
+streamlit-extras
+streamlit-shadcn-ui
+streamlit-toggle-switch
+streamlit-ace
+
+#Watchdog to check updates in files
+watchdog
+#Lib to run .env file
+python-dotenv

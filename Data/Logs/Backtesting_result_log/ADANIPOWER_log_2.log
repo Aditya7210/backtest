@@ -1,0 +1,17 @@
+2026-04-21 10:27:27 | INFO | === Starting Backtest for Adani Power ===
+2026-04-21 10:27:27 | INFO | Loading data from: /app/Data/testing_data/Data_files/yfinance_data/ADANIPOWER_daily_since_2022.csv
+2026-04-21 10:27:27 | INFO | Starting Portfolio Value: ₹100,000.00
+2026-04-21 10:27:27 | INFO | ============================================================
+2026-04-21 10:27:27 | INFO | BACKTEST RESULTS — Trend + Pullback Momentum
+2026-04-21 10:27:27 | INFO | ============================================================
+2026-04-21 10:27:27 | INFO | Starting Cash     : ₹100,000.00
+2026-04-21 10:27:27 | INFO | Final Value       : ₹103,145.67
+2026-04-21 10:27:27 | INFO | Net P&L           : ₹3,145.67 (3.15%)
+2026-04-21 10:27:27 | INFO | Max Drawdown      : 5.99%
+2026-04-21 10:27:27 | INFO | Sharpe Ratio      : 0.2760
+2026-04-21 10:27:27 | INFO | Total Trades      : 12
+2026-04-21 10:27:27 | INFO | Won / Lost        : 6 / 6
+2026-04-21 10:27:27 | INFO | Win Rate          : 50.00%
+2026-04-21 10:27:27 | INFO | ============================================================
+2026-04-21 10:27:27 | INFO | Saved 12 trades to: /app/Data/Logs/Backtesting_result_log/ADANIPOWER_result_2.csv
+2026-04-21 10:27:27 | INFO | Backtest Complete.
