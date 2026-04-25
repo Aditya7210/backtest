@@ -58,6 +58,8 @@ def run_task(
             symbol=symbol,
             strategy_class=strategy_class,
             config=config,
+            terminal=terminal,
+            task_id=task_id,
         )
         result = validate_result(raw_result, symbol=symbol)
         _log(

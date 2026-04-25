@@ -22,6 +22,8 @@ def load_env_variables(env_path: str) -> dict[str, str | None]:
     api_secret = (variables.get("ZERODHA_API_SECRET") or "").strip()
     access_token = variables.get("ZERODHA_ACCESS_TOKEN")
     access_token = access_token.strip() if isinstance(access_token, str) else None
+    token_date = variables.get("ZERODHA_TOKEN_DATE")
+    token_date = token_date.strip() if isinstance(token_date, str) else None
 
     if not api_key:
         raise ValueError("Missing required variable: ZERODHA_API_KEY")
@@ -32,6 +34,7 @@ def load_env_variables(env_path: str) -> dict[str, str | None]:
         "api_key": api_key,
         "api_secret": api_secret,
         "access_token": access_token or None,
+        "token_date": token_date or None,
     }
 
 

@@ -164,6 +164,8 @@ def execute_backtest_dataframe(
     symbol: str,
     strategy_class: type[Any],
     config: dict[str, float],
+    terminal: Any | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(data_df, pd.DataFrame) or data_df.empty:
         raise ValueError("Backtest data is empty")
@@ -173,21 +175,113 @@ def execute_backtest_dataframe(
 
     initial_capital = float(config["initial_capital"])
     commission = float(config["commission"])
+    _log_terminal(
+        terminal,
+        "Starting Backtest",
+        task_id=task_id,
+        symbol=symbol,
+    )
 
     cerebro = bt.Cerebro(stdstats=False)
     data_feed = bt.feeds.PandasData(dataname=data_df)
     cerebro.adddata(data_feed)
     cerebro.addstrategy(strategy_class)
+    cerebro.addanalyzer(_TradeEventAnalyzer, _name="trade_events")
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trade_stats")
     cerebro.broker.setcash(initial_capital)
     cerebro.broker.setcommission(commission=commission)
     try:
-        cerebro.run()
+        results = cerebro.run()
     except Exception as exc:
         raise RuntimeError(f"Strategy execution failed: {exc}") from exc
+
+    strategy_instance = results[0] if results else None
+    if strategy_instance is not None:
+        try:
+            trade_events = strategy_instance.analyzers.trade_events.get_analysis()
+        except Exception:
+            trade_events = []
+        if isinstance(trade_events, list):
+            for event in trade_events[:40]:
+                _log_terminal(
+                    terminal,
+                    str(event),
+                    task_id=task_id,
+                    symbol=symbol,
+                )
+            if len(trade_events) > 40:
+                _log_terminal(
+                    terminal,
+                    f"... {len(trade_events) - 40} more trade events",
+                    level="WARNING",
+                    task_id=task_id,
+                    symbol=symbol,
+                )
+
+        try:
+            trade_stats = strategy_instance.analyzers.trade_stats.get_analysis()
+        except Exception:
+            trade_stats = {}
+        total_trades = int(trade_stats.get("total", {}).get("total", 0)) if isinstance(trade_stats, dict) else 0
+        if total_trades > 0:
+            _log_terminal(
+                terminal,
+                f"Total trades executed: {total_trades}",
+                task_id=task_id,
+                symbol=symbol,
+            )
+
     final_value = float(cerebro.broker.getvalue())
+    _log_terminal(
+        terminal,
+        f"Final Portfolio Value: {final_value}",
+        level="SUCCESS",
+        task_id=task_id,
+        symbol=symbol,
+    )
 
     log_file = _write_log(symbol=symbol, final_value=final_value, config=config)
     return build_success_result(symbol=symbol, final_value=final_value, log_file=str(log_file))
+
+
+class _TradeEventAnalyzer(bt.Analyzer):
+    def start(self) -> None:
+        self.events: list[str] = []
+
+    def notify_trade(self, trade: Any) -> None:
+        try:
+            if trade.justopened:
+                side = "BUY" if trade.size > 0 else "SELL"
+                event_time = bt.num2date(trade.dtopen).strftime("%Y-%m-%d %H:%M:%S")
+                self.events.append(
+                    f"{side} qty={abs(trade.size)} price={float(trade.price):.2f} at {event_time}"
+                )
+            if trade.isclosed:
+                event_time = bt.num2date(trade.dtclose).strftime("%Y-%m-%d %H:%M:%S")
+                self.events.append(
+                    f"CLOSE pnl={float(trade.pnlcomm):.2f} at {event_time}"
+                )
+        except Exception:
+            return
+
+    def get_analysis(self) -> list[str]:
+        return self.events
+
+
+def _log_terminal(
+    terminal: Any | None,
+    message: str,
+    *,
+    level: str = "INFO",
+    task_id: str | None = None,
+    symbol: str | None = None,
+) -> None:
+    if terminal is None or not hasattr(terminal, "log"):
+        return
+    try:
+        terminal.log(message, level=level, task_id=task_id, symbol=symbol)
+    except Exception:
+        pass
 
 
 def _write_log(*, symbol: str, final_value: float, config: dict[str, float]) -> Path:

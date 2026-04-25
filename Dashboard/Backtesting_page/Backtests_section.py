@@ -1,7 +1,15 @@
 from datetime import date, timedelta
+from pathlib import Path
+import sys
+import time as time_module
 
 import streamlit as st
 from streamlit_ace import st_ace
+
+# Ensure top-level project modules (e.g. Backtesting/) are importable in Streamlit runtime.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from .Features import (
     backtest_data_service,
@@ -11,7 +19,6 @@ from .Features import (
     strategy_editor,
     strategy_selection,
     terminal as terminal_feature,
-    zerodha_historical_data,
 )
 
 _STRATEGY_FILE_PLACEHOLDER = "__strategy_file_placeholder__"
@@ -165,8 +172,6 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("zerodha_continuous", False)
     st.session_state.setdefault("instrument_mapper", None)
     st.session_state.setdefault("instrument_mapper_identity", None)
-    st.session_state.setdefault("zerodha_service", None)
-    st.session_state.setdefault("zerodha_service_identity", None)
     st.session_state.setdefault("selected_instrument", None)
     st.session_state.setdefault("zerodha_queue", [])
     st.session_state.setdefault("bt_execution_tasks", [])
@@ -179,6 +184,10 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("execution_total_tasks", 0)
     st.session_state.setdefault("execution_manager", None)
     st.session_state.setdefault("execution_task_states", {})
+    st.session_state.setdefault("_execution_last_refresh_ts", 0.0)
+    st.session_state.setdefault("instrument_mapper_bootstrap_done", False)
+    st.session_state.setdefault("instrument_mapper_bootstrap_ok", True)
+    st.session_state.setdefault("instrument_mapper_bootstrap_message", "")
     if "execution_terminal" not in st.session_state:
         st.session_state["execution_terminal"] = terminal_feature.ExecutionTerminal(max_lines=2000)
 
@@ -191,8 +200,25 @@ def _get_execution_terminal() -> terminal_feature.ExecutionTerminal:
     return terminal_obj
 
 
+def _ensure_instrument_mapper_bootstrap() -> None:
+    if st.session_state.get("instrument_mapper_bootstrap_done", False):
+        return
+
+    ok, message = backtest_data_service.ensure_instrument_mapper_ready()
+    st.session_state["instrument_mapper_bootstrap_done"] = True
+    st.session_state["instrument_mapper_bootstrap_ok"] = bool(ok)
+    st.session_state["instrument_mapper_bootstrap_message"] = str(message or "")
+
+
 def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float]) -> None:
     from Backtesting.execution_manager import ExecutionManager
+
+    existing_manager = st.session_state.get("execution_manager")
+    if existing_manager is not None and hasattr(existing_manager, "stop_worker"):
+        try:
+            existing_manager.stop_worker(timeout_seconds=0.5)
+        except Exception:
+            pass
 
     terminal_obj = _get_execution_terminal()
     terminal_obj.clear()
@@ -200,69 +226,96 @@ def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float
     terminal_obj.log(f"Queued {len(tasks)} tasks", level="INFO")
 
     manager = ExecutionManager(config, terminal=terminal_obj)
-    task_states: dict[str, str] = {}
-
+    manager.clear_tasks()
     for task in tasks:
-        task_id = manager.add_task(task)
-        task_states[task_id] = "PENDING"
+        manager.add_task(task)
+
+    manager.start_worker()
+    queue_snapshot = manager.get_queue_snapshot()
+    task_states = {
+        str(item.get("task_id")): str(item.get("status"))
+        for item in queue_snapshot
+        if item.get("task_id")
+    }
 
     st.session_state["execution_manager"] = manager
     st.session_state["execution_task_states"] = task_states
     st.session_state["execution_running"] = True
     st.session_state["execution_status"] = "RUNNING"
-    st.session_state["execution_total_tasks"] = len(tasks)
+    st.session_state["execution_total_tasks"] = len(queue_snapshot)
     st.session_state["progress"] = 0.0
-    st.session_state["results"] = []
+    st.session_state["results"] = manager.get_ordered_results()
 
 
 def _process_execution_queue_tick() -> None:
-    if not st.session_state.get("execution_running", False):
-        return
-
     manager = st.session_state.get("execution_manager")
     if manager is None:
-        st.session_state["execution_running"] = False
-        st.session_state["execution_status"] = "FAILED"
-        st.session_state["progress"] = 0.0
-        _get_execution_terminal().log(
-            "Execution manager missing. Run aborted.",
-            level="ERROR",
+        from Backtesting.execution_manager import ExecutionManager
+
+        manager = ExecutionManager(
+            {
+                "initial_capital": 100000,
+                "commission": 0.0003,
+                "max_retries": 1,
+                "task_timeout_seconds": 300,
+            },
+            terminal=_get_execution_terminal(),
         )
-        return
+        st.session_state["execution_manager"] = manager
+    if hasattr(manager, "set_terminal"):
+        manager.set_terminal(_get_execution_terminal())
 
-    def _on_task_update(task_id: str, status: str) -> None:
-        task_states = dict(st.session_state.get("execution_task_states", {}))
-        task_states[str(task_id)] = str(status)
-        st.session_state["execution_task_states"] = task_states
+    queue_snapshot = manager.get_queue_snapshot()
+    task_states = {
+        str(item.get("task_id")): str(item.get("status"))
+        for item in queue_snapshot
+        if item.get("task_id")
+    }
+    st.session_state["execution_task_states"] = task_states
+    total = len(queue_snapshot)
+    st.session_state["execution_total_tasks"] = total
 
-    result = manager.run_next(on_task_update=_on_task_update)
-    task_states = st.session_state.get("execution_task_states", {})
-    total = int(st.session_state.get("execution_total_tasks", 0))
     completed = sum(
         1 for status in task_states.values() if status in {"SUCCESS", "FAILED"}
     )
 
     st.session_state["progress"] = (completed / total) if total > 0 else 0.0
-    st.session_state["results"] = list(manager.get_results().values())
+    st.session_state["results"] = manager.get_ordered_results()
 
-    if result is None:
-        st.session_state["execution_running"] = False
-        st.session_state["execution_status"] = (
-            "COMPLETED"
-            if all(status == "SUCCESS" for status in task_states.values())
-            else "COMPLETED_WITH_ERRORS"
-        )
-        st.session_state["progress"] = 1.0 if total > 0 else 0.0
-        if st.session_state["execution_status"] == "COMPLETED":
-            _get_execution_terminal().log("Execution completed", level="SUCCESS")
-        else:
-            _get_execution_terminal().log(
-                "Execution completed with errors",
-                level="WARNING",
-            )
-    else:
+    has_active_tasks = any(
+        status in {"PENDING", "RUNNING"}
+        for status in task_states.values()
+    )
+    if has_active_tasks and not manager.is_worker_running():
+        manager.start_worker()
+
+    previous_status = str(st.session_state.get("execution_status", "IDLE"))
+    if has_active_tasks:
+        st.session_state["execution_running"] = True
         st.session_state["execution_status"] = "RUNNING"
-        st.rerun()
+    else:
+        if manager.is_worker_running() and hasattr(manager, "stop_worker"):
+            manager.stop_worker(timeout_seconds=0.2)
+        st.session_state["execution_running"] = False
+        if total == 0:
+            st.session_state["execution_status"] = "IDLE"
+            st.session_state["progress"] = 0.0
+        else:
+            next_status = (
+                "COMPLETED"
+                if all(status == "SUCCESS" for status in task_states.values())
+                else "COMPLETED_WITH_ERRORS"
+            )
+            st.session_state["execution_status"] = next_status
+            st.session_state["progress"] = 1.0
+
+            if previous_status == "RUNNING" and next_status == "COMPLETED":
+                _get_execution_terminal().log("Execution completed", level="SUCCESS")
+            elif previous_status == "RUNNING" and next_status == "COMPLETED_WITH_ERRORS":
+                _get_execution_terminal().log(
+                    "Execution completed with errors",
+                    level="WARNING",
+                )
 
 
 def _render_execution_terminal_panel() -> None:
@@ -271,6 +324,20 @@ def _render_execution_terminal_panel() -> None:
         terminal_obj,
         key_prefix="bt_execution_terminal",
     )
+
+
+def _schedule_execution_refresh() -> None:
+    if not bool(st.session_state.get("execution_running", False)):
+        return
+
+    current_time = float(time_module.time())
+    last_refresh = float(st.session_state.get("_execution_last_refresh_ts", 0.0))
+    if (current_time - last_refresh) < 0.9:
+        return
+
+    st.session_state["_execution_last_refresh_ts"] = current_time
+    time_module.sleep(0.35)
+    st.rerun()
 
 
 def _get_cached_instrument_mapper(
@@ -294,27 +361,16 @@ def _get_cached_instrument_mapper(
     return mapper
 
 
-def _get_cached_zerodha_service(
-    api_key: str,
-    access_token: str,
-) -> zerodha_historical_data.ZerodhaHistoricalData:
-    identity = (api_key, access_token)
-    service = st.session_state.get("zerodha_service")
-    service_identity = st.session_state.get("zerodha_service_identity")
-
-    if service is not None and service_identity == identity:
-        return service
-
-    service = zerodha_historical_data.ZerodhaHistoricalData(
-        api_key=api_key,
-        access_token=access_token,
-    )
-    st.session_state["zerodha_service"] = service
-    st.session_state["zerodha_service_identity"] = identity
-    return service
-
 def _render_zerodha_data_selection() -> None:
     st.session_state["selected_data_files"] = []
+
+    bootstrap_ok = bool(st.session_state.get("instrument_mapper_bootstrap_ok", True))
+    bootstrap_message = str(st.session_state.get("instrument_mapper_bootstrap_message", "")).strip()
+    if bootstrap_message:
+        if bootstrap_ok:
+            st.caption(bootstrap_message)
+        else:
+            st.warning(bootstrap_message)
 
     query = st.text_input(
         "Symbol",
@@ -326,13 +382,11 @@ def _render_zerodha_data_selection() -> None:
     st.caption("Instrument token is resolved automatically from the symbol.")
 
     if len(query) >= 2:
-        api_key, access_token = backtest_data_service.get_zerodha_credentials(
-            st.session_state.get("ZERODHA_ACCESS_TOKEN")
-        )
-
         results: list[dict[str, object]] = []
-        if not api_key or not access_token:
-            st.warning("Zerodha credentials not found. Symbol search disabled.")
+        try:
+            api_key, access_token = backtest_data_service.validate_zerodha_session()
+        except Exception as exc:
+            st.warning(str(exc))
         else:
             try:
                 mapper = _get_cached_instrument_mapper(api_key, access_token)
@@ -790,6 +844,7 @@ def render() -> None:
     st.session_state.setdefault("_last_loaded_file", None)
     st.session_state.setdefault("data_mode", "csv")
     _initialize_zerodha_state()
+    _ensure_instrument_mapper_bootstrap()
     _process_execution_queue_tick()
     st.session_state.setdefault(
         "bt_data_mode_toggle",
@@ -972,31 +1027,25 @@ def render() -> None:
                         )
 
                         if data_mode == "zerodha":
-                            with st.spinner("Building Zerodha backtest queue tasks..."):
-                                api_key, access_token = (
-                                    backtest_data_service.get_zerodha_credentials(
-                                        st.session_state.get("ZERODHA_ACCESS_TOKEN")
-                                    )
-                                )
-                                if not api_key or not access_token:
-                                    raise RuntimeError(
-                                        "Missing Zerodha credentials. Set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in environment."
-                                    )
-                                service = _get_cached_zerodha_service(api_key, access_token)
-                                tasks = backtest_data_service.build_zerodha_queue_tasks(
-                                    queue=st.session_state.get("zerodha_queue", []),
-                                    service=service,
-                                    selected_strategy=strategy_class,
-                                )
+                            tasks = backtest_data_service.build_zerodha_queue_tasks(
+                                queue=st.session_state.get("zerodha_queue", []),
+                                selected_strategy=strategy_class,
+                            )
                         else:
                             tasks = backtest_data_service.build_csv_tasks(
                                 st.session_state.get("selected_data_files", []),
                                 strategy_class,
                             )
 
+                        for task in tasks:
+                            task["strategy_file_path"] = str(selected_file)
+                            task["strategy_class_name"] = str(selected_class_name)
+
                         config = {
                             "initial_capital": 100000,
                             "commission": 0.0003,
+                            "max_retries": 1,
+                            "task_timeout_seconds": 300,
                         }
                         _start_execution_job(tasks, config)
                     except Exception as exc:
@@ -1030,3 +1079,4 @@ def render() -> None:
             )
 
     _render_execution_terminal_panel()
+    _schedule_execution_refresh()

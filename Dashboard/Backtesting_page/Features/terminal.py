@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from datetime import datetime
 from html import escape
+from threading import RLock
 from typing import Literal, TypedDict
 
 
@@ -29,6 +30,7 @@ class ExecutionTerminal:
     def __init__(self, max_lines: int = 1000) -> None:
         self.logs: list[TerminalLogEntry] = []
         self.max_lines = max(100, int(max_lines))
+        self._lock = RLock()
 
     def log(
         self,
@@ -50,18 +52,21 @@ class ExecutionTerminal:
             "task_id": normalized_task_id,
             "symbol": normalized_symbol,
         }
-        self.logs.append(log_entry)
-        self._trim()
+        with self._lock:
+            self.logs.append(log_entry)
+            self._trim_locked()
         return log_entry
 
     def get_logs(self) -> list[TerminalLogEntry]:
-        return [dict(item) for item in self.logs]
+        with self._lock:
+            return [dict(item) for item in self.logs]
 
     def get_logs_by_task(self, task_id: str) -> list[TerminalLogEntry]:
         normalized = str(task_id or "").strip()
         if not normalized:
             return []
-        return [dict(item) for item in self.logs if item.get("task_id") == normalized]
+        with self._lock:
+            return [dict(item) for item in self.logs if item.get("task_id") == normalized]
 
     def filter_logs(
         self,
@@ -74,29 +79,32 @@ class ExecutionTerminal:
         level_filter = self._normalize_level(filter_level) if filter_level else ""
 
         filtered: list[TerminalLogEntry] = []
-        for item in self.logs:
-            symbol = str(item.get("symbol") or "").upper()
-            level = str(item.get("level") or "INFO").upper()
+        with self._lock:
+            for item in self.logs:
+                symbol = str(item.get("symbol") or "").upper()
+                level = str(item.get("level") or "INFO").upper()
 
-            if symbol_filter and symbol_filter != "ALL" and symbol != symbol_filter:
-                continue
-            if level_filter and level_filter != "ALL" and level != level_filter:
-                continue
-            if error_only and level != "ERROR":
-                continue
-            filtered.append(dict(item))
+                if symbol_filter and symbol_filter != "ALL" and symbol != symbol_filter:
+                    continue
+                if level_filter and level_filter != "ALL" and level != level_filter:
+                    continue
+                if error_only and level != "ERROR":
+                    continue
+                filtered.append(dict(item))
         return filtered
 
     def get_symbols(self) -> list[str]:
-        symbols = {
-            str(item.get("symbol") or "").strip().upper()
-            for item in self.logs
-            if str(item.get("symbol") or "").strip()
-        }
+        with self._lock:
+            symbols = {
+                str(item.get("symbol") or "").strip().upper()
+                for item in self.logs
+                if str(item.get("symbol") or "").strip()
+            }
         return sorted(symbols)
 
     def clear(self) -> None:
-        self.logs = []
+        with self._lock:
+            self.logs = []
 
     def to_text(
         self,
@@ -114,7 +122,7 @@ class ExecutionTerminal:
             return "No logs yet"
         return "\n".join(_format_log_line(item) for item in filtered)
 
-    def _trim(self) -> None:
+    def _trim_locked(self) -> None:
         if len(self.logs) <= self.max_lines:
             return
         self.logs = self.logs[-self.max_lines :]
