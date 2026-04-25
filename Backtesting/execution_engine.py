@@ -6,6 +6,7 @@ from typing import Any
 
 import backtrader as bt
 import pandas as pd
+from pandas.errors import EmptyDataError, ParserError
 
 from Backtesting.data_normalizer import normalize
 
@@ -15,7 +16,15 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
     try:
         strategy_class = validate_strategy_class(task.get("strategy_class"))
         csv_path = _resolve_csv_path(task.get("data"))
-        raw_df = pd.read_csv(csv_path)
+        try:
+            raw_df = pd.read_csv(csv_path)
+        except EmptyDataError as exc:
+            raise ValueError(f"CSV is empty: {csv_path}") from exc
+        except ParserError as exc:
+            raise ValueError(f"CSV parsing failed: {csv_path}") from exc
+
+        if raw_df.empty:
+            raise ValueError(f"CSV has no rows: {csv_path}")
         normalized_df = normalize(raw_df)
         config = extract_runtime_config(task.get("config"))
         return execute_backtest_dataframe(

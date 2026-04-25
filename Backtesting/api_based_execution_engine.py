@@ -19,6 +19,8 @@ def run_task(task: dict[str, Any]) -> dict[str, Any]:
         raw_data = task.get("data")
         if not isinstance(raw_data, pd.DataFrame):
             raise ValueError("Task data must be a pandas DataFrame for API mode")
+        if raw_data.empty:
+            raise ValueError("Task data is empty for API mode")
         normalized_df = normalize(raw_data)
         config = extract_runtime_config(task.get("config"))
         return execute_backtest_dataframe(

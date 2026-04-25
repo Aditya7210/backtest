@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pandas as pd
 
 
 _REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+_REQUIRED_PRICE_COLUMNS = ["Open", "High", "Low", "Close"]
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -17,12 +16,22 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     working_df = df.copy()
     working_df = _rename_columns(working_df)
     working_df = _ensure_datetime_index(working_df)
-    working_df = _ensure_required_columns(working_df)
+    working_df = _ensure_required_price_columns(working_df)
+    if "Volume" not in working_df.columns:
+        working_df["Volume"] = 0
 
     for column in _REQUIRED_COLUMNS:
-        working_df[column] = pd.to_numeric(working_df[column], errors="coerce")
+        normalized_series = (
+            working_df[column]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
+        )
+        working_df[column] = pd.to_numeric(normalized_series, errors="coerce")
 
-    working_df = working_df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    working_df = working_df.dropna(subset=_REQUIRED_PRICE_COLUMNS)
+    working_df["Volume"] = working_df["Volume"].fillna(0)
     working_df = working_df.sort_index()
     working_df = working_df[~working_df.index.duplicated(keep="first")]
 
@@ -79,12 +88,11 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return working_df
 
 
-def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
-    missing = [column for column in _REQUIRED_COLUMNS if column not in df.columns]
+def _ensure_required_price_columns(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [column for column in _REQUIRED_PRICE_COLUMNS if column not in df.columns]
     if missing:
-        raise ValueError(f"Missing required OHLCV columns: {missing}")
+        raise ValueError(f"Missing required OHLC columns: {missing}")
     return df
 
 
 __all__ = ["normalize"]
-

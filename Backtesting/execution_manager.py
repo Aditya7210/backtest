@@ -17,8 +17,6 @@ class ExecutionManager:
     def add_task(self, task: dict[str, Any]) -> None:
         if not isinstance(task, dict):
             raise ValueError("Task must be a dictionary")
-        if "mode" not in task:
-            raise ValueError("Task missing required field: mode")
         self._tasks.append(dict(task))
 
     def clear_tasks(self) -> None:
@@ -28,6 +26,17 @@ class ExecutionManager:
         results: list[dict[str, Any]] = []
 
         for index, task in enumerate(self._tasks):
+            if not isinstance(task, dict):
+                results.append(
+                    {
+                        "symbol": f"TASK_{index + 1}",
+                        "final_value": None,
+                        "log_file": "",
+                        "error": "Invalid task format: expected dictionary",
+                    }
+                )
+                continue
+
             symbol = str(task.get("symbol") or f"TASK_{index + 1}").strip() or f"TASK_{index + 1}"
             mode = str(task.get("mode", "")).strip().lower()
             prepared_task = dict(task)
@@ -72,4 +81,3 @@ class ExecutionManager:
             )
 
         return results
-
