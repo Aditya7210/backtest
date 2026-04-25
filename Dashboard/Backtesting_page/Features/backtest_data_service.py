@@ -105,7 +105,7 @@ def fetch_zerodha_dataframe(
     if from_day > to_day:
         raise ValueError("From Date must be earlier than To Date")
 
-    instrument_token, symbol, instrument_type = _extract_selected_instrument_fields(
+    instrument_token, _, instrument_type = _extract_selected_instrument_fields(
         selected_instrument
     )
     normalized_interval = normalize_interval(interval)
@@ -119,10 +119,7 @@ def fetch_zerodha_dataframe(
         continuous=continuous,
         oi=bool(oi),
     )
-    enriched = df.copy()
-    enriched["Symbol"] = symbol
-    enriched["Interval"] = normalized_interval
-    return enriched
+    return df.copy()
 
 
 def build_zerodha_queue_tasks(
@@ -153,12 +150,13 @@ def build_zerodha_queue_tasks(
             oi=oi,
         )
 
-        symbol = str(df["Symbol"].iloc[-1]) if not df.empty else ""
+        symbol = str((instrument or {}).get("tradingsymbol", "")).strip().upper()
         tasks.append(
             {
                 "mode": "api",
                 "data": df,
                 "symbol": symbol,
+                "interval": interval,
                 "strategy_class": selected_strategy,
             }
         )

@@ -171,6 +171,71 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("bt_execution_tasks", [])
     st.session_state.setdefault("bt_execution_results", [])
     st.session_state.setdefault("bt_execute_status", None)
+    st.session_state.setdefault("execution_status", "IDLE")
+    st.session_state.setdefault("results", [])
+    st.session_state.setdefault("progress", 0.0)
+    st.session_state.setdefault("execution_running", False)
+    st.session_state.setdefault("execution_total_tasks", 0)
+    st.session_state.setdefault("execution_manager", None)
+    st.session_state.setdefault("execution_task_states", {})
+
+
+def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float]) -> None:
+    from Backtesting.execution_manager import ExecutionManager
+
+    manager = ExecutionManager(config)
+    task_states: dict[str, str] = {}
+
+    for task in tasks:
+        task_id = manager.add_task(task)
+        task_states[task_id] = "PENDING"
+
+    st.session_state["execution_manager"] = manager
+    st.session_state["execution_task_states"] = task_states
+    st.session_state["execution_running"] = True
+    st.session_state["execution_status"] = "RUNNING"
+    st.session_state["execution_total_tasks"] = len(tasks)
+    st.session_state["progress"] = 0.0
+    st.session_state["results"] = []
+
+
+def _process_execution_queue_tick() -> None:
+    if not st.session_state.get("execution_running", False):
+        return
+
+    manager = st.session_state.get("execution_manager")
+    if manager is None:
+        st.session_state["execution_running"] = False
+        st.session_state["execution_status"] = "FAILED"
+        st.session_state["progress"] = 0.0
+        return
+
+    def _on_task_update(task_id: str, status: str) -> None:
+        task_states = dict(st.session_state.get("execution_task_states", {}))
+        task_states[str(task_id)] = str(status)
+        st.session_state["execution_task_states"] = task_states
+
+    result = manager.run_next(on_task_update=_on_task_update)
+    task_states = st.session_state.get("execution_task_states", {})
+    total = int(st.session_state.get("execution_total_tasks", 0))
+    completed = sum(
+        1 for status in task_states.values() if status in {"SUCCESS", "FAILED"}
+    )
+
+    st.session_state["progress"] = (completed / total) if total > 0 else 0.0
+    st.session_state["results"] = list(manager.get_results().values())
+
+    if result is None:
+        st.session_state["execution_running"] = False
+        st.session_state["execution_status"] = (
+            "COMPLETED"
+            if all(status == "SUCCESS" for status in task_states.values())
+            else "COMPLETED_WITH_ERRORS"
+        )
+        st.session_state["progress"] = 1.0 if total > 0 else 0.0
+    else:
+        st.session_state["execution_status"] = "RUNNING"
+        st.rerun()
 
 
 def _get_cached_instrument_mapper(
@@ -690,6 +755,7 @@ def render() -> None:
     st.session_state.setdefault("_last_loaded_file", None)
     st.session_state.setdefault("data_mode", "csv")
     _initialize_zerodha_state()
+    _process_execution_queue_tick()
     st.session_state.setdefault(
         "bt_data_mode_toggle",
         st.session_state["data_mode"] == "zerodha",
@@ -846,12 +912,13 @@ def render() -> None:
             queue_count = len(st.session_state.get("zerodha_queue", []))
             csv_count = len(st.session_state.get("selected_data_files", []))
             can_execute = queue_count > 0 if data_mode == "zerodha" else csv_count > 0
+            execution_running = bool(st.session_state.get("execution_running", False))
 
             execute_clicked = st.button(
                 "Execute Strategy",
                 use_container_width=True,
                 type="primary",
-                disabled=not can_execute,
+                disabled=(not can_execute) or execution_running,
                 key="bt_execute",
             )
             if execute_clicked:
@@ -889,32 +956,33 @@ def render() -> None:
                             strategy_class,
                         )
 
-                    from Backtesting.execution_manager import ExecutionManager
-
                     config = {
                         "initial_capital": 100000,
                         "commission": 0.0003,
                     }
-                    manager = ExecutionManager(config)
-                    for task in tasks:
-                        manager.add_task(task)
-
-                    with st.spinner("Running backtests..."):
-                        results = manager.run()
+                    _start_execution_job(tasks, config)
                 except Exception as exc:
                     st.error(f"Failed to execute backtests: {exc}")
                     st.session_state["bt_execution_tasks"] = []
                 else:
                     st.session_state["bt_execution_tasks"] = tasks
-                    st.session_state["bt_execution_results"] = results
-                    st.session_state["bt_execute_status"] = "Execution completed"
+                    st.session_state["bt_execution_results"] = []
+                    st.session_state["bt_execute_status"] = "Execution started"
                     st.success(st.session_state["bt_execute_status"])
-                    for res in results:
-                        st.write(f"Symbol: {res.get('symbol')}")
-                        st.write(f"Final Value: {res.get('final_value')}")
-                        st.write(f"Log File: {res.get('log_file')}")
-                        if res.get("error"):
-                            st.error(f"Error: {res.get('error')}")
+
+            st.caption(f"Execution Status: {st.session_state.get('execution_status', 'IDLE')}")
+            st.progress(float(st.session_state.get("progress", 0.0)))
+
+            session_results = list(st.session_state.get("results", []))
+            if session_results:
+                st.session_state["bt_execution_results"] = session_results
+                for res in session_results:
+                    st.write(f"Symbol: {res.get('symbol')}")
+                    st.write(f"Status: {res.get('status')}")
+                    st.write(f"Final Value: {res.get('final_value')}")
+                    st.write(f"Log File: {res.get('log_file')}")
+                    if res.get("error"):
+                        st.error(f"Error: {res.get('error')}")
 
             st.button(
                 "+ Create New Strategy",

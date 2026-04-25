@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+from pandas.api.types import is_object_dtype, is_string_dtype
 
 
 _REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
@@ -21,14 +22,7 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
         working_df["Volume"] = 0
 
     for column in _REQUIRED_COLUMNS:
-        normalized_series = (
-            working_df[column]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.strip()
-            .replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
-        )
-        working_df[column] = pd.to_numeric(normalized_series, errors="coerce")
+        working_df[column] = _to_numeric_safely(working_df[column])
 
     working_df = working_df.dropna(subset=_REQUIRED_PRICE_COLUMNS)
     working_df["Volume"] = working_df["Volume"].fillna(0)
@@ -93,6 +87,19 @@ def _ensure_required_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required OHLC columns: {missing}")
     return df
+
+
+def _to_numeric_safely(series: pd.Series) -> pd.Series:
+    if is_object_dtype(series) or is_string_dtype(series):
+        cleaned = (
+            series
+            .astype("string")
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
+        )
+        return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(series, errors="coerce")
 
 
 __all__ = ["normalize"]
