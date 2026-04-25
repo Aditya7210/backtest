@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timedelta
 import os
+from pathlib import Path
 
 import streamlit as st
 from streamlit_ace import st_ace
@@ -10,6 +11,7 @@ from .Features import (
     name_indicator_saver_versioner,
     strategy_editor,
     strategy_selection,
+    zerodha_auth as zerodha_auth_feature,
     zerodha_csv_downloader,
     zerodha_historical_data,
 )
@@ -151,6 +153,31 @@ _ZERODHA_INTERVALS = [
 ]
 
 
+def _resolve_env_path() -> Path:
+    return Path(__file__).resolve().parents[2] / ".env"
+
+
+def _get_zerodha_credentials() -> tuple[str, str]:
+    api_key = os.getenv("ZERODHA_API_KEY", "").strip()
+    access_token = str(st.session_state.get("ZERODHA_ACCESS_TOKEN") or "").strip()
+
+    if not access_token:
+        env_path = _resolve_env_path()
+        if env_path.is_file():
+            try:
+                env_data = zerodha_auth_feature.load_env_variables(str(env_path))
+            except Exception:
+                env_data = {}
+            if not api_key:
+                api_key = str(env_data.get("api_key") or "").strip()
+            access_token = str(env_data.get("access_token") or "").strip()
+
+    if not access_token:
+        access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+
+    return api_key, access_token
+
+
 def _initialize_zerodha_state() -> None:
     today = date.today()
     st.session_state.setdefault("zerodha_symbol", "")
@@ -229,8 +256,7 @@ def _get_cached_zerodha_service(
 
 
 def _fetch_zerodha_data_from_ui() -> None:
-    api_key = os.getenv("ZERODHA_API_KEY", "").strip()
-    access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+    api_key, access_token = _get_zerodha_credentials()
 
     if not api_key or not access_token:
         st.session_state["zerodha_fetch_error"] = (
@@ -328,8 +354,7 @@ def _render_zerodha_data_selection() -> None:
     st.caption("Instrument token is resolved automatically from the symbol.")
 
     if len(query) >= 2:
-        api_key = os.getenv("ZERODHA_API_KEY", "").strip()
-        access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+        api_key, access_token = _get_zerodha_credentials()
 
         results: list[dict[str, object]] = []
         if not api_key or not access_token:

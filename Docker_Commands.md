@@ -18,6 +18,18 @@ docker compose up -d
 ```
 *(Note: Use `docker-compose` (with a hyphen) if you have an older version of Docker, but `docker compose` is the modern standard).*
 
+### Start + auto-open dashboard in browser
+If you want the browser to open automatically after startup:
+- PowerShell (Windows):
+```powershell
+.\compose-up.ps1
+```
+- Bash/zsh (macOS/Linux):
+```bash
+./compose-up.sh
+```
+These wrappers run `docker compose up -d`, wait for Streamlit health, and then open `http://localhost:8501`.
+
 ### Stop and Shutdown the environment
 Ready to shut down for the day? This will smoothly stop and remove the container.
 ```bash
