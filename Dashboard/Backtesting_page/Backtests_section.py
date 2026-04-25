@@ -1,18 +1,15 @@
-from datetime import date, datetime, time, timedelta
-import os
-from pathlib import Path
+from datetime import date, timedelta
 
 import streamlit as st
 from streamlit_ace import st_ace
 
 from .Features import (
+    backtest_data_service,
     data_selection_feature,
     instrument_mapper as instrument_mapper_feature,
     name_indicator_saver_versioner,
     strategy_editor,
     strategy_selection,
-    zerodha_auth as zerodha_auth_feature,
-    zerodha_csv_downloader,
     zerodha_historical_data,
 )
 
@@ -153,31 +150,6 @@ _ZERODHA_INTERVALS = [
 ]
 
 
-def _resolve_env_path() -> Path:
-    return Path(__file__).resolve().parents[2] / ".env"
-
-
-def _get_zerodha_credentials() -> tuple[str, str]:
-    api_key = os.getenv("ZERODHA_API_KEY", "").strip()
-    access_token = str(st.session_state.get("ZERODHA_ACCESS_TOKEN") or "").strip()
-
-    if not access_token:
-        env_path = _resolve_env_path()
-        if env_path.is_file():
-            try:
-                env_data = zerodha_auth_feature.load_env_variables(str(env_path))
-            except Exception:
-                env_data = {}
-            if not api_key:
-                api_key = str(env_data.get("api_key") or "").strip()
-            access_token = str(env_data.get("access_token") or "").strip()
-
-    if not access_token:
-        access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
-
-    return api_key, access_token
-
-
 def _initialize_zerodha_state() -> None:
     today = date.today()
     st.session_state.setdefault("zerodha_symbol", "")
@@ -190,28 +162,15 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("zerodha_to_date", today)
     st.session_state.setdefault("zerodha_oi", False)
     st.session_state.setdefault("zerodha_continuous", False)
-    st.session_state.setdefault("zerodha_data_frame", None)
-    st.session_state.setdefault("zerodha_fetch_status", None)
-    st.session_state.setdefault("zerodha_fetch_error", None)
-    st.session_state.setdefault("zerodha_loading", False)
     st.session_state.setdefault("instrument_mapper", None)
     st.session_state.setdefault("instrument_mapper_identity", None)
     st.session_state.setdefault("zerodha_service", None)
     st.session_state.setdefault("zerodha_service_identity", None)
     st.session_state.setdefault("selected_instrument", None)
-
-
-def _on_symbol_suggestion_change(
-    label_to_symbol: dict[str, str],
-    label_to_item: dict[str, dict[str, object]],
-) -> None:
-    selected_label = st.session_state.get("symbol_suggestions")
-    if selected_label not in label_to_symbol:
-        return
-
-    resolved_symbol = label_to_symbol[selected_label]
-    st.session_state["zerodha_symbol"] = resolved_symbol
-    st.session_state["selected_instrument"] = label_to_item.get(selected_label)
+    st.session_state.setdefault("zerodha_queue", [])
+    st.session_state.setdefault("bt_execution_tasks", [])
+    st.session_state.setdefault("bt_execution_results", [])
+    st.session_state.setdefault("bt_execute_status", None)
 
 
 def _get_cached_instrument_mapper(
@@ -254,93 +213,6 @@ def _get_cached_zerodha_service(
     st.session_state["zerodha_service_identity"] = identity
     return service
 
-
-def _fetch_zerodha_data_from_ui() -> None:
-    api_key, access_token = _get_zerodha_credentials()
-
-    if not api_key or not access_token:
-        st.session_state["zerodha_fetch_error"] = (
-            "Missing Zerodha credentials. Set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in environment."
-        )
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    selected_instrument = st.session_state.get("selected_instrument")
-    if not isinstance(selected_instrument, dict) or not selected_instrument:
-        st.session_state["zerodha_fetch_error"] = (
-            "Please select a valid instrument from suggestions"
-        )
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    symbol = str(selected_instrument.get("tradingsymbol", "")).strip().upper()
-    if not symbol:
-        st.session_state["zerodha_fetch_error"] = (
-            "Please select a valid instrument from suggestions"
-        )
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    instrument_token_raw = selected_instrument.get("instrument_token")
-    if instrument_token_raw in (None, ""):
-        st.session_state["zerodha_fetch_error"] = "Instrument token not found"
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    try:
-        instrument_token = int(instrument_token_raw)
-    except (TypeError, ValueError):
-        st.session_state["zerodha_fetch_error"] = "Instrument token not found"
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    instrument_type = str(selected_instrument.get("instrument_type", "")).strip().upper()
-
-    from_day = st.session_state.get("zerodha_from_date")
-    to_day = st.session_state.get("zerodha_to_date")
-    interval = str(st.session_state.get("zerodha_interval", "15minute")).lower().strip()
-    requested_continuous = bool(st.session_state.get("zerodha_continuous", False))
-    continuous = requested_continuous and instrument_type == "FUT"
-    oi = bool(st.session_state.get("zerodha_oi", False))
-
-    from_dt = datetime.combine(from_day, time.min)
-    to_dt = datetime.combine(to_day, time.max)
-
-    try:
-        service = _get_cached_zerodha_service(api_key, access_token)
-        with st.spinner("Fetching Zerodha historical candles..."):
-            data = service.fetch_data(
-                instrument_token=instrument_token,
-                from_date=from_dt,
-                to_date=to_dt,
-                interval=interval,
-                continuous=continuous,
-                oi=oi,
-            )
-    except Exception as exc:
-        st.session_state["zerodha_service"] = None
-        st.session_state["zerodha_service_identity"] = None
-        st.session_state["zerodha_fetch_error"] = str(exc)
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_data_frame"] = None
-        return
-
-    data = data.copy()
-    data["Symbol"] = symbol
-    data["Interval"] = interval
-
-    st.session_state["zerodha_data_frame"] = data
-    st.session_state["zerodha_fetch_error"] = None
-    st.session_state["zerodha_fetch_status"] = (
-        f"Fetched {len(data)} rows for {symbol} ({interval})."
-    )
-
-
 def _render_zerodha_data_selection() -> None:
     st.session_state["selected_data_files"] = []
 
@@ -354,7 +226,9 @@ def _render_zerodha_data_selection() -> None:
     st.caption("Instrument token is resolved automatically from the symbol.")
 
     if len(query) >= 2:
-        api_key, access_token = _get_zerodha_credentials()
+        api_key, access_token = backtest_data_service.get_zerodha_credentials(
+            st.session_state.get("ZERODHA_ACCESS_TOKEN")
+        )
 
         results: list[dict[str, object]] = []
         if not api_key or not access_token:
@@ -367,7 +241,7 @@ def _render_zerodha_data_selection() -> None:
                 results = []
 
         if results:
-            st.markdown("### 🔍 Matching Instruments")
+            st.markdown("### Matching Instruments")
             st.caption("Showing top matches")
             options = [
                 f"{item['tradingsymbol']} ({item['exchange']}, {item['instrument_type']})"
@@ -382,13 +256,11 @@ def _render_zerodha_data_selection() -> None:
                 for option, item in zip(options, results)
             }
 
-            selected_option = st.selectbox(
+            selected_option = st.radio(
                 "Select Matching Symbol",
                 options=options,
                 key="symbol_suggestions",
                 index=0,
-                on_change=_on_symbol_suggestion_change,
-                args=(label_to_symbol, label_to_item),
             )
             selected_label = st.session_state.get("symbol_suggestions") or selected_option
 
@@ -404,8 +276,8 @@ def _render_zerodha_data_selection() -> None:
             )
             st.session_state["selected_instrument"] = None
             st.caption("No matching instruments found")
-
-        st.write("Selected Instrument Debug:", st.session_state.get("selected_instrument"))
+    else:
+        st.session_state["selected_instrument"] = None
 
     st.selectbox(
         "Interval",
@@ -422,130 +294,61 @@ def _render_zerodha_data_selection() -> None:
     st.toggle("Include Open Interest (OI)", key="zerodha_oi")
     st.toggle("Continuous Futures", key="zerodha_continuous")
 
-    action_col1, action_col2 = st.columns([2, 1], gap="small")
-    with action_col1:
-        fetch_clicked = st.button(
-            "Fetch Zerodha Data",
-            type="primary",
-            use_container_width=True,
-            key="bt_fetch_zerodha_data",
-            disabled=bool(st.session_state.get("zerodha_loading", False)),
-        )
-    with action_col2:
-        clear_clicked = st.button(
-            "Clear",
-            use_container_width=True,
-            key="bt_clear_zerodha_data",
-        )
-        download_clicked = st.button(
-            "Download CSV",
-            use_container_width=True,
-            key="bt_download_zerodha_data",
-            disabled=bool(st.session_state.get("zerodha_loading", False)),
-        )
+    add_to_queue_clicked = st.button(
+        "Add to Backtest Queue",
+        use_container_width=True,
+        key="bt_add_zerodha_queue",
+    )
 
-    if fetch_clicked and not st.session_state.get("zerodha_loading", False):
+    if add_to_queue_clicked:
+        selected = st.session_state.get("selected_instrument")
+        interval = backtest_data_service.normalize_interval(
+            str(st.session_state.get("zerodha_interval", "15minute"))
+        )
         from_day = st.session_state.get("zerodha_from_date")
         to_day = st.session_state.get("zerodha_to_date")
+        requested_continuous = bool(st.session_state.get("zerodha_continuous", False))
+        oi = bool(st.session_state.get("zerodha_oi", False))
 
-        if from_day is None or to_day is None:
-            st.error("Please select valid dates")
-            st.session_state["zerodha_fetch_error"] = "Please select valid dates"
-            st.session_state["zerodha_fetch_status"] = None
-            st.session_state["zerodha_loading"] = False
-        elif from_day > to_day:
-            st.error("From Date must be earlier than To Date")
-            st.session_state["zerodha_fetch_error"] = "From Date must be earlier than To Date"
-            st.session_state["zerodha_fetch_status"] = None
-            st.session_state["zerodha_loading"] = False
-        else:
-            st.session_state["zerodha_fetch_error"] = None
-            st.session_state["zerodha_fetch_status"] = None
-            st.session_state["zerodha_loading"] = True
-            try:
-                _fetch_zerodha_data_from_ui()
-            except Exception as exc:
-                st.session_state["zerodha_fetch_error"] = str(exc)
-                st.session_state["zerodha_fetch_status"] = None
-                st.session_state["zerodha_data_frame"] = None
-            finally:
-                st.session_state["zerodha_loading"] = False
-
-    if clear_clicked:
-        st.session_state["zerodha_data_frame"] = None
-        st.session_state["zerodha_fetch_status"] = None
-        st.session_state["zerodha_fetch_error"] = None
-        st.session_state["zerodha_loading"] = False
-
-    if download_clicked:
-        df = st.session_state.get("zerodha_data_frame")
-        from_day = st.session_state.get("zerodha_from_date")
-        to_day = st.session_state.get("zerodha_to_date")
-        selected_instrument = st.session_state.get("selected_instrument")
-        interval = str(st.session_state.get("zerodha_interval", "15minute")).lower().strip()
-
-        if df is None:
-            st.error("No data available to download. Fetch Zerodha data first.")
-        elif from_day is None or to_day is None:
-            st.error("Please select valid dates before downloading CSV.")
-        elif (
-            not isinstance(selected_instrument, dict)
-            or not selected_instrument.get("tradingsymbol")
-        ):
-            st.error("Please select a valid instrument from suggestions before downloading.")
-        else:
-            symbol = str(selected_instrument["tradingsymbol"]).strip().upper()
-            try:
-                save_result = zerodha_csv_downloader.download_and_save_data(
-                    df=df,
-                    symbol=symbol,
-                    start_date=datetime.combine(from_day, time.min),
-                    end_date=datetime.combine(to_day, time.max),
-                    interval=interval,
-                )
-            except Exception as exc:
-                st.error(f"Failed to save CSV: {exc}")
-            else:
-                if save_result.get("status") == "exists":
-                    st.info("File already exists")
-                else:
-                    st.success("CSV saved successfully")
-                    st.caption(f"Saved to: {save_result.get('file_path')}")
-
-    fetch_error = st.session_state.get("zerodha_fetch_error")
-    fetch_status = st.session_state.get("zerodha_fetch_status")
-    fetched_df = st.session_state.get("zerodha_data_frame")
-
-    if fetch_error:
-        st.error(str(fetch_error))
-    elif fetch_status:
-        st.success(str(fetch_status))
-
-    if fetched_df is not None:
-        if fetched_df.empty:
-            st.info("No candles found (market closed or no data available for selected range).")
-        else:
-            st.caption(
-                f"Rows: {len(fetched_df)} | "
-                f"Range: {fetched_df.index.min()} to {fetched_df.index.max()}"
+        try:
+            queue_item = backtest_data_service.create_queue_item(
+                selected_instrument=selected if isinstance(selected, dict) else None,
+                interval=interval,
+                from_day=from_day,
+                to_day=to_day,
+                requested_continuous=requested_continuous,
+                oi=oi,
             )
-            st.caption("Preview (last 100 rows)")
-            preview_df = fetched_df.tail(100).copy()
-            date_column = "Date" if "Date" not in preview_df.columns else "Date (Index)"
-            time_column = "Time" if "Time" not in preview_df.columns else "Time (Index)"
-            if hasattr(preview_df.index, "strftime"):
-                preview_df.insert(0, date_column, preview_df.index.strftime("%Y-%m-%d"))
-                preview_df.insert(1, time_column, preview_df.index.strftime("%H:%M:%S"))
-            else:
-                preview_df.insert(0, date_column, preview_df.index.astype(str))
-                preview_df.insert(1, time_column, "")
-            st.dataframe(
-                preview_df,
-                use_container_width=True,
-                hide_index=True,
-            )
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["zerodha_queue"].append(queue_item)
+            symbol = str(selected.get("tradingsymbol", "")).strip().upper()
+            st.success(f"Added {symbol} ({interval}) to queue.")
+
+    st.caption("Backtest Queue")
+    queue = st.session_state.get("zerodha_queue", [])
+    if not queue:
+        st.caption("Queue is empty.")
     else:
-        st.caption("Configure Zerodha data inputs for backtesting")
+        remove_idx: int | None = None
+        for i, item in enumerate(queue):
+            instrument = item.get("instrument", {})
+            symbol = str(instrument.get("tradingsymbol", "UNKNOWN"))
+            interval = str(item.get("interval", ""))
+            from_day = item.get("from")
+            to_day = item.get("to")
+            row_col1, row_col2 = st.columns([4, 1], gap="small")
+            with row_col1:
+                st.write(f"{i + 1}. {symbol} ({interval}) [{from_day} -> {to_day}]")
+            with row_col2:
+                if st.button("Remove", key=f"bt_remove_queue_{i}"):
+                    remove_idx = i
+        if remove_idx is not None:
+            st.session_state["zerodha_queue"].pop(remove_idx)
+            st.rerun()
+
+    st.caption("Queue-based mode: data will be fetched only when Execute Strategy is clicked.")
 
 
 def _default_data_source(sources: list[dict[str, object]]) -> str | None:
@@ -1039,13 +842,79 @@ def render() -> None:
                 )
                 st.caption("When enabled, Save creates a new versioned strategy file.")
 
-            st.button(
+            data_mode = st.session_state.get("data_mode", "csv")
+            queue_count = len(st.session_state.get("zerodha_queue", []))
+            csv_count = len(st.session_state.get("selected_data_files", []))
+            can_execute = queue_count > 0 if data_mode == "zerodha" else csv_count > 0
+
+            execute_clicked = st.button(
                 "Execute Strategy",
                 use_container_width=True,
                 type="primary",
-                disabled=True,
+                disabled=not can_execute,
                 key="bt_execute",
             )
+            if execute_clicked:
+                try:
+                    selected_file = st.session_state.get("selected_strategy_file")
+                    selected_class_name = st.session_state.get("selected_strategy_class")
+                    if not selected_file or not selected_class_name:
+                        raise ValueError("Please select a valid strategy")
+
+                    strategy_class = backtest_data_service.load_strategy_class(
+                        str(selected_file),
+                        str(selected_class_name),
+                    )
+
+                    if data_mode == "zerodha":
+                        with st.spinner("Building Zerodha backtest queue tasks..."):
+                            api_key, access_token = (
+                                backtest_data_service.get_zerodha_credentials(
+                                    st.session_state.get("ZERODHA_ACCESS_TOKEN")
+                                )
+                            )
+                            if not api_key or not access_token:
+                                raise RuntimeError(
+                                    "Missing Zerodha credentials. Set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in environment."
+                                )
+                            service = _get_cached_zerodha_service(api_key, access_token)
+                            tasks = backtest_data_service.build_zerodha_queue_tasks(
+                                queue=st.session_state.get("zerodha_queue", []),
+                                service=service,
+                                selected_strategy=strategy_class,
+                            )
+                    else:
+                        tasks = backtest_data_service.build_csv_tasks(
+                            st.session_state.get("selected_data_files", []),
+                            strategy_class,
+                        )
+
+                    from Backtesting.execution_manager import ExecutionManager
+
+                    config = {
+                        "initial_capital": 100000,
+                        "commission": 0.0003,
+                    }
+                    manager = ExecutionManager(config)
+                    for task in tasks:
+                        manager.add_task(task)
+
+                    with st.spinner("Running backtests..."):
+                        results = manager.run()
+                except Exception as exc:
+                    st.error(f"Failed to execute backtests: {exc}")
+                    st.session_state["bt_execution_tasks"] = []
+                else:
+                    st.session_state["bt_execution_tasks"] = tasks
+                    st.session_state["bt_execution_results"] = results
+                    st.session_state["bt_execute_status"] = "Execution completed"
+                    st.success(st.session_state["bt_execute_status"])
+                    for res in results:
+                        st.write(f"Symbol: {res.get('symbol')}")
+                        st.write(f"Final Value: {res.get('final_value')}")
+                        st.write(f"Log File: {res.get('log_file')}")
+                        if res.get("error"):
+                            st.error(f"Error: {res.get('error')}")
 
             st.button(
                 "+ Create New Strategy",
