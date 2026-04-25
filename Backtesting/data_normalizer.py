@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 import pandas as pd
-from pandas.api.types import is_object_dtype, is_string_dtype
+from pandas.api.types import (
+    is_numeric_dtype,
+    is_object_dtype,
+    is_string_dtype,
+)
 
 
 _REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 _REQUIRED_PRICE_COLUMNS = ["Open", "High", "Low", "Close"]
+
+
+def should_normalize(df: pd.DataFrame) -> bool:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return True
+
+    if not set(_REQUIRED_PRICE_COLUMNS).issubset(set(df.columns)):
+        return True
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return True
+
+    if df[_REQUIRED_PRICE_COLUMNS].isna().any().any():
+        return True
+
+    return False
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -90,16 +110,24 @@ def _ensure_required_price_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _to_numeric_safely(series: pd.Series) -> pd.Series:
+    if is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
     if is_object_dtype(series) or is_string_dtype(series):
-        cleaned = (
-            series
-            .astype("string")
-            .str.replace(",", "", regex=False)
-            .str.strip()
-            .replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
-        )
+        def _clean_value(value: object) -> object:
+            if value is None or pd.isna(value):
+                return pd.NA
+            if isinstance(value, str):
+                cleaned = value.replace(",", "").strip()
+                if cleaned.lower() in {"", "none", "nan", "null"}:
+                    return pd.NA
+                return cleaned
+            return value
+
+        cleaned = series.map(_clean_value)
         return pd.to_numeric(cleaned, errors="coerce")
+
     return pd.to_numeric(series, errors="coerce")
 
 
-__all__ = ["normalize"]
+__all__ = ["normalize", "should_normalize"]

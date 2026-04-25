@@ -10,6 +10,7 @@ from .Features import (
     name_indicator_saver_versioner,
     strategy_editor,
     strategy_selection,
+    terminal as terminal_feature,
     zerodha_historical_data,
 )
 
@@ -178,12 +179,27 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("execution_total_tasks", 0)
     st.session_state.setdefault("execution_manager", None)
     st.session_state.setdefault("execution_task_states", {})
+    if "execution_terminal" not in st.session_state:
+        st.session_state["execution_terminal"] = terminal_feature.ExecutionTerminal(max_lines=2000)
+
+
+def _get_execution_terminal() -> terminal_feature.ExecutionTerminal:
+    terminal_obj = st.session_state.get("execution_terminal")
+    if terminal_obj is None or not hasattr(terminal_obj, "log"):
+        terminal_obj = terminal_feature.ExecutionTerminal(max_lines=2000)
+        st.session_state["execution_terminal"] = terminal_obj
+    return terminal_obj
 
 
 def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float]) -> None:
     from Backtesting.execution_manager import ExecutionManager
 
-    manager = ExecutionManager(config)
+    terminal_obj = _get_execution_terminal()
+    terminal_obj.clear()
+    terminal_obj.log("Execution started", level="INFO")
+    terminal_obj.log(f"Queued {len(tasks)} tasks", level="INFO")
+
+    manager = ExecutionManager(config, terminal=terminal_obj)
     task_states: dict[str, str] = {}
 
     for task in tasks:
@@ -208,6 +224,10 @@ def _process_execution_queue_tick() -> None:
         st.session_state["execution_running"] = False
         st.session_state["execution_status"] = "FAILED"
         st.session_state["progress"] = 0.0
+        _get_execution_terminal().log(
+            "Execution manager missing. Run aborted.",
+            level="ERROR",
+        )
         return
 
     def _on_task_update(task_id: str, status: str) -> None:
@@ -233,9 +253,24 @@ def _process_execution_queue_tick() -> None:
             else "COMPLETED_WITH_ERRORS"
         )
         st.session_state["progress"] = 1.0 if total > 0 else 0.0
+        if st.session_state["execution_status"] == "COMPLETED":
+            _get_execution_terminal().log("Execution completed", level="SUCCESS")
+        else:
+            _get_execution_terminal().log(
+                "Execution completed with errors",
+                level="WARNING",
+            )
     else:
         st.session_state["execution_status"] = "RUNNING"
         st.rerun()
+
+
+def _render_execution_terminal_panel() -> None:
+    terminal_obj = _get_execution_terminal()
+    terminal_feature.render_terminal_panel(
+        terminal_obj,
+        key_prefix="bt_execution_terminal",
+    )
 
 
 def _get_cached_instrument_mapper(
@@ -922,53 +957,56 @@ def render() -> None:
                 key="bt_execute",
             )
             if execute_clicked:
-                try:
-                    selected_file = st.session_state.get("selected_strategy_file")
-                    selected_class_name = st.session_state.get("selected_strategy_class")
-                    if not selected_file or not selected_class_name:
-                        raise ValueError("Please select a valid strategy")
+                if bool(st.session_state.get("execution_running", False)):
+                    st.info("Execution is already running. Please wait for current run to finish.")
+                else:
+                    try:
+                        selected_file = st.session_state.get("selected_strategy_file")
+                        selected_class_name = st.session_state.get("selected_strategy_class")
+                        if not selected_file or not selected_class_name:
+                            raise ValueError("Please select a valid strategy")
 
-                    strategy_class = backtest_data_service.load_strategy_class(
-                        str(selected_file),
-                        str(selected_class_name),
-                    )
-
-                    if data_mode == "zerodha":
-                        with st.spinner("Building Zerodha backtest queue tasks..."):
-                            api_key, access_token = (
-                                backtest_data_service.get_zerodha_credentials(
-                                    st.session_state.get("ZERODHA_ACCESS_TOKEN")
-                                )
-                            )
-                            if not api_key or not access_token:
-                                raise RuntimeError(
-                                    "Missing Zerodha credentials. Set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in environment."
-                                )
-                            service = _get_cached_zerodha_service(api_key, access_token)
-                            tasks = backtest_data_service.build_zerodha_queue_tasks(
-                                queue=st.session_state.get("zerodha_queue", []),
-                                service=service,
-                                selected_strategy=strategy_class,
-                            )
-                    else:
-                        tasks = backtest_data_service.build_csv_tasks(
-                            st.session_state.get("selected_data_files", []),
-                            strategy_class,
+                        strategy_class = backtest_data_service.load_strategy_class(
+                            str(selected_file),
+                            str(selected_class_name),
                         )
 
-                    config = {
-                        "initial_capital": 100000,
-                        "commission": 0.0003,
-                    }
-                    _start_execution_job(tasks, config)
-                except Exception as exc:
-                    st.error(f"Failed to execute backtests: {exc}")
-                    st.session_state["bt_execution_tasks"] = []
-                else:
-                    st.session_state["bt_execution_tasks"] = tasks
-                    st.session_state["bt_execution_results"] = []
-                    st.session_state["bt_execute_status"] = "Execution started"
-                    st.success(st.session_state["bt_execute_status"])
+                        if data_mode == "zerodha":
+                            with st.spinner("Building Zerodha backtest queue tasks..."):
+                                api_key, access_token = (
+                                    backtest_data_service.get_zerodha_credentials(
+                                        st.session_state.get("ZERODHA_ACCESS_TOKEN")
+                                    )
+                                )
+                                if not api_key or not access_token:
+                                    raise RuntimeError(
+                                        "Missing Zerodha credentials. Set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in environment."
+                                    )
+                                service = _get_cached_zerodha_service(api_key, access_token)
+                                tasks = backtest_data_service.build_zerodha_queue_tasks(
+                                    queue=st.session_state.get("zerodha_queue", []),
+                                    service=service,
+                                    selected_strategy=strategy_class,
+                                )
+                        else:
+                            tasks = backtest_data_service.build_csv_tasks(
+                                st.session_state.get("selected_data_files", []),
+                                strategy_class,
+                            )
+
+                        config = {
+                            "initial_capital": 100000,
+                            "commission": 0.0003,
+                        }
+                        _start_execution_job(tasks, config)
+                    except Exception as exc:
+                        st.error(f"Failed to execute backtests: {exc}")
+                        st.session_state["bt_execution_tasks"] = []
+                    else:
+                        st.session_state["bt_execution_tasks"] = tasks
+                        st.session_state["bt_execution_results"] = []
+                        st.session_state["bt_execute_status"] = "Execution started"
+                        st.success(st.session_state["bt_execute_status"])
 
             st.caption(f"Execution Status: {st.session_state.get('execution_status', 'IDLE')}")
             st.progress(float(st.session_state.get("progress", 0.0)))
@@ -991,34 +1029,4 @@ def render() -> None:
                 key="bt_create",
             )
 
-    st.markdown(
-        """
-<div style="margin-top:16px;">
-  <div style="background:#F3F4F6; border:1px solid #E5E7EB;
-              border-radius:8px 8px 0 0; padding:8px 16px;
-              display:flex; align-items:center; gap:8px;">
-    <span style="width:8px;height:8px;border-radius:50%;background:#E5E7EB;
-                 display:inline-block;"></span>
-    <span style="width:8px;height:8px;border-radius:50%;background:#E5E7EB;
-                 display:inline-block;"></span>
-    <span style="width:8px;height:8px;border-radius:50%;background:#E5E7EB;
-                 display:inline-block;"></span>
-    <span style="font-size:12px; color:#7D8C99; margin-left:8px;
-                 font-family:'Inter',sans-serif;">
-      Terminal &mdash; Strategy Execution Output
-    </span>
-  </div>
-  <div style="background:#1E1E2E; border:1px solid #E5E7EB; border-top:none;
-              border-radius:0 0 8px 8px; padding:16px; height:200px;
-              overflow-y:auto; font-family:'Consolas','Courier New',monospace;
-              font-size:12px; line-height:1.6;">
-    <span style="color:#AAB3BC;">[system] Engine idle &mdash; no strategy loaded.</span><br>
-    <span style="color:#AAB3BC;">[system] Awaiting execution signal...</span><br>
-    <span style="color:#AAB3BC;">[system] Data feed: not connected.</span><br>
-    <span style="color:#AAB3BC;">[system] Strategy engine: standby.</span><br>
-    <span style="color:#FFC107;">&gt; _</span>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    _render_execution_terminal_panel()

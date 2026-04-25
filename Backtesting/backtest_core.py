@@ -52,6 +52,8 @@ def build_failed_result(symbol: str, error: str, *, log_file: str = "") -> dict[
         "final_value": None,
         "log_file": resolved_log_file,
         "error": str(error or "Unknown execution error"),
+        "execution_time": 0.0,
+        "retries": 0,
     }
 
 
@@ -60,6 +62,8 @@ def build_success_result(
     final_value: float,
     *,
     log_file: str,
+    execution_time: float = 0.0,
+    retries: int = 0,
 ) -> dict[str, Any]:
     return {
         "symbol": symbol,
@@ -67,7 +71,91 @@ def build_success_result(
         "final_value": float(final_value),
         "log_file": str(log_file or ""),
         "error": None,
+        "execution_time": max(0.0, float(execution_time)),
+        "retries": max(0, int(retries)),
     }
+
+
+def validate_result(
+    payload: Any,
+    *,
+    symbol: str,
+    execution_time: float | None = None,
+    retries: int | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        result = build_failed_result(symbol, "Engine returned invalid result format")
+    else:
+        result = dict(payload)
+
+    resolved_symbol = str(result.get("symbol") or symbol).strip().upper() or str(symbol)
+    status = str(result.get("status", "FAILED")).strip().upper()
+    log_file = str(result.get("log_file") or "")
+    error = result.get("error")
+    final_value = result.get("final_value")
+
+    if status not in {"SUCCESS", "FAILED"}:
+        result = build_failed_result(
+            resolved_symbol,
+            "Invalid result status from engine",
+            log_file=log_file,
+        )
+        status = "FAILED"
+
+    if status == "SUCCESS":
+        if final_value is None:
+            result = build_failed_result(
+                resolved_symbol,
+                "Execution succeeded without final_value",
+                log_file=log_file,
+            )
+            status = "FAILED"
+        else:
+            try:
+                normalized_final_value: float | None = float(final_value)
+            except (TypeError, ValueError):
+                result = build_failed_result(
+                    resolved_symbol,
+                    "Execution returned non-numeric final_value",
+                    log_file=log_file,
+                )
+                status = "FAILED"
+            else:
+                result = build_success_result(
+                    symbol=resolved_symbol,
+                    final_value=normalized_final_value,
+                    log_file=log_file,
+                )
+    else:
+        resolved_error = str(error or "").strip()
+        if not resolved_error:
+            resolved_error = "Unknown execution error"
+        result = build_failed_result(
+            resolved_symbol,
+            resolved_error,
+            log_file=log_file,
+        )
+
+    if execution_time is not None:
+        try:
+            result["execution_time"] = max(0.0, float(execution_time))
+        except (TypeError, ValueError):
+            result["execution_time"] = 0.0
+    else:
+        result["execution_time"] = max(0.0, float(result.get("execution_time", 0.0)))
+
+    if retries is not None:
+        try:
+            result["retries"] = max(0, int(retries))
+        except (TypeError, ValueError):
+            result["retries"] = 0
+    else:
+        try:
+            result["retries"] = max(0, int(result.get("retries", 0)))
+        except (TypeError, ValueError):
+            result["retries"] = 0
+
+    return result
 
 
 def execute_backtest_dataframe(
@@ -174,5 +262,6 @@ __all__ = [
     "build_success_result",
     "execute_backtest_dataframe",
     "extract_runtime_config",
+    "validate_result",
     "validate_strategy_class",
 ]
