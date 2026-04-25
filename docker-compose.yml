@@ -8,19 +8,10 @@ services:
     env_file:
       - .env
 
-    # WSLg display forwarding (run docker-compose from Ubuntu WSL terminal)
-    environment:
-      - DISPLAY=${DISPLAY}
-      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
-      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
-
     volumes:
       # Mount project folder so file changes reflect instantly (no rebuild needed)
       - .:/app
       - ~/.skills:/root/.skills
-      # WSLg sockets for GUI forwarding
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - /mnt/wslg:/mnt/wslg
 
     ports:
       # Expose Streamlit port
