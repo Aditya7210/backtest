@@ -83,8 +83,10 @@ class ExecutionTerminal:
         filter_level: str | None = None,
         error_only: bool = False,
     ) -> list[TerminalLogEntry]:
-        symbol_filter = str(filter_symbol or "").strip().upper()
-        level_filter = self._normalize_level(filter_level) if filter_level else ""
+        symbol_filter = self._normalize_filter(filter_symbol)
+        level_filter = self._normalize_level_filter(filter_level)
+        bypass_symbol_filter = not symbol_filter or symbol_filter == "ALL"
+        bypass_level_filter = not level_filter
 
         filtered: list[TerminalLogEntry] = []
         with self._lock:
@@ -92,9 +94,9 @@ class ExecutionTerminal:
                 symbol = str(item.get("symbol") or "").upper()
                 level = str(item.get("level") or "INFO").upper()
 
-                if symbol_filter and symbol_filter != "ALL" and symbol != symbol_filter:
+                if not bypass_symbol_filter and symbol != symbol_filter:
                     continue
-                if level_filter and level_filter != "ALL" and level != level_filter:
+                if not bypass_level_filter and level != level_filter:
                     continue
                 if error_only and level != "ERROR":
                     continue
@@ -142,6 +144,19 @@ class ExecutionTerminal:
             return normalized  # type: ignore[return-value]
         return "INFO"
 
+    @staticmethod
+    def _normalize_filter(value: str | None) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _normalize_level_filter(level: str | None) -> str:
+        normalized = str(level or "").strip().upper()
+        if not normalized or normalized == "ALL":
+            return ""
+        if normalized in _VALID_LEVELS:
+            return normalized
+        return ""
+
 
 def render_terminal(
     terminal: ExecutionTerminal,
@@ -154,11 +169,29 @@ def render_terminal(
     import streamlit as st
 
     target = placeholder or st.empty()
+    requested_level = str(filter_level or "").strip().upper()
     filtered = terminal.filter_logs(
         filter_symbol=filter_symbol,
         filter_level=filter_level,
         error_only=error_only,
     )
+
+    if requested_level in {"", "ALL"} and not error_only:
+        all_count = len(filtered)
+        for level in _VALID_LEVELS:
+            specific_count = len(
+                terminal.filter_logs(
+                    filter_symbol=filter_symbol,
+                    filter_level=level,
+                    error_only=False,
+                )
+            )
+            if specific_count > all_count:
+                target.warning(
+                    "Terminal filter sanity warning: ALL filter returned fewer logs than "
+                    f"{level} filter."
+                )
+                break
 
     if not filtered:
         target.info("No logs yet")

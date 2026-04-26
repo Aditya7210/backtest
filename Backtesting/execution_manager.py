@@ -7,9 +7,9 @@ import threading
 import time
 from typing import Any
 
-from Backtesting.api_based_execution_engine import run_task as run_api_task
 from Backtesting.backtest_core import build_failed_result, validate_result
-from Backtesting.execution_engine import run_task as run_csv_task
+from Backtesting.execution_engine import ExecutionEngine
+from Backtesting.performance_tracker import PerformanceTracker
 
 
 class ExecutionManager:
@@ -19,11 +19,18 @@ class ExecutionManager:
         terminal: Any | None = None,
         *,
         store_path: str | Path | None = None,
+        metrics_path: str | Path | None = None,
         poll_interval_seconds: float = 0.2,
+        worker_count: int = 3,
     ) -> None:
         self._config = dict(config) if isinstance(config, dict) else {}
         self._terminal = terminal
         self._poll_interval_seconds = max(0.05, float(poll_interval_seconds))
+        requested_worker_count = self._config.get("worker_count", worker_count)
+        try:
+            self._worker_count = max(1, int(requested_worker_count))
+        except (TypeError, ValueError):
+            self._worker_count = 3
 
         default_store_path = (
             Path(__file__).resolve().parents[1]
@@ -40,8 +47,18 @@ class ExecutionManager:
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._worker_thread: threading.Thread | None = None
+        self.workers: list[threading.Thread] = []
         self._on_task_update: Any = None
+        self._execution_engine = ExecutionEngine(
+            base_config=self._config,
+            terminal=self._terminal,
+        )
+        resolved_metrics_path = metrics_path
+        if resolved_metrics_path is None:
+            resolved_metrics_path = self._config.get("metrics_path")
+        self._performance_tracker = PerformanceTracker(
+            metrics_path=resolved_metrics_path,
+        )
 
         self._queue: list[dict[str, Any]] = []
         self._results_by_task_id: dict[str, dict[str, Any]] = {}
@@ -51,6 +68,7 @@ class ExecutionManager:
     def set_terminal(self, terminal: Any | None) -> None:
         with self._lock:
             self._terminal = terminal
+            self._execution_engine.set_terminal(terminal)
 
     def add_task(self, task: dict[str, Any]) -> str:
         if not isinstance(task, dict):
@@ -61,10 +79,12 @@ class ExecutionManager:
             task_id = f"TASK-{self._task_counter:04d}"
             queue_task = dict(task)
             queue_task.setdefault("task_id", task_id)
+            created_at = self._utc_iso_now()
 
             queue_item = {
                 "task_id": task_id,
                 "task": queue_task,
+                "created_at": created_at,
                 "status": "PENDING",
                 "result": None,
                 "start_time": None,
@@ -111,6 +131,9 @@ class ExecutionManager:
                     ordered_results.append(dict(stored_result))
             return ordered_results
 
+    def get_performance_metrics(self) -> dict[str, Any]:
+        return self._performance_tracker.get_metrics_snapshot()
+
     def has_active_tasks(self) -> bool:
         with self._lock:
             return any(
@@ -118,39 +141,70 @@ class ExecutionManager:
                 for item in self._queue
             )
 
-    def start_worker(self, on_task_update: Any = None) -> bool:
+    def start_workers(
+        self,
+        on_task_update: Any = None,
+        worker_count: int | None = None,
+    ) -> int:
         with self._lock:
             if callable(on_task_update):
                 self._on_task_update = on_task_update
 
-            if self._worker_thread is not None and self._worker_thread.is_alive():
-                return False
+            active_workers = [worker for worker in self.workers if worker.is_alive()]
+            if active_workers:
+                self.workers = active_workers
+                return len(active_workers)
+
+            if worker_count is not None:
+                try:
+                    self._worker_count = max(1, int(worker_count))
+                except (TypeError, ValueError):
+                    self._worker_count = 3
 
             self._stop_event.clear()
-            self._worker_thread = threading.Thread(
-                target=self._worker_loop,
-                name="BacktestExecutionWorker",
-                daemon=True,
-            )
-            self._worker_thread.start()
+            self.workers = []
+            for worker_index in range(self._worker_count):
+                worker_thread = threading.Thread(
+                    target=self._worker_loop,
+                    args=(worker_index + 1,),
+                    name=f"BacktestExecutionWorker-{worker_index + 1}",
+                    daemon=True,
+                )
+                worker_thread.start()
+                self.workers.append(worker_thread)
 
-        self._log("Execution worker started", level="INFO")
-        return True
+        self._log(
+            f"Execution workers started (count={len(self.workers)})",
+            level="INFO",
+        )
+        return len(self.workers)
+
+    def stop_workers(self, timeout_seconds: float = 3.0) -> None:
+        self._stop_event.set()
+        workers = list(self.workers)
+        was_running = any(worker.is_alive() for worker in workers)
+        join_timeout = max(0.1, float(timeout_seconds))
+        for worker in workers:
+            if worker.is_alive():
+                worker.join(timeout=join_timeout)
+        with self._lock:
+            self.workers = []
+        if was_running:
+            self._log("Execution workers stopped", level="WARNING")
+
+    def get_active_workers(self) -> int:
+        with self._lock:
+            self.workers = [worker for worker in self.workers if worker.is_alive()]
+            return len(self.workers)
+
+    def start_worker(self, on_task_update: Any = None) -> bool:
+        return self.start_workers(on_task_update=on_task_update) > 0
 
     def stop_worker(self, timeout_seconds: float = 3.0) -> None:
-        self._stop_event.set()
-        worker = self._worker_thread
-        was_running = worker is not None and worker.is_alive()
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=max(0.1, float(timeout_seconds)))
-        with self._lock:
-            self._worker_thread = None
-        if was_running:
-            self._log("Execution worker stopped", level="WARNING")
+        self.stop_workers(timeout_seconds=timeout_seconds)
 
     def is_worker_running(self) -> bool:
-        worker = self._worker_thread
-        return worker is not None and worker.is_alive()
+        return self.get_active_workers() > 0
 
     def run_next(self, on_task_update: Any = None) -> dict[str, Any] | None:
         if callable(on_task_update):
@@ -177,7 +231,7 @@ class ExecutionManager:
             processed_count += 1
         return self.get_ordered_results()
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, worker_id: int) -> None:
         while not self._stop_event.is_set():
             try:
                 queue_item = self._pick_next_pending_task()
@@ -187,16 +241,26 @@ class ExecutionManager:
                 self._process_queue_item(queue_item)
             except Exception as exc:
                 self._log(
-                    f"Worker loop error: {exc}",
+                    f"Worker {worker_id} loop error: {exc}",
                     level="ERROR",
                 )
                 time.sleep(self._poll_interval_seconds)
 
     def _pick_next_pending_task(self) -> dict[str, Any] | None:
         with self._lock:
-            queue_item = next(
-                (item for item in self._queue if item.get("status") == "PENDING"),
-                None,
+            pending_items = [
+                item for item in self._queue if item.get("status") == "PENDING"
+            ]
+            queue_item = (
+                sorted(
+                    pending_items,
+                    key=lambda item: (
+                        str(item.get("created_at") or ""),
+                        str(item.get("task_id") or ""),
+                    ),
+                )[0]
+                if pending_items
+                else None
             )
             if queue_item is None:
                 return None
@@ -238,11 +302,18 @@ class ExecutionManager:
         )
         total_execution_time = max(0.0, time.monotonic() - task_started_at)
         retries_used = int(final_result.get("retries", 0))
-        final_result = validate_result(
+        validated_final_result = validate_result(
             final_result,
             symbol=symbol,
             execution_time=total_execution_time,
             retries=retries_used,
+        )
+        final_result = self._apply_failure_intelligence(
+            validated_final_result,
+            symbol=symbol,
+            source_result=final_result,
+            default_stage="execution",
+            default_error_type="SYSTEM_ERROR",
         )
         final_status = str(final_result["status"]).upper()
 
@@ -255,6 +326,23 @@ class ExecutionManager:
             self._results_by_task_id[task_id] = dict(final_result)
             self._save_store_locked()
 
+            created_at = str(queue_item.get("created_at") or "")
+            start_time = str(queue_item.get("start_time") or "")
+            end_time = str(queue_item.get("end_time") or "")
+            execution_time = float(queue_item.get("execution_time") or 0.0)
+            retries = int(queue_item.get("retries") or 0)
+
+        self._record_performance_metrics(
+            task_id=task_id,
+            symbol=symbol,
+            status=final_status,
+            created_at=created_at,
+            start_time=start_time,
+            end_time=end_time,
+            execution_time=execution_time,
+            retries=retries,
+            final_result=final_result,
+        )
         self._emit_update(task_id, final_status)
         if final_status == "SUCCESS":
             self._log(
@@ -265,7 +353,10 @@ class ExecutionManager:
             )
         else:
             self._log(
-                f"{symbol} failed: {final_result.get('error')}",
+                (
+                    f"{symbol} failed [{final_result.get('error_type')} @ "
+                    f"{final_result.get('stage')}]: {final_result.get('error_message')}"
+                ),
                 level="ERROR",
                 task_id=task_id,
                 symbol=symbol,
@@ -291,35 +382,101 @@ class ExecutionManager:
 
             try:
                 execution_task = self._hydrate_strategy_class(task)
-                raw_result = self._dispatch_task(
-                    mode=mode,
-                    task=execution_task,
-                    task_id=task_id,
-                    symbol=symbol,
-                )
             except Exception as exc:
-                raw_result = build_failed_result(symbol, str(exc))
+                stage_hint = "validation"
+                error_type = self._classify_error_type(exc, stage_hint=stage_hint)
+                raw_result = self._build_classified_failure(
+                    symbol=symbol,
+                    error=exc,
+                    error_type=error_type,
+                    stage=stage_hint,
+                )
                 self._log(
-                    f"Task execution crashed: {exc}",
+                    f"Task validation failed: {self._resolve_error_message(exc)}",
                     level="ERROR",
                     task_id=task_id,
                     symbol=symbol,
                 )
+            else:
+                try:
+                    raw_result = self._dispatch_task(
+                        mode=mode,
+                        task=execution_task,
+                        task_id=task_id,
+                        symbol=symbol,
+                    )
+                except TimeoutError as exc:
+                    raw_result = self._build_classified_failure(
+                        symbol=symbol,
+                        error=exc,
+                        error_type="TIMEOUT_ERROR",
+                        stage="execution",
+                    )
+                    self._log(
+                        f"Task execution timed out: {self._resolve_error_message(exc)}",
+                        level="ERROR",
+                        task_id=task_id,
+                        symbol=symbol,
+                    )
+                except Exception as exc:
+                    stage_hint = "execution"
+                    if "unsupported task mode" in self._resolve_error_message(exc).lower():
+                        stage_hint = "validation"
+                    error_type = self._classify_error_type(exc, stage_hint=stage_hint)
+                    raw_result = self._build_classified_failure(
+                        symbol=symbol,
+                        error=exc,
+                        error_type=error_type,
+                        stage=stage_hint,
+                    )
+                    self._log(
+                        f"Task execution crashed: {self._resolve_error_message(exc)}",
+                        level="ERROR",
+                        task_id=task_id,
+                        symbol=symbol,
+                    )
 
             if raw_result is None:
-                raw_result = build_failed_result(symbol, "Engine returned no result")
+                raw_result = self._build_classified_failure(
+                    symbol=symbol,
+                    error="Engine returned no result",
+                    error_type="SYSTEM_ERROR",
+                    stage="execution",
+                )
             elif not isinstance(raw_result, dict):
-                raw_result = build_failed_result(symbol, "Engine returned invalid result format")
+                raw_result = self._build_classified_failure(
+                    symbol=symbol,
+                    error="Engine returned invalid result format",
+                    error_type="SYSTEM_ERROR",
+                    stage="execution",
+                )
 
             attempt_execution_time = max(0.0, time.monotonic() - attempt_started_at)
-            validated_attempt_result = validate_result(
-                raw_result,
+            validated_attempt_result = self._apply_failure_intelligence(
+                validate_result(
+                    raw_result,
+                    symbol=symbol,
+                    execution_time=attempt_execution_time,
+                    retries=retries_used,
+                ),
                 symbol=symbol,
-                execution_time=attempt_execution_time,
-                retries=retries_used,
+                source_result=raw_result,
+                default_stage="execution",
+                default_error_type="SYSTEM_ERROR",
             )
 
             if timeout_seconds is not None and attempt_execution_time > timeout_seconds:
+                timeout_message = (
+                    "Task exceeded timeout "
+                    f"({attempt_execution_time:.2f}s > {timeout_seconds:.2f}s)"
+                )
+                timeout_raw_result = self._build_classified_failure(
+                    symbol=symbol,
+                    error=timeout_message,
+                    error_type="TIMEOUT_ERROR",
+                    stage="execution",
+                    log_file=str(validated_attempt_result.get("log_file") or ""),
+                )
                 self._log(
                     (
                         f"Timeout exceeded on attempt {attempt_index + 1}: "
@@ -329,18 +486,17 @@ class ExecutionManager:
                     task_id=task_id,
                     symbol=symbol,
                 )
-                validated_attempt_result = validate_result(
-                    build_failed_result(
-                        symbol,
-                        (
-                            "Task exceeded timeout "
-                            f"({attempt_execution_time:.2f}s > {timeout_seconds:.2f}s)"
-                        ),
-                        log_file=str(validated_attempt_result.get("log_file") or ""),
+                validated_attempt_result = self._apply_failure_intelligence(
+                    validate_result(
+                        timeout_raw_result,
+                        symbol=symbol,
+                        execution_time=attempt_execution_time,
+                        retries=retries_used,
                     ),
                     symbol=symbol,
-                    execution_time=attempt_execution_time,
-                    retries=retries_used,
+                    source_result=timeout_raw_result,
+                    default_stage="execution",
+                    default_error_type="TIMEOUT_ERROR",
                 )
 
             last_result = validated_attempt_result
@@ -355,7 +511,17 @@ class ExecutionManager:
                     symbol=symbol,
                 )
 
-        return validate_result(last_result, symbol=symbol, retries=retry_limit)
+        return self._apply_failure_intelligence(
+            validate_result(
+                last_result,
+                symbol=symbol,
+                retries=retry_limit,
+            ),
+            symbol=symbol,
+            source_result=last_result,
+            default_stage="execution",
+            default_error_type="SYSTEM_ERROR",
+        )
 
     def _dispatch_task(
         self,
@@ -365,21 +531,12 @@ class ExecutionManager:
         task_id: str,
         symbol: str,
     ) -> dict[str, Any]:
-        if mode == "api":
-            return run_api_task(
-                task,
-                self._config,
-                terminal=self._terminal,
-                task_id=task_id,
-            )
-        if mode == "csv":
-            return run_csv_task(
-                task,
-                self._config,
-                terminal=self._terminal,
-                task_id=task_id,
-            )
-        raise ValueError(f"Unsupported task mode: {mode or '<missing>'}")
+        self._execution_engine.set_base_config(self._config)
+        return self._execution_engine.execute(
+            task=task,
+            task_id=task_id,
+            mode=mode,
+        )
 
     def _hydrate_strategy_class(self, task: dict[str, Any]) -> dict[str, Any]:
         if isinstance(task.get("strategy_class"), type):
@@ -398,6 +555,214 @@ class ExecutionManager:
             strategy_class_name,
         )
         return hydrated
+
+    def _build_classified_failure(
+        self,
+        *,
+        symbol: str,
+        error: Exception | str,
+        error_type: str,
+        stage: str,
+        log_file: str = "",
+    ) -> dict[str, Any]:
+        error_message = self._resolve_error_message(error)
+        payload = build_failed_result(symbol, error_message, log_file=log_file)
+        payload["error"] = error_message
+        payload["error_message"] = error_message
+        payload["error_type"] = self._sanitize_error_type(error_type)
+        payload["stage"] = self._sanitize_stage(stage)
+        return payload
+
+    def _apply_failure_intelligence(
+        self,
+        result: dict[str, Any],
+        *,
+        symbol: str,
+        source_result: Any,
+        default_stage: str,
+        default_error_type: str,
+    ) -> dict[str, Any]:
+        normalized = validate_result(
+            result,
+            symbol=symbol,
+            execution_time=float(result.get("execution_time", 0.0)),
+            retries=int(result.get("retries", 0)),
+        )
+        if str(normalized.get("status", "")).upper() == "SUCCESS":
+            normalized["error_type"] = None
+            normalized["error_message"] = None
+            normalized["stage"] = None
+            return normalized
+
+        source = source_result if isinstance(source_result, dict) else {}
+        resolved_error_message = str(
+            source.get("error_message")
+            or source.get("error")
+            or normalized.get("error")
+            or "Unknown execution error"
+        ).strip() or "Unknown execution error"
+        resolved_stage = self._sanitize_stage(
+            source.get("stage") or default_stage
+        )
+        resolved_error_type = self._sanitize_error_type(
+            source.get("error_type")
+            or self._classify_error_type_from_message(
+                resolved_error_message,
+                stage_hint=resolved_stage,
+            )
+            or default_error_type
+        )
+
+        normalized["error"] = resolved_error_message
+        normalized["error_message"] = resolved_error_message
+        normalized["error_type"] = resolved_error_type
+        normalized["stage"] = resolved_stage
+        return normalized
+
+    def _classify_error_type(self, error: Exception, *, stage_hint: str) -> str:
+        message = self._resolve_error_message(error)
+        return self._classify_error_type_from_message(message, stage_hint=stage_hint)
+
+    def _classify_error_type_from_message(self, message: str, *, stage_hint: str) -> str:
+        lowered = str(message or "").strip().lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            return "TIMEOUT_ERROR"
+        if stage_hint == "validation":
+            return "VALIDATION_ERROR"
+        if any(
+            marker in lowered
+            for marker in ("strategy execution failed", "strategy", "indicator")
+        ):
+            return "STRATEGY_ERROR"
+        if any(
+            marker in lowered
+            for marker in (
+                "zerodha",
+                "kite",
+                "tokenexception",
+                "networkexception",
+                "ratelimitexception",
+                "api",
+            )
+        ):
+            return "API_ERROR"
+        if any(
+            marker in lowered
+            for marker in (
+                "ohlc",
+                "data",
+                "dataset",
+                "column",
+                "nan",
+                "csv",
+                "empty",
+            )
+        ):
+            return "DATA_ERROR"
+        return "SYSTEM_ERROR"
+
+    @staticmethod
+    def _sanitize_error_type(value: Any) -> str:
+        allowed = {
+            "DATA_ERROR",
+            "API_ERROR",
+            "STRATEGY_ERROR",
+            "TIMEOUT_ERROR",
+            "VALIDATION_ERROR",
+            "SYSTEM_ERROR",
+        }
+        candidate = str(value or "").strip().upper()
+        if candidate in allowed:
+            return candidate
+        return "SYSTEM_ERROR"
+
+    @staticmethod
+    def _sanitize_stage(value: Any) -> str:
+        allowed = {"DATA_FETCH", "EXECUTION", "VALIDATION"}
+        candidate = str(value or "").strip().upper()
+        if candidate in allowed:
+            return candidate.lower()
+        return "execution"
+
+    @staticmethod
+    def _resolve_error_message(error: Exception | str) -> str:
+        if isinstance(error, Exception):
+            resolved = str(error).strip()
+            if resolved:
+                return resolved
+            return type(error).__name__
+        resolved = str(error).strip()
+        return resolved or "Unknown execution error"
+
+    def _record_performance_metrics(
+        self,
+        *,
+        task_id: str,
+        symbol: str,
+        status: str,
+        created_at: str,
+        start_time: str,
+        end_time: str,
+        execution_time: float,
+        retries: int,
+        final_result: dict[str, Any],
+    ) -> None:
+        wait_time = self._calculate_wait_time_seconds(
+            created_at=created_at,
+            start_time=start_time,
+        )
+        error_type = str(final_result.get("error_type") or "").strip().upper() or None
+        timeout = error_type == "TIMEOUT_ERROR"
+        error_message = str(final_result.get("error_message") or final_result.get("error") or "").strip() or None
+        stage = str(final_result.get("stage") or "").strip().lower() or None
+
+        try:
+            self._performance_tracker.record_task(
+                task_id=task_id,
+                symbol=symbol,
+                status=status,
+                execution_time=execution_time,
+                wait_time=wait_time,
+                retries=retries,
+                timeout=timeout,
+                error_type=error_type,
+                error_message=error_message,
+                stage=stage,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except Exception as exc:
+            self._log(
+                f"Failed to record performance metrics: {exc}",
+                level="WARNING",
+                task_id=task_id,
+                symbol=symbol,
+            )
+
+    def _calculate_wait_time_seconds(
+        self,
+        *,
+        created_at: str,
+        start_time: str,
+    ) -> float:
+        created_dt = self._parse_iso_datetime(created_at)
+        start_dt = self._parse_iso_datetime(start_time)
+        if created_dt is None or start_dt is None:
+            return 0.0
+        return max(0.0, (start_dt - created_dt).total_seconds())
+
+    @staticmethod
+    def _parse_iso_datetime(value: str) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     def _emit_update(self, task_id: str, status: str) -> None:
         callback = self._on_task_update
@@ -552,6 +917,7 @@ class ExecutionManager:
         return {
             "task_id": str(item.get("task_id") or ""),
             "task": self._serialize_value(item.get("task", {})),
+            "created_at": item.get("created_at"),
             "status": str(item.get("status") or "PENDING"),
             "result": self._serialize_value(item.get("result")),
             "start_time": item.get("start_time"),
@@ -568,9 +934,15 @@ class ExecutionManager:
         task = deserialized_task if isinstance(deserialized_task, dict) else {}
         deserialized_result = self._deserialize_value(item.get("result"))
         result = deserialized_result if isinstance(deserialized_result, dict) else None
+        created_at = str(item.get("created_at") or "").strip()
+        if not created_at:
+            created_at = str(
+                item.get("start_time") or item.get("end_time") or self._utc_iso_now()
+            )
         return {
             "task_id": task_id,
             "task": task,
+            "created_at": created_at,
             "status": str(item.get("status") or "PENDING").upper(),
             "result": result,
             "start_time": item.get("start_time"),

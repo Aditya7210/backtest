@@ -158,8 +158,65 @@ _ZERODHA_INTERVALS = [
 ]
 
 
+def _sync_state_contract() -> None:
+    selected_data_default = {
+        "mode": "csv",
+        "selected_files": [],
+        "zerodha_queue": [],
+        "symbol": "",
+        "interval": "15minute",
+        "dates": (None, None),
+    }
+    selected_strategy_default = {
+        "file": None,
+        "class": None,
+    }
+    execution_state_default = {
+        "status": "IDLE",
+        "running": False,
+        "progress": 0.0,
+        "results": [],
+    }
+
+    if not isinstance(st.session_state.get("selected_data"), dict):
+        st.session_state["selected_data"] = dict(selected_data_default)
+    if not isinstance(st.session_state.get("selected_strategy"), dict):
+        st.session_state["selected_strategy"] = dict(selected_strategy_default)
+    if not isinstance(st.session_state.get("execution_state"), dict):
+        st.session_state["execution_state"] = dict(execution_state_default)
+
+    selected_data = dict(st.session_state.get("selected_data", {}))
+    selected_data.setdefault("mode", str(st.session_state.get("data_mode", "csv")))
+    selected_data["mode"] = str(st.session_state.get("data_mode", selected_data["mode"]))
+    selected_data["selected_files"] = list(st.session_state.get("selected_data_files", []))
+    selected_data["zerodha_queue"] = list(st.session_state.get("zerodha_queue", []))
+    selected_data["symbol"] = str(st.session_state.get("selected_symbol") or "")
+    selected_data["interval"] = str(st.session_state.get("selected_interval") or "15minute")
+    selected_data["dates"] = tuple(st.session_state.get("selected_dates") or (None, None))
+    st.session_state["selected_data"] = selected_data
+
+    selected_strategy = dict(st.session_state.get("selected_strategy", {}))
+    selected_strategy["file"] = st.session_state.get("selected_strategy_file")
+    selected_strategy["class"] = st.session_state.get("selected_strategy_class")
+    st.session_state["selected_strategy"] = selected_strategy
+
+    execution_state = dict(st.session_state.get("execution_state", {}))
+    execution_state["status"] = str(st.session_state.get("execution_status", "IDLE"))
+    execution_state["running"] = bool(st.session_state.get("execution_running", False))
+    execution_state["progress"] = float(st.session_state.get("progress", 0.0))
+    execution_state["results"] = list(st.session_state.get("results", []))
+    st.session_state["execution_state"] = execution_state
+
+    assert isinstance(st.session_state.get("selected_data"), dict)
+    assert isinstance(st.session_state.get("selected_strategy"), dict)
+    assert isinstance(st.session_state.get("execution_state"), dict)
+
+
 def _initialize_zerodha_state() -> None:
     today = date.today()
+    st.session_state.setdefault("selected_symbol", None)
+    st.session_state.setdefault("selected_interval", None)
+    st.session_state.setdefault("selected_dates", None)
     st.session_state.setdefault("zerodha_symbol", "")
     st.session_state.setdefault(
         "zerodha_symbol_input",
@@ -170,6 +227,21 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("zerodha_to_date", today)
     st.session_state.setdefault("zerodha_oi", False)
     st.session_state.setdefault("zerodha_continuous", False)
+    if st.session_state.get("selected_symbol") is None:
+        st.session_state["selected_symbol"] = str(
+            st.session_state.get("zerodha_symbol", "")
+        ).strip()
+    if st.session_state.get("selected_interval") is None:
+        st.session_state["selected_interval"] = str(
+            st.session_state.get("zerodha_interval", "15minute")
+        ).strip() or "15minute"
+    st.session_state.setdefault("selected_from_date", st.session_state.get("zerodha_from_date"))
+    st.session_state.setdefault("selected_to_date", st.session_state.get("zerodha_to_date"))
+    if st.session_state.get("selected_dates") is None:
+        st.session_state["selected_dates"] = (
+            st.session_state.get("selected_from_date", today - timedelta(days=30)),
+            st.session_state.get("selected_to_date", today),
+        )
     st.session_state.setdefault("instrument_mapper", None)
     st.session_state.setdefault("instrument_mapper_identity", None)
     st.session_state.setdefault("selected_instrument", None)
@@ -194,6 +266,7 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("instrument_mapper_bootstrap_message", "")
     if "execution_terminal" not in st.session_state:
         st.session_state["execution_terminal"] = terminal_feature.ExecutionTerminal(max_lines=2000)
+    _sync_state_contract()
 
 
 def _get_execution_terminal() -> terminal_feature.ExecutionTerminal:
@@ -249,6 +322,7 @@ def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float
     st.session_state["execution_total_tasks"] = len(queue_snapshot)
     st.session_state["progress"] = 0.0
     st.session_state["results"] = manager.get_ordered_results()
+    _sync_state_contract()
 
 
 def _process_execution_queue_tick() -> None:
@@ -328,6 +402,7 @@ def _process_execution_queue_tick() -> None:
                     "Execution completed with errors",
                     level="WARNING",
                 )
+    _sync_state_contract()
 
 
 def _render_execution_terminal_panel() -> None:
@@ -384,13 +459,18 @@ def _render_zerodha_data_selection() -> None:
         else:
             st.warning(bootstrap_message)
 
+    if st.session_state.get("selected_symbol") is None:
+        st.session_state["selected_symbol"] = (
+            str(st.session_state.get("zerodha_symbol", "")).strip() or ""
+        )
+
     query = st.text_input(
         "Symbol",
-        value=st.session_state.get("zerodha_symbol", ""),
-        key="zerodha_symbol_input",
+        key="selected_symbol",
         placeholder="e.g. RELIANCE",
     ).strip()
     st.session_state["zerodha_symbol"] = query
+    st.session_state["zerodha_symbol_input"] = query
     st.caption("Instrument token is resolved automatically from the symbol.")
 
     if len(query) >= 2:
@@ -445,17 +525,37 @@ def _render_zerodha_data_selection() -> None:
     else:
         st.session_state["selected_instrument"] = None
 
+    selected_interval = str(st.session_state.get("selected_interval") or "").strip().lower()
+    if selected_interval not in _ZERODHA_INTERVALS:
+        selected_interval = "15minute"
+        st.session_state["selected_interval"] = selected_interval
+
     st.selectbox(
         "Interval",
         _ZERODHA_INTERVALS,
-        key="zerodha_interval",
+        key="selected_interval",
     )
+    st.session_state["zerodha_interval"] = str(
+        st.session_state.get("selected_interval", "15minute")
+    ).strip().lower()
 
     date_col1, date_col2 = st.columns(2, gap="small")
+    if st.session_state.get("selected_dates") is None:
+        st.session_state["selected_dates"] = (
+            st.session_state.get("selected_from_date"),
+            st.session_state.get("selected_to_date"),
+        )
     with date_col1:
-        st.date_input("From Date", key="zerodha_from_date")
+        st.date_input("From Date", key="selected_from_date")
     with date_col2:
-        st.date_input("To Date", key="zerodha_to_date")
+        st.date_input("To Date", key="selected_to_date")
+
+    st.session_state["selected_dates"] = (
+        st.session_state.get("selected_from_date"),
+        st.session_state.get("selected_to_date"),
+    )
+    st.session_state["zerodha_from_date"] = st.session_state.get("selected_from_date")
+    st.session_state["zerodha_to_date"] = st.session_state.get("selected_to_date")
 
     st.toggle("Include Open Interest (OI)", key="zerodha_oi")
     st.toggle("Continuous Futures", key="zerodha_continuous")
@@ -469,10 +569,10 @@ def _render_zerodha_data_selection() -> None:
     if add_to_queue_clicked:
         selected = st.session_state.get("selected_instrument")
         interval = backtest_data_service.normalize_interval(
-            str(st.session_state.get("zerodha_interval", "15minute"))
+            str(st.session_state.get("selected_interval", "15minute"))
         )
-        from_day = st.session_state.get("zerodha_from_date")
-        to_day = st.session_state.get("zerodha_to_date")
+        from_day = st.session_state.get("selected_from_date")
+        to_day = st.session_state.get("selected_to_date")
         requested_continuous = bool(st.session_state.get("zerodha_continuous", False))
         oi = bool(st.session_state.get("zerodha_oi", False))
 
@@ -858,6 +958,7 @@ def render() -> None:
     _initialize_zerodha_state()
     _ensure_instrument_mapper_bootstrap()
     _process_execution_queue_tick()
+    _sync_state_contract()
     st.session_state.setdefault(
         "bt_data_mode_toggle",
         st.session_state["data_mode"] == "zerodha",
@@ -1047,11 +1148,20 @@ def render() -> None:
                         help="Maximum allowed runtime per task.",
                     )
 
-            data_mode = st.session_state.get("data_mode", "csv")
-            queue_count = len(st.session_state.get("zerodha_queue", []))
-            csv_count = len(st.session_state.get("selected_data_files", []))
+            _sync_state_contract()
+            selected_data_state = dict(st.session_state.get("selected_data", {}))
+            selected_strategy_state = dict(st.session_state.get("selected_strategy", {}))
+            execution_state = dict(st.session_state.get("execution_state", {}))
+
+            data_mode = str(
+                selected_data_state.get("mode") or st.session_state.get("data_mode", "csv")
+            ).strip().lower()
+            queue_count = len(selected_data_state.get("zerodha_queue", []))
+            csv_count = len(selected_data_state.get("selected_files", []))
             can_execute = queue_count > 0 if data_mode == "zerodha" else csv_count > 0
-            execution_running = bool(st.session_state.get("execution_running", False))
+            execution_running = bool(
+                execution_state.get("running", st.session_state.get("execution_running", False))
+            )
 
             execute_clicked = st.button(
                 "Execute Strategy",
@@ -1065,8 +1175,8 @@ def render() -> None:
                     st.info("Execution is already running. Please wait for current run to finish.")
                 else:
                     try:
-                        selected_file = st.session_state.get("selected_strategy_file")
-                        selected_class_name = st.session_state.get("selected_strategy_class")
+                        selected_file = selected_strategy_state.get("file")
+                        selected_class_name = selected_strategy_state.get("class")
                         if not selected_file or not selected_class_name:
                             raise ValueError("Please select a valid strategy")
 
@@ -1077,12 +1187,12 @@ def render() -> None:
 
                         if data_mode == "zerodha":
                             tasks = backtest_data_service.build_zerodha_queue_tasks(
-                                queue=st.session_state.get("zerodha_queue", []),
+                                queue=list(selected_data_state.get("zerodha_queue", [])),
                                 selected_strategy=strategy_class,
                             )
                         else:
                             tasks = backtest_data_service.build_csv_tasks(
-                                st.session_state.get("selected_data_files", []),
+                                list(selected_data_state.get("selected_files", [])),
                                 strategy_class,
                             )
 
@@ -1108,11 +1218,13 @@ def render() -> None:
                     except Exception as exc:
                         st.error(f"Failed to execute backtests: {exc}")
                         st.session_state["bt_execution_tasks"] = []
+                        _sync_state_contract()
                     else:
                         st.session_state["bt_execution_tasks"] = tasks
                         st.session_state["bt_execution_results"] = []
                         st.session_state["bt_execute_status"] = "Execution started"
                         st.success(st.session_state["bt_execute_status"])
+                        _sync_state_contract()
 
             st.caption(f"Execution Status: {st.session_state.get('execution_status', 'IDLE')}")
             st.progress(float(st.session_state.get("progress", 0.0)))
@@ -1136,4 +1248,5 @@ def render() -> None:
             )
 
     _render_execution_terminal_panel()
+    _sync_state_contract()
     _schedule_execution_refresh()

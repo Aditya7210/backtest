@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
 import backtrader as bt
 import pandas as pd
+
+_IST_TIMEZONE = "Asia/Kolkata"
+_MARKET_OPEN_TIME = time(9, 15)
+_MARKET_CLOSE_TIME = time(15, 30)
 
 
 def validate_strategy_class(value: Any) -> type[Any]:
@@ -17,8 +21,12 @@ def validate_strategy_class(value: Any) -> type[Any]:
 def extract_runtime_config(
     base_config: dict[str, Any] | None = None,
     task_config: Any = None,
-) -> dict[str, float]:
-    config = {"initial_capital": 100000.0, "commission": 0.0003}
+) -> dict[str, Any]:
+    config = {
+        "initial_capital": 100000.0,
+        "commission": 0.0003,
+        "enforce_market_hours": True,
+    }
     if isinstance(base_config, dict):
         config.update(base_config)
     if isinstance(task_config, dict):
@@ -26,6 +34,7 @@ def extract_runtime_config(
 
     config["initial_capital"] = float(config["initial_capital"])
     config["commission"] = float(config["commission"])
+    config["enforce_market_hours"] = bool(config.get("enforce_market_hours", True))
 
     if config["initial_capital"] <= 0:
         raise ValueError("initial_capital must be greater than 0")
@@ -35,6 +44,7 @@ def extract_runtime_config(
     return {
         "initial_capital": config["initial_capital"],
         "commission": config["commission"],
+        "enforce_market_hours": config["enforce_market_hours"],
     }
 
 
@@ -171,7 +181,28 @@ def execute_backtest_dataframe(
         raise ValueError("Backtest data is empty")
     if not isinstance(strategy_class, type):
         raise ValueError("Invalid strategy class")
-    _validate_execution_dataframe(data_df)
+    raw_input_rows = int(len(data_df))
+    _log_terminal(
+        terminal,
+        f"Input dataframe rows before preparation: {raw_input_rows}",
+        task_id=task_id,
+        symbol=symbol,
+    )
+    prepared_df = _prepare_dataframe_for_backtrader(
+        data_df,
+        enforce_market_hours=bool(config.get("enforce_market_hours", True)),
+        terminal=terminal,
+        task_id=task_id,
+        symbol=symbol,
+    )
+    _validate_execution_dataframe(prepared_df)
+    prepared_rows = int(len(prepared_df))
+    _log_terminal(
+        terminal,
+        f"Rows passed to Backtrader data feed: {prepared_rows}",
+        task_id=task_id,
+        symbol=symbol,
+    )
 
     initial_capital = float(config["initial_capital"])
     commission = float(config["commission"])
@@ -183,8 +214,17 @@ def execute_backtest_dataframe(
     )
 
     cerebro = bt.Cerebro(stdstats=False)
-    data_feed = bt.feeds.PandasData(dataname=data_df)
+    data_feed = bt.feeds.PandasData(dataname=prepared_df)
     cerebro.adddata(data_feed)
+    _log_terminal(
+        terminal,
+        (
+            "Backtrader data feed attached with full prepared dataset "
+            f"({prepared_rows} rows)"
+        ),
+        task_id=task_id,
+        symbol=symbol,
+    )
     cerebro.addstrategy(strategy_class)
     cerebro.addanalyzer(_TradeEventAnalyzer, _name="trade_events")
     cerebro.addanalyzer(_ClosedTradesAnalyzer, _name="closed_trades")
@@ -197,6 +237,38 @@ def execute_backtest_dataframe(
         raise RuntimeError(f"Strategy execution failed: {exc}") from exc
 
     strategy_instance = results[0] if results else None
+    bars_processed = int(len(strategy_instance)) if strategy_instance is not None else 0
+    _log_terminal(
+        terminal,
+        f"Bars processed by Backtrader: {bars_processed}",
+        task_id=task_id,
+        symbol=symbol,
+    )
+    if bars_processed != prepared_rows:
+        mismatch_message = (
+            "Row/bar sanity check failed. "
+            f"Prepared rows={prepared_rows}, processed bars={bars_processed}"
+        )
+        _log_terminal(
+            terminal,
+            mismatch_message,
+            level="ERROR",
+            task_id=task_id,
+            symbol=symbol,
+        )
+        raise RuntimeError(mismatch_message)
+    else:
+        _log_terminal(
+            terminal,
+            (
+                "Row/bar sanity check passed: "
+                f"{prepared_rows} input rows == {bars_processed} processed bars"
+            ),
+            level="SUCCESS",
+            task_id=task_id,
+            symbol=symbol,
+        )
+
     trade_events: list[str] = []
     closed_trades: list[dict[str, Any]] = []
     if strategy_instance is not None:
@@ -448,6 +520,106 @@ def _validate_execution_dataframe(data_df: pd.DataFrame) -> None:
     fully_nan_ohlc = data_df[required].isna().all(axis=1)
     if bool(fully_nan_ohlc.any()):
         raise ValueError("Data contains rows with fully NaN OHLC values")
+
+
+def _prepare_dataframe_for_backtrader(
+    data_df: pd.DataFrame,
+    *,
+    enforce_market_hours: bool,
+    terminal: Any | None,
+    task_id: str | None,
+    symbol: str,
+) -> pd.DataFrame:
+    prepared_df = data_df.copy()
+    if prepared_df.empty:
+        return prepared_df
+
+    prepared_df.index = _to_ist_index(prepared_df.index)
+    prepared_df = prepared_df[~prepared_df.index.isna()]
+    if prepared_df.empty:
+        raise ValueError("No valid datetime index values after parsing")
+    prepared_df = prepared_df.sort_index()
+    prepared_df = prepared_df[~prepared_df.index.duplicated(keep="first")]
+
+    if enforce_market_hours and _should_filter_market_hours(prepared_df.index):
+        prepared_df = prepared_df.between_time(
+            _MARKET_OPEN_TIME.strftime("%H:%M"),
+            _MARKET_CLOSE_TIME.strftime("%H:%M"),
+        )
+        _assert_market_hours(prepared_df.index)
+    elif not enforce_market_hours:
+        _log_terminal(
+            terminal,
+            "market hour filter skipped",
+            task_id=task_id,
+            symbol=symbol,
+        )
+
+    if prepared_df.empty:
+        raise ValueError("No rows remain after market hour filtering")
+
+    if prepared_df.index.tz is not None:
+        prepared_df.index = prepared_df.index.tz_localize(None)
+
+    return prepared_df
+
+
+def _to_ist_index(index: pd.Index) -> pd.DatetimeIndex:
+    parsed_values: list[pd.Timestamp] = []
+    timezone_flags: list[bool] = []
+    for raw_value in list(index):
+        parsed = pd.to_datetime(raw_value, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        ts = pd.Timestamp(parsed)
+        parsed_values.append(ts)
+        timezone_flags.append(ts.tzinfo is not None)
+
+    if not parsed_values:
+        return pd.DatetimeIndex([], tz=_IST_TIMEZONE)
+
+    has_aware = any(timezone_flags)
+    has_naive = any(not flag for flag in timezone_flags)
+    if has_aware and has_naive:
+        raise ValueError("Mixed timezone data detected in execution index")
+
+    if has_aware:
+        converted_values = [ts.tz_convert(_IST_TIMEZONE) for ts in parsed_values]
+    else:
+        # Naive timestamps are assumed to already be IST.
+        converted_values = [ts.tz_localize(_IST_TIMEZONE) for ts in parsed_values]
+
+    converted = pd.DatetimeIndex(converted_values)
+    if converted.tz is None:
+        raise ValueError("Failed to normalize execution index timezone")
+    return converted
+
+
+def _should_filter_market_hours(index: pd.DatetimeIndex) -> bool:
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
+        return False
+
+    unique_times = {
+        (ts.hour, ts.minute, ts.second, ts.microsecond)
+        for ts in index
+    }
+    if len(unique_times) == 1:
+        only_time = next(iter(unique_times))
+        if only_time in {(0, 0, 0, 0), (5, 30, 0, 0)}:
+            return False
+    return True
+
+
+def _assert_market_hours(index: pd.DatetimeIndex) -> None:
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
+        return
+    index_times = pd.Series(index.time)
+    valid = (
+        (index_times >= _MARKET_OPEN_TIME)
+        & (index_times <= _MARKET_CLOSE_TIME)
+    )
+    if not bool(valid.all()):
+        raise ValueError("Detected timestamps outside market hours (09:15 to 15:30 IST)")
 
 
 __all__ = [

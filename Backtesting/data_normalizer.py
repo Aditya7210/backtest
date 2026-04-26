@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import time
+import logging
+
 import pandas as pd
 from pandas.api.types import (
     is_numeric_dtype,
@@ -10,6 +13,10 @@ from pandas.api.types import (
 
 _REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 _REQUIRED_PRICE_COLUMNS = ["Open", "High", "Low", "Close"]
+_IST_TIMEZONE = "Asia/Kolkata"
+_MARKET_OPEN_TIME = time(9, 15)
+_MARKET_CLOSE_TIME = time(15, 30)
+_LOGGER = logging.getLogger(__name__)
 
 
 def should_normalize(df: pd.DataFrame) -> bool:
@@ -22,13 +29,27 @@ def should_normalize(df: pd.DataFrame) -> bool:
     if not isinstance(df.index, pd.DatetimeIndex):
         return True
 
+    if df.index.tz is not None and _timezone_name(df.index.tz) != _IST_TIMEZONE:
+        return True
+
     if df[_REQUIRED_PRICE_COLUMNS].isna().any().any():
         return True
+
+    if df.index.duplicated().any():
+        return True
+
+    if _should_filter_market_hours(df.index):
+        if not _are_all_times_within_market_hours(df.index):
+            return True
 
     return False
 
 
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
+def normalize(
+    df: pd.DataFrame,
+    *,
+    enforce_market_hours: bool = True,
+) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame):
         raise ValueError("Input must be a pandas DataFrame")
     if df.empty:
@@ -48,11 +69,37 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     working_df["Volume"] = working_df["Volume"].fillna(0)
     working_df = working_df.sort_index()
     working_df = working_df[~working_df.index.duplicated(keep="first")]
+    working_df = _apply_market_hour_filter(
+        working_df,
+        enforce_market_hours=enforce_market_hours,
+    )
+    _assert_market_hours(
+        working_df.index,
+        enforce_market_hours=enforce_market_hours,
+    )
 
     if working_df.empty:
         raise ValueError("No valid OHLCV rows after normalization")
 
     return working_df[_REQUIRED_COLUMNS]
+
+
+def prepare_ohlcv_for_plot(
+    df: pd.DataFrame,
+    *,
+    enforce_market_hours: bool = True,
+) -> pd.DataFrame:
+    """
+    Normalize price data into plotting-ready OHLCV with stable datetime index.
+    """
+    normalized = normalize(df, enforce_market_hours=enforce_market_hours)
+    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+    normalized = normalized[~normalized.index.isna()]
+    normalized = normalized.sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="first")]
+    if normalized.empty:
+        raise ValueError("No valid rows available for plotting after datetime cleanup")
+    return normalized
 
 
 def _rename_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,8 +140,13 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
 
     if not isinstance(working_df.index, pd.DatetimeIndex):
         raise ValueError("Normalized index must be DatetimeIndex")
-    if working_df.index.tz is not None:
-        working_df.index = working_df.index.tz_localize(None)
+
+    working_df.index = _to_ist_index(working_df.index)
+
+    working_df.index = pd.to_datetime(working_df.index, errors="coerce")
+    working_df = working_df[~working_df.index.isna()]
+    working_df = working_df.sort_index()
+    working_df = working_df[~working_df.index.duplicated(keep="first")]
     if working_df.index.empty:
         raise ValueError("No valid datetime values found")
 
@@ -130,4 +182,110 @@ def _to_numeric_safely(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-__all__ = ["normalize", "should_normalize"]
+def _apply_market_hour_filter(
+    df: pd.DataFrame,
+    *,
+    enforce_market_hours: bool,
+) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex) or df.empty:
+        return df
+    if not enforce_market_hours:
+        _LOGGER.info("market hour filter skipped")
+        return df
+    if not _should_filter_market_hours(df.index):
+        return df
+    filtered = df.between_time(
+        _MARKET_OPEN_TIME.strftime("%H:%M"),
+        _MARKET_CLOSE_TIME.strftime("%H:%M"),
+    )
+    return filtered
+
+
+def _assert_market_hours(
+    index: pd.DatetimeIndex,
+    *,
+    enforce_market_hours: bool,
+) -> None:
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
+        return
+    if not enforce_market_hours:
+        return
+    if not _should_filter_market_hours(index):
+        return
+    if not _are_all_times_within_market_hours(index):
+        raise ValueError("Detected timestamps outside market hours (09:15 to 15:30 IST)")
+
+
+def _are_all_times_within_market_hours(index: pd.DatetimeIndex) -> bool:
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
+        return True
+    time_series = pd.Series(index.time)
+    return bool(
+        ((time_series >= _MARKET_OPEN_TIME) & (time_series <= _MARKET_CLOSE_TIME)).all()
+    )
+
+
+def _should_filter_market_hours(index: pd.DatetimeIndex) -> bool:
+    if not isinstance(index, pd.DatetimeIndex) or index.empty:
+        return False
+
+    unique_times = {
+        (ts.hour, ts.minute, ts.second, ts.microsecond)
+        for ts in index
+    }
+    if len(unique_times) == 1:
+        only_time = next(iter(unique_times))
+        if only_time in {(0, 0, 0, 0), (5, 30, 0, 0)}:
+            return False
+    return True
+
+
+def _timezone_name(tz: object) -> str:
+    if tz is None:
+        return ""
+    key = getattr(tz, "key", None)
+    if isinstance(key, str) and key:
+        return key
+    zone = getattr(tz, "zone", None)
+    if isinstance(zone, str) and zone:
+        return zone
+    return str(tz)
+
+
+def _to_ist_index(index: pd.Index) -> pd.DatetimeIndex:
+    parsed_values: list[pd.Timestamp] = []
+    timezone_flags: list[bool] = []
+
+    for raw_value in list(index):
+        parsed = pd.to_datetime(raw_value, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        ts = pd.Timestamp(parsed)
+        parsed_values.append(ts)
+        timezone_flags.append(ts.tzinfo is not None)
+
+    if not parsed_values:
+        return pd.DatetimeIndex([], tz=_IST_TIMEZONE)
+
+    has_aware = any(timezone_flags)
+    has_naive = any(not item for item in timezone_flags)
+    if has_aware and has_naive:
+        raise ValueError("Mixed timezone data detected in datetime index")
+
+    if has_aware:
+        converted_values = [ts.tz_convert(_IST_TIMEZONE) for ts in parsed_values]
+        _LOGGER.info("Timezone detected: aware. Converted timestamps to IST.")
+    else:
+        # Naive values are treated as already in IST; no UTC shift is applied.
+        converted_values = [ts.tz_localize(_IST_TIMEZONE) for ts in parsed_values]
+        _LOGGER.info("Timezone detected: naive. Assuming timestamps are already IST.")
+
+    converted = pd.DatetimeIndex(converted_values)
+    if converted.tz is None:
+        raise ValueError("Datetime index timezone normalization failed")
+    if _timezone_name(converted.tz) != _IST_TIMEZONE:
+        raise ValueError("Datetime index timezone is inconsistent after normalization")
+    return converted
+
+
+__all__ = ["normalize", "prepare_ohlcv_for_plot", "should_normalize"]
