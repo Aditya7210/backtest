@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
+import warnings
 
 import backtrader as bt
 import pandas as pd
@@ -10,6 +11,33 @@ import pandas as pd
 _IST_TIMEZONE = "Asia/Kolkata"
 _MARKET_OPEN_TIME = time(9, 15)
 _MARKET_CLOSE_TIME = time(15, 30)
+_SHORT_ENABLE_FLAGS = (
+    "allow_short",
+    "allow_shorts",
+    "allow_short_selling",
+    "short_selling",
+    "enable_short",
+    "short_enabled",
+)
+_SHORT_SCALING_ENABLE_FLAGS = (
+    "allow_short_scaling",
+    "allow_short_scale_in",
+    "short_scaling_enabled",
+    "short_scale_in_enabled",
+)
+_POSITION_SIZE_TOLERANCE = 1e-9
+
+
+def _to_ist_datetime(value: datetime) -> datetime:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        # Backtrader numeric datetimes are treated as UTC when tz info is missing.
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert(_IST_TIMEZONE).to_pydatetime()
+
+
+def _format_ist_datetime(value: datetime) -> str:
+    return _to_ist_datetime(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def validate_strategy_class(value: Any) -> type[Any]:
@@ -225,16 +253,25 @@ def execute_backtest_dataframe(
         task_id=task_id,
         symbol=symbol,
     )
-    cerebro.addstrategy(strategy_class)
+    guarded_strategy_class = _build_position_guarded_strategy(strategy_class)
+    cerebro.addstrategy(guarded_strategy_class)
     cerebro.addanalyzer(_TradeEventAnalyzer, _name="trade_events")
     cerebro.addanalyzer(_ClosedTradesAnalyzer, _name="closed_trades")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trade_stats")
-    cerebro.broker.setcash(initial_capital)
-    cerebro.broker.setcommission(commission=commission)
-    try:
-        results = cerebro.run()
-    except Exception as exc:
-        raise RuntimeError(f"Strategy execution failed: {exc}") from exc
+    _reset_cerebro_broker_state(
+        cerebro,
+        initial_capital=initial_capital,
+        commission=commission,
+        terminal=terminal,
+        task_id=task_id,
+        symbol=symbol,
+    )
+    results = _run_cerebro_with_isolation(
+        cerebro,
+        terminal=terminal,
+        task_id=task_id,
+        symbol=symbol,
+    )
 
     strategy_instance = results[0] if results else None
     bars_processed = int(len(strategy_instance)) if strategy_instance is not None else 0
@@ -272,6 +309,28 @@ def execute_backtest_dataframe(
     trade_events: list[str] = []
     closed_trades: list[dict[str, Any]] = []
     if strategy_instance is not None:
+        blocked_sell_events = getattr(strategy_instance, "_position_guard_events", [])
+        if isinstance(blocked_sell_events, list):
+            for event in blocked_sell_events[:40]:
+                _log_terminal(
+                    terminal,
+                    str(event),
+                    level="WARNING",
+                    task_id=task_id,
+                    symbol=symbol,
+                )
+            if len(blocked_sell_events) > 40:
+                _log_terminal(
+                    terminal,
+                    (
+                        "... "
+                        f"{len(blocked_sell_events) - 40} more blocked sell events"
+                    ),
+                    level="WARNING",
+                    task_id=task_id,
+                    symbol=symbol,
+                )
+
         try:
             raw_events = strategy_instance.analyzers.trade_events.get_analysis()
         except Exception:
@@ -349,12 +408,12 @@ class _TradeEventAnalyzer(bt.Analyzer):
         try:
             if trade.justopened:
                 side = "BUY" if trade.size > 0 else "SELL"
-                event_time = bt.num2date(trade.dtopen).strftime("%Y-%m-%d %H:%M:%S")
+                event_time = _format_ist_datetime(bt.num2date(trade.dtopen))
                 self.events.append(
                     f"{side} qty={abs(trade.size)} price={float(trade.price):.2f} at {event_time}"
                 )
             if trade.isclosed:
-                event_time = bt.num2date(trade.dtclose).strftime("%Y-%m-%d %H:%M:%S")
+                event_time = _format_ist_datetime(bt.num2date(trade.dtclose))
                 self.events.append(
                     f"CLOSE pnl={float(trade.pnlcomm):.2f} at {event_time}"
                 )
@@ -369,35 +428,51 @@ class _ClosedTradesAnalyzer(bt.Analyzer):
     def start(self) -> None:
         self.rows: list[dict[str, Any]] = []
         self._open_dirs: dict[int, str] = {}
-        self._open_qty: dict[int, int] = {}
+        self._open_qty: dict[int, float] = {}
 
     def notify_trade(self, trade: Any) -> None:
         try:
             if trade.justopened:
                 direction = "BUY" if float(trade.size) > 0 else "SELL"
                 self._open_dirs[int(trade.ref)] = direction
-                self._open_qty[int(trade.ref)] = max(1, int(abs(float(trade.size))))
+                self._open_qty[int(trade.ref)] = abs(float(trade.size))
 
             if not trade.isclosed:
                 return
 
             trade_ref = int(trade.ref)
             direction = self._open_dirs.pop(trade_ref, "BUY")
-            qty = self._open_qty.pop(trade_ref, 1)
+            qty = abs(float(self._open_qty.pop(trade_ref, 0.0)))
             entry_px = float(trade.price)
-            exit_px = (float(trade.pnl) / qty + entry_px) if qty > 0 else entry_px
+            net_pnl = float(getattr(trade, "pnlcomm", 0.0) or 0.0)
+
+            if qty > _POSITION_SIZE_TOLERANCE:
+                pnl_per_unit = net_pnl / qty
+                if direction == "SELL":
+                    # Short trade: profit when exit < entry.
+                    exit_px = entry_px - pnl_per_unit
+                else:
+                    # Long trade: profit when exit > entry.
+                    exit_px = entry_px + pnl_per_unit
+            else:
+                exit_px = entry_px
+
+            if abs(qty - round(qty)) <= _POSITION_SIZE_TOLERANCE:
+                qty_value: int | float = int(round(qty))
+            else:
+                qty_value = round(qty, 6)
 
             self.rows.append(
                 {
-                    "Entry Date": bt.num2date(trade.dtopen).strftime("%Y-%m-%d %H:%M:%S"),
-                    "Close Date": bt.num2date(trade.dtclose).strftime("%Y-%m-%d %H:%M:%S"),
+                    "Entry Date": _format_ist_datetime(bt.num2date(trade.dtopen)),
+                    "Close Date": _format_ist_datetime(bt.num2date(trade.dtclose)),
                     "Symbol": "",
                     "Direction": direction,
-                    "Qty": qty,
+                    "Qty": qty_value,
                     "Entry Price": round(entry_px, 2),
                     "Exit Price": round(exit_px, 2),
                     "Gross P&L": round(float(trade.pnl), 2),
-                    "Net P&L": round(float(trade.pnlcomm), 2),
+                    "Net P&L": round(net_pnl, 2),
                 }
             )
         except Exception:
@@ -405,6 +480,253 @@ class _ClosedTradesAnalyzer(bt.Analyzer):
 
     def get_analysis(self) -> list[dict[str, Any]]:
         return self.rows
+
+
+def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
+    class _PositionGuardedStrategy(strategy_class):  # type: ignore[misc, valid-type]
+        def _resolve_bool_setting(self, keys: tuple[str, ...]) -> bool:
+            for key in keys:
+                if hasattr(self, key):
+                    value = getattr(self, key)
+                    if isinstance(value, bool):
+                        return value
+
+            params = getattr(self, "p", None)
+            if params is not None:
+                for key in keys:
+                    if hasattr(params, key):
+                        value = getattr(params, key)
+                        if isinstance(value, bool):
+                            return value
+            return False
+
+        def _resolve_short_enabled(self) -> bool:
+            return self._resolve_bool_setting(_SHORT_ENABLE_FLAGS)
+
+        def _resolve_short_scaling_enabled(self) -> bool:
+            return self._resolve_bool_setting(_SHORT_SCALING_ENABLE_FLAGS)
+
+        def _resolve_sell_data(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any | None:
+            if "data" in kwargs and kwargs.get("data") is not None:
+                return kwargs.get("data")
+            if args:
+                candidate = args[0]
+                if not isinstance(candidate, (bool, int, float, str)):
+                    return candidate
+            return None
+
+        def _position_size_for_data(self, data_obj: Any | None) -> float:
+            try:
+                if data_obj is not None and hasattr(self, "getposition"):
+                    position = self.getposition(data=data_obj)
+                else:
+                    position = self.position
+            except Exception:
+                position = self.position
+            try:
+                return float(getattr(position, "size", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        def _record_blocked_sell(
+            self,
+            *,
+            position_size: float,
+            short_enabled: bool,
+            short_scaling_enabled: bool,
+            reason: str,
+            data_obj: Any | None,
+        ) -> None:
+            events = getattr(self, "_position_guard_events", None)
+            if not isinstance(events, list):
+                events = []
+                setattr(self, "_position_guard_events", events)
+
+            timestamp = "N/A"
+            try:
+                timestamp = _format_ist_datetime(self.datetime.datetime(0))
+            except Exception:
+                pass
+
+            data_label = "default"
+            if data_obj is not None:
+                raw_name = getattr(data_obj, "_name", "") or getattr(data_obj, "_dataname", "")
+                data_label = str(raw_name or "default")
+
+            events.append(
+                "[OrderGuard] Blocked sell order "
+                f"at {timestamp} (data={data_label}, position_size={position_size}, "
+                f"short_enabled={short_enabled}, "
+                f"short_scaling_enabled={short_scaling_enabled}, "
+                f"reason={reason})."
+            )
+
+        def _record_sell_interpretation(
+            self,
+            *,
+            message: str,
+            position_size: float,
+            short_enabled: bool,
+            short_scaling_enabled: bool,
+            data_obj: Any | None,
+        ) -> None:
+            events = getattr(self, "_position_guard_events", None)
+            if not isinstance(events, list):
+                events = []
+                setattr(self, "_position_guard_events", events)
+
+            timestamp = "N/A"
+            try:
+                timestamp = _format_ist_datetime(self.datetime.datetime(0))
+            except Exception:
+                pass
+
+            data_label = "default"
+            if data_obj is not None:
+                raw_name = getattr(data_obj, "_name", "") or getattr(data_obj, "_dataname", "")
+                data_label = str(raw_name or "default")
+
+            events.append(
+                f"{message} at {timestamp} "
+                f"(data={data_label}, position_size={position_size}, "
+                f"short_enabled={short_enabled}, "
+                f"short_scaling_enabled={short_scaling_enabled})."
+            )
+
+        def sell(self, *args: Any, **kwargs: Any) -> Any:
+            data_obj = self._resolve_sell_data(args, kwargs)
+            position_size = self._position_size_for_data(data_obj)
+            short_enabled = self._resolve_short_enabled()
+            short_scaling_enabled = self._resolve_short_scaling_enabled()
+
+            if position_size > _POSITION_SIZE_TOLERANCE:
+                self._record_sell_interpretation(
+                    message="[OrderGuard] SELL interpreted as LONG EXIT",
+                    position_size=position_size,
+                    short_enabled=short_enabled,
+                    short_scaling_enabled=short_scaling_enabled,
+                    data_obj=data_obj,
+                )
+                return super().sell(*args, **kwargs)
+
+            if abs(position_size) <= _POSITION_SIZE_TOLERANCE and short_enabled:
+                self._record_sell_interpretation(
+                    message="[OrderGuard] SELL interpreted as SHORT ENTRY",
+                    position_size=position_size,
+                    short_enabled=short_enabled,
+                    short_scaling_enabled=short_scaling_enabled,
+                    data_obj=data_obj,
+                )
+                return super().sell(*args, **kwargs)
+
+            if position_size < -_POSITION_SIZE_TOLERANCE and short_scaling_enabled:
+                self._record_sell_interpretation(
+                    message="[OrderGuard] SELL interpreted as SHORT ENTRY",
+                    position_size=position_size,
+                    short_enabled=short_enabled,
+                    short_scaling_enabled=short_scaling_enabled,
+                    data_obj=data_obj,
+                )
+                return super().sell(*args, **kwargs)
+
+            if abs(position_size) <= _POSITION_SIZE_TOLERANCE:
+                reason = "flat-position-short-disabled"
+            elif position_size < 0:
+                reason = "short-position-scaling-disabled"
+            else:
+                reason = "sell-not-allowed"
+
+            self._record_blocked_sell(
+                position_size=position_size,
+                short_enabled=short_enabled,
+                short_scaling_enabled=short_scaling_enabled,
+                reason=reason,
+                data_obj=data_obj,
+            )
+            return None
+
+    _PositionGuardedStrategy.__name__ = f"{strategy_class.__name__}PositionGuarded"
+    _PositionGuardedStrategy.__qualname__ = _PositionGuardedStrategy.__name__
+    return _PositionGuardedStrategy
+
+
+def _reset_cerebro_broker_state(
+    cerebro: bt.Cerebro,
+    *,
+    initial_capital: float,
+    commission: float,
+    terminal: Any | None,
+    task_id: str | None,
+    symbol: str,
+) -> None:
+    try:
+        # Fresh broker instance avoids carry-over state between runs.
+        cerebro.broker = bt.brokers.BackBroker()
+    except Exception:
+        pass
+
+    cerebro.broker.setcash(float(initial_capital))
+    cerebro.broker.setcommission(commission=float(commission))
+    _log_terminal(
+        terminal,
+        "Broker state reset for isolated run",
+        task_id=task_id,
+        symbol=symbol,
+    )
+
+
+def _run_cerebro_with_isolation(
+    cerebro: bt.Cerebro,
+    *,
+    terminal: Any | None,
+    task_id: str | None,
+    symbol: str,
+) -> list[Any]:
+    try:
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            warnings.simplefilter("always")
+            results = cerebro.run()
+    except Exception as exc:
+        _log_terminal(
+            terminal,
+            f"Backtrader sandbox trapped exception: {type(exc).__name__}: {exc}",
+            level="ERROR",
+            task_id=task_id,
+            symbol=symbol,
+        )
+        raise RuntimeError(f"Strategy execution failed: {type(exc).__name__}: {exc}") from exc
+
+    if captured_warnings:
+        max_warning_logs = 25
+        for warning_item in captured_warnings[:max_warning_logs]:
+            warning_msg = str(getattr(warning_item, "message", "") or "").strip()
+            warning_category = getattr(getattr(warning_item, "category", None), "__name__", "Warning")
+            warning_file = str(getattr(warning_item, "filename", "") or "")
+            warning_line = int(getattr(warning_item, "lineno", 0) or 0)
+            location = f"{Path(warning_file).name}:{warning_line}" if warning_file else f"line:{warning_line}"
+            _log_terminal(
+                terminal,
+                f"[Backtrader Warning] {warning_category} at {location}: {warning_msg}",
+                level="WARNING",
+                task_id=task_id,
+                symbol=symbol,
+            )
+
+        if len(captured_warnings) > max_warning_logs:
+            _log_terminal(
+                terminal,
+                (
+                    "[Backtrader Warning] "
+                    f"{len(captured_warnings) - max_warning_logs} additional warnings suppressed"
+                ),
+                level="WARNING",
+                task_id=task_id,
+                symbol=symbol,
+            )
+
+    if not isinstance(results, list):
+        raise RuntimeError("Strategy execution failed: Backtrader returned invalid result payload")
+    return results
 
 
 def _log_terminal(
@@ -559,7 +881,8 @@ def _prepare_dataframe_for_backtrader(
         raise ValueError("No rows remain after market hour filtering")
 
     if prepared_df.index.tz is not None:
-        prepared_df.index = prepared_df.index.tz_localize(None)
+        # Feed Backtrader as naive UTC so bt.num2date outputs can be safely mapped back to IST.
+        prepared_df.index = prepared_df.index.tz_convert("UTC").tz_localize(None)
 
     return prepared_df
 

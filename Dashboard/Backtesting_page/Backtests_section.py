@@ -803,6 +803,92 @@ def _normalize_editor_text(content: str) -> str:
     return (content or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _mark_strategy_files_dirty() -> None:
+    st.session_state["strategy_files_dirty"] = True
+    runtime_flags = st.session_state.get("_strategy_selection_runtime")
+    if isinstance(runtime_flags, dict):
+        runtime_flags["strategy_files_dirty"] = True
+
+
+def _build_strategy_class_name(cleaned_name: str) -> str:
+    tokens = [token for token in cleaned_name.replace("-", "_").split("_") if token]
+    class_name = "".join(token[:1].upper() + token[1:] for token in tokens)
+    if not class_name:
+        class_name = "NewStrategy"
+    if not class_name[0].isalpha():
+        class_name = f"Strategy{class_name}"
+    return class_name
+
+
+def _build_new_strategy_template(cleaned_name: str) -> str:
+    class_name = _build_strategy_class_name(cleaned_name)
+    return f'''"""Auto-generated Backtrader strategy template."""
+
+import backtrader as bt
+
+
+class {class_name}(bt.Strategy):
+    params = dict()
+
+    def __init__(self) -> None:
+        self.order = None
+
+    def next(self) -> None:
+        if self.order:
+            return
+
+        # Example:
+        # if not self.position:
+        #     self.order = self.buy(size=1)
+        # elif self.position.size > 0:
+        #     self.order = self.sell(size=1)
+        pass
+
+    def notify_order(self, order) -> None:
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        self.order = None
+'''
+
+
+def _create_new_strategy_file(raw_name: str) -> tuple[bool, str, str | None]:
+    strategy_selection.refresh_if_needed()
+    is_valid, validation_error = name_indicator_saver_versioner.validate_strategy_name(
+        raw_name,
+        current_file_id=None,
+    )
+    if not is_valid:
+        return False, validation_error or "Invalid strategy name", None
+
+    cleaned_name = name_indicator_saver_versioner.clean_strategy_name(raw_name)
+    if not cleaned_name:
+        return False, "Strategy name cannot be empty", None
+
+    strategy_root = strategy_selection.STRATEGY_CODES_ROOT.resolve()
+    target_path = (strategy_root / f"{cleaned_name}.py").resolve()
+    try:
+        target_path.relative_to(strategy_root)
+    except ValueError:
+        return False, "Resolved strategy path is invalid", None
+
+    if target_path.exists():
+        return False, "Strategy with this name already exists", None
+
+    content = _build_new_strategy_template(cleaned_name)
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with target_path.open("x", encoding="utf-8", newline="\n") as file_handle:
+            file_handle.write(content)
+    except FileExistsError:
+        return False, "Strategy with this name already exists", None
+    except OSError as exc:
+        return False, f"Unable to create strategy file: {exc}", None
+
+    _mark_strategy_files_dirty()
+    strategy_selection.refresh_if_needed()
+    return True, f"Strategy created: {target_path.name}", target_path.relative_to(strategy_root).as_posix()
+
+
 def _on_strategy_file_change(visible_file_ids: tuple[str, ...]) -> None:
     selected_option = st.session_state.get("bt_strategy_file_widget", _STRATEGY_FILE_PLACEHOLDER)
     previous_file = st.session_state.get("selected_strategy_file")
@@ -1240,12 +1326,28 @@ def render() -> None:
                     if res.get("error"):
                         st.error(f"Error: {res.get('error')}")
 
-            st.button(
+            st.text_input(
+                "New Strategy Name",
+                key="bt_new_strategy_name",
+                placeholder="e.g. MeanReversionStrategy",
+            )
+            create_clicked = st.button(
                 "+ Create New Strategy",
                 use_container_width=True,
-                disabled=True,
                 key="bt_create",
             )
+            if create_clicked:
+                created_ok, message, created_file_id = _create_new_strategy_file(
+                    str(st.session_state.get("bt_new_strategy_name", "")),
+                )
+                if not created_ok:
+                    st.error(message)
+                elif created_file_id is not None:
+                    st.session_state["selected_strategy_file"] = created_file_id
+                    st.session_state["selected_strategy_class"] = None
+                    st.session_state["bt_new_strategy_name"] = ""
+                    st.success(message)
+                    st.rerun()
 
     _render_execution_terminal_panel()
     _sync_state_contract()

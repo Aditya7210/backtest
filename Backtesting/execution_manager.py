@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import json
+import multiprocessing
 from pathlib import Path
+import queue as std_queue
 import threading
 import time
 from typing import Any
@@ -10,6 +13,44 @@ from typing import Any
 from Backtesting.backtest_core import build_failed_result, validate_result
 from Backtesting.execution_engine import ExecutionEngine
 from Backtesting.performance_tracker import PerformanceTracker
+
+
+def _execute_task_in_subprocess(
+    result_queue: Any,
+    *,
+    base_config: dict[str, Any],
+    mode: str,
+    task: dict[str, Any],
+    task_id: str,
+) -> None:
+    try:
+        execution_task = dict(task) if isinstance(task, dict) else {}
+        if not isinstance(execution_task.get("strategy_class"), type):
+            strategy_file = str(execution_task.get("strategy_file_path") or "").strip()
+            strategy_class_name = str(execution_task.get("strategy_class_name") or "").strip()
+            if strategy_file and strategy_class_name:
+                from Dashboard.Backtesting_page.Features import backtest_data_service
+
+                safe_strategy_path = backtest_data_service.resolve_strategy_file_path(
+                    strategy_file
+                )
+                execution_task["strategy_class"] = backtest_data_service.load_strategy_class(
+                    str(safe_strategy_path),
+                    strategy_class_name,
+                )
+
+        engine = ExecutionEngine(
+            base_config=dict(base_config) if isinstance(base_config, dict) else {},
+            terminal=None,
+        )
+        result = engine.execute(
+            task=execution_task,
+            task_id=str(task_id or ""),
+            mode=str(mode or "").strip().lower(),
+        )
+        result_queue.put({"ok": True, "result": result})
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 class ExecutionManager:
@@ -77,7 +118,7 @@ class ExecutionManager:
         with self._lock:
             self._task_counter += 1
             task_id = f"TASK-{self._task_counter:04d}"
-            queue_task = dict(task)
+            queue_task = copy.deepcopy(task)
             queue_task.setdefault("task_id", task_id)
             created_at = self._utc_iso_now()
 
@@ -372,8 +413,9 @@ class ExecutionManager:
         retry_limit: int,
         timeout_seconds: float | None,
     ) -> dict[str, Any]:
+        immutable_task = copy.deepcopy(task)
         attempts = retry_limit + 1
-        mode = str(task.get("mode", "")).strip().lower()
+        mode = str(immutable_task.get("mode", "")).strip().lower()
         last_result: dict[str, Any] = build_failed_result(symbol, "Execution did not run")
 
         for attempt_index in range(attempts):
@@ -381,7 +423,8 @@ class ExecutionManager:
             retries_used = attempt_index
 
             try:
-                execution_task = self._hydrate_strategy_class(task)
+                execution_task = copy.deepcopy(immutable_task)
+                execution_task = self._hydrate_strategy_class(execution_task)
             except Exception as exc:
                 stage_hint = "validation"
                 error_type = self._classify_error_type(exc, stage_hint=stage_hint)
@@ -399,11 +442,12 @@ class ExecutionManager:
                 )
             else:
                 try:
-                    raw_result = self._dispatch_task(
+                    raw_result = self._dispatch_task_with_hard_timeout(
                         mode=mode,
                         task=execution_task,
                         task_id=task_id,
                         symbol=symbol,
+                        timeout_seconds=timeout_seconds,
                     )
                 except TimeoutError as exc:
                     raw_result = self._build_classified_failure(
@@ -465,57 +509,48 @@ class ExecutionManager:
                 default_error_type="SYSTEM_ERROR",
             )
 
-            if timeout_seconds is not None and attempt_execution_time > timeout_seconds:
-                timeout_message = (
-                    "Task exceeded timeout "
-                    f"({attempt_execution_time:.2f}s > {timeout_seconds:.2f}s)"
-                )
-                timeout_raw_result = self._build_classified_failure(
-                    symbol=symbol,
-                    error=timeout_message,
-                    error_type="TIMEOUT_ERROR",
-                    stage="execution",
-                    log_file=str(validated_attempt_result.get("log_file") or ""),
-                )
-                self._log(
-                    (
-                        f"Timeout exceeded on attempt {attempt_index + 1}: "
-                        f"{attempt_execution_time:.2f}s > {timeout_seconds:.2f}s"
-                    ),
-                    level="WARNING",
-                    task_id=task_id,
-                    symbol=symbol,
-                )
-                validated_attempt_result = self._apply_failure_intelligence(
-                    validate_result(
-                        timeout_raw_result,
-                        symbol=symbol,
-                        execution_time=attempt_execution_time,
-                        retries=retries_used,
-                    ),
-                    symbol=symbol,
-                    source_result=timeout_raw_result,
-                    default_stage="execution",
-                    default_error_type="TIMEOUT_ERROR",
-                )
-
             last_result = validated_attempt_result
             if str(validated_attempt_result.get("status", "")).upper() == "SUCCESS":
                 return validated_attempt_result
 
             if attempt_index < retry_limit:
-                self._log(
-                    f"Retrying {symbol} ({attempt_index + 1}/{retry_limit})",
-                    level="WARNING",
-                    task_id=task_id,
-                    symbol=symbol,
-                )
+                if self._is_retryable_failure(validated_attempt_result):
+                    self._log(
+                        f"Retrying {symbol} ({attempt_index + 1}/{retry_limit})",
+                        level="WARNING",
+                        task_id=task_id,
+                        symbol=symbol,
+                    )
+                else:
+                    non_retryable_type = self._sanitize_error_type(
+                        (
+                            validated_attempt_result.get("error_type")
+                            if isinstance(validated_attempt_result, dict)
+                            else None
+                        )
+                    )
+                    self._log(
+                        (
+                            f"Not retrying {symbol}: non-retryable error type "
+                            f"{non_retryable_type}"
+                        ),
+                        level="WARNING",
+                        task_id=task_id,
+                        symbol=symbol,
+                    )
+                    break
 
+        resolved_retries = 0
+        if isinstance(last_result, dict):
+            try:
+                resolved_retries = max(0, int(last_result.get("retries", 0)))
+            except (TypeError, ValueError):
+                resolved_retries = 0
         return self._apply_failure_intelligence(
             validate_result(
                 last_result,
                 symbol=symbol,
-                retries=retry_limit,
+                retries=resolved_retries,
             ),
             symbol=symbol,
             source_result=last_result,
@@ -538,6 +573,93 @@ class ExecutionManager:
             mode=mode,
         )
 
+    def _dispatch_task_with_hard_timeout(
+        self,
+        *,
+        mode: str,
+        task: dict[str, Any],
+        task_id: str,
+        symbol: str,
+        timeout_seconds: float | None,
+    ) -> dict[str, Any]:
+        if timeout_seconds is None:
+            return self._dispatch_task(
+                mode=mode,
+                task=task,
+                task_id=task_id,
+                symbol=symbol,
+            )
+
+        timeout = max(0.1, float(timeout_seconds))
+        subprocess_task = self._prepare_task_for_subprocess(task)
+        process_context = multiprocessing.get_context("spawn")
+        result_queue = process_context.Queue(maxsize=1)
+        process = process_context.Process(
+            target=_execute_task_in_subprocess,
+            kwargs={
+                "result_queue": result_queue,
+                "base_config": dict(self._config),
+                "mode": mode,
+                "task": subprocess_task,
+                "task_id": task_id,
+            },
+            daemon=True,
+        )
+
+        try:
+            process.start()
+        except Exception:
+            self._close_result_queue(result_queue)
+            raise
+        process.join(timeout=timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=1.0)
+
+            self._close_result_queue(result_queue)
+            raise TimeoutError(f"Task exceeded hard timeout ({timeout:.2f}s)")
+
+        try:
+            payload = result_queue.get(timeout=0.5)
+        except std_queue.Empty:
+            payload = None
+        finally:
+            self._close_result_queue(result_queue)
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Task subprocess finished without result (exit_code={process.exitcode})"
+            )
+
+        if bool(payload.get("ok")):
+            result = payload.get("result")
+            if isinstance(result, dict):
+                return result
+            raise RuntimeError("Task subprocess returned invalid result payload")
+
+        raise RuntimeError(str(payload.get("error") or "Task subprocess failed"))
+
+    @staticmethod
+    def _close_result_queue(result_queue: Any) -> None:
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+        try:
+            result_queue.join_thread()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _prepare_task_for_subprocess(task: dict[str, Any]) -> dict[str, Any]:
+        prepared = copy.deepcopy(task) if isinstance(task, dict) else {}
+        # Avoid pickling dynamic class objects; child process re-hydrates safely.
+        prepared.pop("strategy_class", None)
+        return prepared
+
     def _hydrate_strategy_class(self, task: dict[str, Any]) -> dict[str, Any]:
         if isinstance(task.get("strategy_class"), type):
             return dict(task)
@@ -550,8 +672,9 @@ class ExecutionManager:
         from Dashboard.Backtesting_page.Features import backtest_data_service
 
         hydrated = dict(task)
+        safe_strategy_path = backtest_data_service.resolve_strategy_file_path(strategy_file)
         hydrated["strategy_class"] = backtest_data_service.load_strategy_class(
-            strategy_file,
+            str(safe_strategy_path),
             strategy_class_name,
         )
         return hydrated
@@ -683,6 +806,14 @@ class ExecutionManager:
         if candidate in allowed:
             return candidate.lower()
         return "execution"
+
+    def _is_retryable_failure(self, result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("status", "")).strip().upper() == "SUCCESS":
+            return False
+        error_type = self._sanitize_error_type(result.get("error_type"))
+        return error_type in {"TIMEOUT_ERROR", "API_ERROR"}
 
     @staticmethod
     def _resolve_error_message(error: Exception | str) -> str:

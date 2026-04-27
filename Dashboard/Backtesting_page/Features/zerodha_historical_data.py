@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
+import os
+from pathlib import Path
 from time import sleep
 from typing import Any
 
 import pandas as pd
+from dotenv import load_dotenv
 from kiteconnect import KiteConnect
 
 
@@ -51,8 +54,36 @@ class ZerodhaHistoricalData:
     MARKET_CLOSE_TIME = time(15, 30)
 
     def __init__(self, api_key: str, access_token: str) -> None:
-        self._kite = KiteConnect(api_key=api_key)
-        self._kite.set_access_token(access_token)
+        self._api_key_fallback = str(api_key or "").strip()
+        self._access_token_fallback = str(access_token or "").strip()
+        self._env_path = Path(__file__).resolve().parents[3] / ".env"
+
+    def get_kite_client(self) -> KiteConnect:
+        load_dotenv(dotenv_path=self._env_path, override=True)
+
+        api_key = (
+            (os.getenv("ZERODHA_API_KEY") or "").strip()
+            or (os.getenv("api_key") or "").strip()
+            or self._api_key_fallback
+        )
+        access_token = (
+            (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+            or (os.getenv("access_token") or "").strip()
+            or self._access_token_fallback
+        )
+
+        if not api_key:
+            raise RuntimeError(
+                "Zerodha API key missing. Please set ZERODHA_API_KEY or api_key in .env."
+            )
+        if not access_token:
+            raise RuntimeError(
+                "Zerodha access token missing. Refresh login and update access_token in .env."
+            )
+
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        return kite
 
     def fetch_data(
         self,
@@ -283,12 +314,13 @@ class ZerodhaHistoricalData:
                 sleep(min(2 ** attempt, 8))
 
             try:
+                kite_client = self.get_kite_client()
                 print("Fetching Zerodha data with:")
                 print("Instrument:", instrument_token)
                 print("From:", from_date)
                 print("To:", to_date)
                 print("Interval:", interval)
-                data = self._kite.historical_data(
+                data = kite_client.historical_data(
                     instrument_token=instrument_token,
                     from_date=from_date,
                     to_date=to_date,
@@ -301,6 +333,11 @@ class ZerodhaHistoricalData:
                 print(f"[Zerodha Error] Attempt {attempt + 1} failed:")
                 print("ERROR TYPE:", type(e).__name__)
                 print("ERROR MESSAGE:", str(e))
+                if self._is_auth_error(e):
+                    print(
+                        "[Zerodha Auth] Access token appears invalid/expired. "
+                        "If .env is refreshed, next retry will use the latest token."
+                    )
                 last_exception = e
 
         if last_exception is None:
@@ -685,3 +722,18 @@ class ZerodhaHistoricalData:
         if not isinstance(value, datetime):
             raise ValueError(f"{field_name} must be a datetime instance")
         return value
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        error_name = type(exc).__name__.lower()
+        error_message = str(exc).lower()
+        auth_tokens = (
+            "token",
+            "expired",
+            "invalid",
+            "unauthor",
+            "forbidden",
+            "permission",
+            "session",
+        )
+        return ("token" in error_name) or any(token in error_message for token in auth_tokens)

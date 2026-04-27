@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from Backtesting.backtest_core import (
     validate_strategy_class,
 )
 from Backtesting.data_normalizer import normalize
+
+MAX_CSV_SIZE_MB = 200.0
 
 
 def run_csv_task(
@@ -46,6 +49,11 @@ def run_csv_task(
         symbol=symbol,
     )
     try:
+        file_size_mb = os.path.getsize(csv_path) / (1024 * 1024)
+        if file_size_mb > MAX_CSV_SIZE_MB:
+            raise ValueError(
+                f"CSV too large: {file_size_mb:.2f} MB (max {MAX_CSV_SIZE_MB:.2f} MB)"
+            )
         raw_df = pd.read_csv(csv_path)
     except EmptyDataError as exc:
         return _build_failure_result(
@@ -331,8 +339,8 @@ def _log(
         return
     try:
         terminal.log(message, level=level, task_id=task_id, symbol=symbol)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[LoggingError] {exc}")
 
 
 def _build_failure_result(
@@ -407,6 +415,8 @@ def _classify_fetch_error(error: Exception) -> str:
             "no rows",
             "permission",
             "path",
+            "too large",
+            "size",
         )
     ):
         return "DATA_ERROR"

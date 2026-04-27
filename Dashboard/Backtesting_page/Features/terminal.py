@@ -5,6 +5,7 @@ from datetime import datetime
 from datetime import timedelta, timezone
 from html import escape
 from threading import RLock
+import time as time_module
 from typing import Literal, TypedDict
 from zoneinfo import ZoneInfo
 
@@ -215,6 +216,7 @@ def render_terminal_panel(
     terminal: ExecutionTerminal,
     *,
     key_prefix: str = "execution_terminal",
+    auto_refresh: bool = True,
 ) -> None:
     import streamlit as st
 
@@ -279,6 +281,10 @@ def render_terminal_panel(
     )
 
     _render_task_logs(terminal, key_prefix=key_prefix)
+    _maybe_auto_refresh_terminal_panel(
+        key_prefix=key_prefix,
+        auto_refresh=auto_refresh,
+    )
 
 
 def _render_task_logs(terminal: ExecutionTerminal, *, key_prefix: str) -> None:
@@ -310,6 +316,50 @@ def _render_task_logs(terminal: ExecutionTerminal, *, key_prefix: str) -> None:
                 continue
             text = "\n".join(_format_log_line(item) for item in logs)
             st.code(text, language="text")
+
+
+def _is_execution_active() -> bool:
+    import streamlit as st
+
+    if bool(st.session_state.get("execution_running", False)):
+        return True
+
+    execution_state = st.session_state.get("execution_state")
+    if not isinstance(execution_state, dict):
+        return False
+
+    status = str(execution_state.get("status") or "").strip().upper()
+    running = bool(execution_state.get("running", False))
+    return running or status == "RUNNING"
+
+
+def _maybe_auto_refresh_terminal_panel(
+    *,
+    key_prefix: str,
+    auto_refresh: bool,
+) -> None:
+    import streamlit as st
+
+    enabled_key = f"{key_prefix}_auto_refresh_enabled"
+    last_refresh_key = f"{key_prefix}_last_refresh_ts"
+
+    st.session_state.setdefault(enabled_key, bool(auto_refresh))
+    st.session_state.setdefault(last_refresh_key, 0.0)
+
+    auto_refresh_enabled = bool(st.session_state.get(enabled_key, bool(auto_refresh)))
+    if not auto_refresh_enabled:
+        return
+    if not _is_execution_active():
+        return
+
+    now = float(time_module.time())
+    last_refresh = float(st.session_state.get(last_refresh_key, 0.0))
+    if (now - last_refresh) < 1.0:
+        return
+
+    st.session_state[last_refresh_key] = now
+    time_module.sleep(1.0)
+    st.rerun()
 
 
 def _render_log_html(item: TerminalLogEntry) -> str:

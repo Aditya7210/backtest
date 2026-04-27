@@ -19,6 +19,27 @@ _MARKET_CLOSE_TIME = time(15, 30)
 _LOGGER = logging.getLogger(__name__)
 
 
+def _to_ist_timestamp(
+    value: object,
+    *,
+    naive_source_timezone: str = _IST_TIMEZONE,
+) -> pd.Timestamp | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+
+    ts = pd.Timestamp(parsed)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(naive_source_timezone)
+    else:
+        ts = ts.tz_convert(_IST_TIMEZONE)
+
+    converted = ts.tz_convert(_IST_TIMEZONE)
+    if converted.tzinfo is None:
+        return None
+    return converted
+
+
 def should_normalize(df: pd.DataFrame) -> bool:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return True
@@ -56,6 +77,8 @@ def normalize(
         raise ValueError("Input DataFrame is empty")
 
     working_df = df.copy()
+    before_rows = int(len(working_df))
+    _LOGGER.info("Normalization start: input rows=%d", before_rows)
     working_df = _rename_columns(working_df)
     working_df = _ensure_datetime_index(working_df)
     working_df = _ensure_required_price_columns(working_df)
@@ -65,13 +88,33 @@ def normalize(
     for column in _REQUIRED_COLUMNS:
         working_df[column] = _to_numeric_safely(working_df[column])
 
+    before_nan_drop = int(len(working_df))
     working_df = working_df.dropna(subset=_REQUIRED_PRICE_COLUMNS)
+    after_nan_drop = int(len(working_df))
+    _LOGGER.info(
+        "Dropped %d rows due to NaN",
+        max(0, before_nan_drop - after_nan_drop),
+    )
+
     working_df["Volume"] = working_df["Volume"].fillna(0)
     working_df = working_df.sort_index()
+    before_dedup = int(len(working_df))
     working_df = working_df[~working_df.index.duplicated(keep="first")]
+    after_dedup = int(len(working_df))
+    _LOGGER.info(
+        "Dropped %d duplicate rows",
+        max(0, before_dedup - after_dedup),
+    )
+
+    before_market_filter = int(len(working_df))
     working_df = _apply_market_hour_filter(
         working_df,
         enforce_market_hours=enforce_market_hours,
+    )
+    after_market_filter = int(len(working_df))
+    _LOGGER.info(
+        "Filtered %d rows outside market hours",
+        max(0, before_market_filter - after_market_filter),
     )
     _assert_market_hours(
         working_df.index,
@@ -80,6 +123,8 @@ def normalize(
 
     if working_df.empty:
         raise ValueError("No valid OHLCV rows after normalization")
+
+    _LOGGER.info("Normalization complete: output rows=%d", int(len(working_df)))
 
     return working_df[_REQUIRED_COLUMNS]
 
@@ -260,9 +305,10 @@ def _to_ist_index(index: pd.Index) -> pd.DatetimeIndex:
         parsed = pd.to_datetime(raw_value, errors="coerce")
         if pd.isna(parsed):
             continue
-        ts = pd.Timestamp(parsed)
-        parsed_values.append(ts)
-        timezone_flags.append(ts.tzinfo is not None)
+        timezone_flags.append(pd.Timestamp(parsed).tzinfo is not None)
+        converted = _to_ist_timestamp(raw_value, naive_source_timezone=_IST_TIMEZONE)
+        if converted is not None:
+            parsed_values.append(converted)
 
     if not parsed_values:
         return pd.DatetimeIndex([], tz=_IST_TIMEZONE)
@@ -272,15 +318,12 @@ def _to_ist_index(index: pd.Index) -> pd.DatetimeIndex:
     if has_aware and has_naive:
         raise ValueError("Mixed timezone data detected in datetime index")
 
+    converted = pd.DatetimeIndex(parsed_values)
     if has_aware:
-        converted_values = [ts.tz_convert(_IST_TIMEZONE) for ts in parsed_values]
         _LOGGER.info("Timezone detected: aware. Converted timestamps to IST.")
     else:
-        # Naive values are treated as already in IST; no UTC shift is applied.
-        converted_values = [ts.tz_localize(_IST_TIMEZONE) for ts in parsed_values]
         _LOGGER.info("Timezone detected: naive. Assuming timestamps are already IST.")
 
-    converted = pd.DatetimeIndex(converted_values)
     if converted.tz is None:
         raise ValueError("Datetime index timezone normalization failed")
     if _timezone_name(converted.tz) != _IST_TIMEZONE:

@@ -700,6 +700,13 @@ def _render_dashboard_instance(instance_id, price_csv_options, trade_csv_options
                 legend=dict(orientation="h", yanchor="bottom", y=1.00, xanchor="right", x=1),
                 uirevision="stable"
             )
+            if _is_intraday_index(df_price_sub.index):
+                fig.update_xaxes(
+                    rangebreaks=[
+                        dict(bounds=["sat", "mon"]),
+                        dict(bounds=[15.5, 9.25], pattern="hour"),
+                    ]
+                )
             fig.update_xaxes(showgrid=True, gridcolor=GRID_COLOR, showline=False, zeroline=False, showspikes=True, spikemode="across", spikecolor="grey", spikethickness=1)
             fig.update_yaxes(showgrid=True, gridcolor=GRID_COLOR, showline=False, zeroline=False, showspikes=True, spikemode="across", spikecolor="grey", spikethickness=1, tickformat=".2f")
             for r in range(1, num_rows):

@@ -57,6 +57,7 @@ class TrendPullbackStrategy(bt.Strategy):
         risk_pct=0.015,           
         max_gap_pct=0.04,         
         min_trend_diff_pct=0.01,
+        allow_short_selling=True,
         use_trailing_sl=False,    
     )
 

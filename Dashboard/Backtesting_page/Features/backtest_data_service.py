@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from datetime import date, datetime, time
 import hashlib
 import importlib.util
@@ -29,6 +30,85 @@ def resolve_zerodha_cache_dir() -> Path:
         / "Data_files"
         / "Zerodha_data"
     )
+
+
+def resolve_strategy_root() -> Path:
+    return (resolve_project_root() / "Strategies" / "Strategy_codes").resolve()
+
+
+def resolve_strategy_file_path(strategy_file_path: str) -> Path:
+    raw_value = str(strategy_file_path or "").strip()
+    if not raw_value:
+        raise ValueError("Invalid strategy path")
+
+    strategy_root = resolve_strategy_root()
+    raw_path = Path(raw_value)
+    candidate = raw_path if raw_path.is_absolute() else (strategy_root / raw_path)
+
+    try:
+        resolved_path = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Strategy file not found: {strategy_file_path}") from exc
+    except OSError as exc:
+        raise ValueError("Invalid strategy path") from exc
+
+    try:
+        resolved_path.relative_to(strategy_root)
+    except ValueError as exc:
+        raise ValueError("Invalid strategy path") from exc
+
+    if not resolved_path.is_file():
+        raise ValueError(f"Strategy file not found: {strategy_file_path}")
+    if resolved_path.suffix.lower() != ".py":
+        raise ValueError("Invalid strategy path")
+
+    return resolved_path
+
+
+def _callable_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _iter_assignment_targets(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return [node.target]
+    if isinstance(node, ast.AugAssign):
+        return [node.target]
+    return []
+
+
+def _validate_strategy_source_safety(resolved_path: Path) -> None:
+    try:
+        source = resolved_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError("Unable to read strategy source") from exc
+
+    try:
+        tree = ast.parse(source, filename=str(resolved_path))
+    except SyntaxError as exc:
+        raise ValueError(f"Strategy file has syntax errors: {exc}") from exc
+
+    blocked_calls = {"eval", "exec", "compile", "__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            called_name = _callable_name(node.func)
+            if called_name in blocked_calls:
+                raise ValueError(
+                    "Strategy contains disallowed dynamic execution primitives"
+                )
+
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in _iter_assignment_targets(node):
+                if isinstance(target, ast.Name) and target.id == "__import__":
+                    raise ValueError("Invalid strategy code: import override is not allowed")
+                if isinstance(target, ast.Attribute) and target.attr == "__import__":
+                    raise ValueError("Invalid strategy code: import override is not allowed")
 
 
 def get_zerodha_credentials(session_access_token: str | None = None) -> tuple[str, str]:
@@ -292,17 +372,11 @@ def ensure_instrument_mapper_ready() -> tuple[bool, str]:
 def load_strategy_class(strategy_file_path: str, class_name: str) -> type[Any]:
     if not strategy_file_path or not class_name:
         raise ValueError("Invalid strategy selection")
+    if not str(class_name).strip().isidentifier():
+        raise ValueError("Invalid strategy class name")
 
-    strategy_root = Path(__file__).resolve().parents[3] / "Strategies" / "Strategy_codes"
-    raw_path = Path(strategy_file_path)
-    resolved_path = (
-        raw_path.resolve()
-        if raw_path.is_absolute()
-        else (strategy_root / raw_path).resolve()
-    )
-
-    if not resolved_path.is_file():
-        raise ValueError(f"Strategy file not found: {strategy_file_path}")
+    resolved_path = resolve_strategy_file_path(strategy_file_path)
+    _validate_strategy_source_safety(resolved_path)
 
     module_name = (
         "strategy_module_"
@@ -313,12 +387,15 @@ def load_strategy_class(strategy_file_path: str, class_name: str) -> type[Any]:
         raise ValueError("Unable to load strategy module")
 
     module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
+    finally:
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
 
     if not hasattr(module, class_name):
         raise ValueError(f"Strategy class '{class_name}' not found")
@@ -343,5 +420,7 @@ __all__ = [
     "resolve_project_root",
     "resolve_zerodha_cache_dir",
     "resolve_env_path",
+    "resolve_strategy_file_path",
+    "resolve_strategy_root",
     "validate_zerodha_session",
 ]
