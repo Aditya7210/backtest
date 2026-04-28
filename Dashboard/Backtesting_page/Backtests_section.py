@@ -15,6 +15,7 @@ from .Features import (
     backtest_data_service,
     data_selection_feature,
     instrument_mapper as instrument_mapper_feature,
+    live_data_selector,
     name_indicator_saver_versioner,
     strategy_editor,
     strategy_selection,
@@ -166,6 +167,11 @@ def _sync_state_contract() -> None:
         "symbol": "",
         "interval": "15minute",
         "dates": (None, None),
+        "live_date": None,
+        "live_instrument_token": None,
+        "live_tradingsymbol": None,
+        "live_timeframe": None,
+        "live_data_type": "equities",
     }
     selected_strategy_default = {
         "file": None,
@@ -193,6 +199,11 @@ def _sync_state_contract() -> None:
     selected_data["symbol"] = str(st.session_state.get("selected_symbol") or "")
     selected_data["interval"] = str(st.session_state.get("selected_interval") or "15minute")
     selected_data["dates"] = tuple(st.session_state.get("selected_dates") or (None, None))
+    selected_data["live_date"] = st.session_state.get("live_selected_date")
+    selected_data["live_instrument_token"] = st.session_state.get("live_selected_token")
+    selected_data["live_tradingsymbol"] = st.session_state.get("live_selected_symbol")
+    selected_data["live_timeframe"] = st.session_state.get("live_selected_timeframe")
+    selected_data["live_data_type"] = str(st.session_state.get("live_selected_data_type") or "equities")
     st.session_state["selected_data"] = selected_data
 
     selected_strategy = dict(st.session_state.get("selected_strategy", {}))
@@ -264,6 +275,11 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("instrument_mapper_bootstrap_done", False)
     st.session_state.setdefault("instrument_mapper_bootstrap_ok", True)
     st.session_state.setdefault("instrument_mapper_bootstrap_message", "")
+    st.session_state.setdefault("live_selected_date", None)
+    st.session_state.setdefault("live_selected_token", None)
+    st.session_state.setdefault("live_selected_symbol", None)
+    st.session_state.setdefault("live_selected_timeframe", "5min")
+    st.session_state.setdefault("live_selected_data_type", "equities")
     if "execution_terminal" not in st.session_state:
         st.session_state["execution_terminal"] = terminal_feature.ExecutionTerminal(max_lines=2000)
     _sync_state_contract()
@@ -655,6 +671,11 @@ def _render_data_selection() -> None:
     if data_mode == "zerodha":
         _render_zerodha_data_selection()
         return
+    if data_mode == "live_market":
+        st.session_state["selected_data_files"] = []
+        st.session_state["zerodha_queue"] = []
+        live_data_selector.render()
+        return
 
     sources = data_selection_feature.get_data_sources()
     if not sources:
@@ -1045,17 +1066,23 @@ def render() -> None:
     _ensure_instrument_mapper_bootstrap()
     _process_execution_queue_tick()
     _sync_state_contract()
-    st.session_state.setdefault(
-        "bt_data_mode_toggle",
-        st.session_state["data_mode"] == "zerodha",
+    mode_to_label = {
+        "csv": "Local CSV",
+        "zerodha": "Zerodha API",
+        "live_market": "Live Market",
+    }
+    expected_label = mode_to_label.get(
+        str(st.session_state.get("data_mode", "csv")),
+        "Local CSV",
     )
-
-    initial_mode = "zerodha" if st.session_state.get("bt_data_mode_toggle") else "csv"
-    if initial_mode != st.session_state["data_mode"]:
-        st.session_state["data_mode"] = initial_mode
+    if st.session_state.get("bt_data_mode_select") != expected_label:
+        st.session_state["bt_data_mode_select"] = expected_label
 
     if st.session_state["data_mode"] == "zerodha":
         st.session_state["selected_data_files"] = []
+    elif st.session_state["data_mode"] == "live_market":
+        st.session_state["selected_data_files"] = []
+        st.session_state["zerodha_queue"] = []
 
     if st.session_state["data_mode"] == "csv":
         data_selection_feature.initialize_data_layer()
@@ -1129,23 +1156,34 @@ def render() -> None:
                     name_indicator_saver_versioner.save_strategy()
 
             with toggle_col:
-                toggle_value = st.toggle(
-                    "CSV / Zerodha",
-                    value=(st.session_state["data_mode"] == "zerodha"),
-                    key="bt_data_mode_toggle",
+                mode_options = {
+                    "Local CSV": "csv",
+                    "Zerodha API": "zerodha",
+                    "Live Market": "live_market",
+                }
+                selected_label = st.selectbox(
+                    "Data Source",
+                    options=list(mode_options.keys()),
+                    key="bt_data_mode_select",
                 )
-
-                new_mode = "zerodha" if toggle_value else "csv"
+                new_mode = mode_options[selected_label]
                 if new_mode != st.session_state["data_mode"]:
                     st.session_state["data_mode"] = new_mode
                     if new_mode == "zerodha":
                         st.session_state["selected_data_files"] = []
                         st.session_state["bt_data_files_widget"] = []
+                    elif new_mode == "live_market":
+                        st.session_state["selected_data_files"] = []
+                        st.session_state["zerodha_queue"] = []
+                    else:
+                        st.session_state["zerodha_queue"] = []
 
                 if st.session_state["data_mode"] == "csv":
                     st.caption("Using local CSV data")
-                else:
+                elif st.session_state["data_mode"] == "zerodha":
                     st.caption("Using Zerodha API data")
+                else:
+                    st.caption("Using collected live market data")
 
         ace_widget_key = (
             f"bt_code_editor_ace::{current_strategy_file}"
@@ -1244,7 +1282,18 @@ def render() -> None:
             ).strip().lower()
             queue_count = len(selected_data_state.get("zerodha_queue", []))
             csv_count = len(selected_data_state.get("selected_files", []))
-            can_execute = queue_count > 0 if data_mode == "zerodha" else csv_count > 0
+            live_ready = bool(
+                selected_data_state.get("live_date")
+                and selected_data_state.get("live_instrument_token")
+                and selected_data_state.get("live_tradingsymbol")
+                and selected_data_state.get("live_timeframe")
+            )
+            if data_mode == "zerodha":
+                can_execute = queue_count > 0
+            elif data_mode == "live_market":
+                can_execute = live_ready
+            else:
+                can_execute = csv_count > 0
             execution_running = bool(
                 execution_state.get("running", st.session_state.get("execution_running", False))
             )
@@ -1275,6 +1324,37 @@ def render() -> None:
                             tasks = backtest_data_service.build_zerodha_queue_tasks(
                                 queue=list(selected_data_state.get("zerodha_queue", [])),
                                 selected_strategy=strategy_class,
+                            )
+                        elif data_mode == "live_market":
+                            live_date = str(selected_data_state.get("live_date") or "").strip()
+                            live_token = selected_data_state.get("live_instrument_token")
+                            live_symbol = str(selected_data_state.get("live_tradingsymbol") or "").strip().upper()
+                            live_timeframe = str(selected_data_state.get("live_timeframe") or "").strip().lower()
+                            live_data_type = str(selected_data_state.get("live_data_type") or "equities").strip().lower()
+                            ok, message = backtest_data_service.validate_live_data_selection(
+                                date_str=live_date,
+                                instrument_token=int(live_token) if live_token is not None else 0,
+                                tradingsymbol=live_symbol,
+                                timeframe=live_timeframe,
+                                data_type=live_data_type,
+                                live_data_root=backtest_data_service.resolve_live_data_root(),
+                            )
+                            if not ok:
+                                raise ValueError(message)
+
+                            from LiveMarket.data_extractor import extract_instrument_data
+
+                            extracted_path = extract_instrument_data(
+                                date_str=live_date,
+                                instrument_token=int(live_token),
+                                tradingsymbol=live_symbol,
+                                timeframe=live_timeframe,
+                                data_type=live_data_type,
+                                live_data_root=backtest_data_service.resolve_live_data_root(),
+                            )
+                            tasks = backtest_data_service.build_csv_tasks(
+                                [str(extracted_path)],
+                                strategy_class,
                             )
                         else:
                             tasks = backtest_data_service.build_csv_tasks(

@@ -36,6 +36,10 @@ def resolve_strategy_root() -> Path:
     return (resolve_project_root() / "Strategies" / "Strategy_codes").resolve()
 
 
+def resolve_live_data_root() -> Path:
+    return resolve_project_root() / "Data" / "live_market"
+
+
 def resolve_strategy_file_path(strategy_file_path: str) -> Path:
     raw_value = str(strategy_file_path or "").strip()
     if not raw_value:
@@ -407,6 +411,37 @@ def load_strategy_class(strategy_file_path: str, class_name: str) -> type[Any]:
     return strategy_class
 
 
+def validate_live_data_selection(
+    date_str: str,
+    instrument_token: int,
+    tradingsymbol: str,
+    timeframe: str,
+    data_type: str,
+    live_data_root: Path | None = None,
+) -> tuple[bool, str]:
+    _ = instrument_token
+    _ = tradingsymbol
+    normalized_date = str(date_str or "").strip()
+    normalized_timeframe = str(timeframe or "").strip().lower()
+    normalized_data_type = str(data_type or "").strip().lower()
+    if not normalized_date:
+        return False, "No live market date selected."
+    if normalized_data_type not in {"equities", "options"}:
+        return False, "Invalid live market data type."
+    if not normalized_timeframe:
+        return False, "No live market timeframe selected."
+
+    root = resolve_live_data_root() if live_data_root is None else Path(live_data_root)
+    daily_dir = root / "daily" / normalized_date
+    if not daily_dir.is_dir():
+        return False, f"No data collected for {normalized_date}."
+
+    source_csv = daily_dir / f"{normalized_data_type}_{normalized_timeframe}.csv"
+    if not source_csv.is_file():
+        return False, f"{normalized_timeframe} data not available for {normalized_date}. Try 1min."
+    return True, ""
+
+
 __all__ = [
     "build_csv_tasks",
     "build_zerodha_queue_tasks",
@@ -418,9 +453,11 @@ __all__ = [
     "load_strategy_class",
     "normalize_interval",
     "resolve_project_root",
+    "resolve_live_data_root",
     "resolve_zerodha_cache_dir",
     "resolve_env_path",
     "resolve_strategy_file_path",
     "resolve_strategy_root",
     "validate_zerodha_session",
+    "validate_live_data_selection",
 ]

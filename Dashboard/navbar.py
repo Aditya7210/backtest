@@ -67,8 +67,8 @@ def render_navbar() -> str:
 
     selected = option_menu(
         menu_title=None,
-        options=["Zerodha Authentication", "Dashboard", "Backtests"],
-        icons=["shield-lock", "activity", "bar-chart-steps"],
+        options=["Zerodha Authentication", "Dashboard", "Backtests", "Market Pulse"],
+        icons=["shield-lock", "activity", "bar-chart-steps", "broadcast"],
         menu_icon="cast",
         default_index=0,
         orientation="horizontal",
