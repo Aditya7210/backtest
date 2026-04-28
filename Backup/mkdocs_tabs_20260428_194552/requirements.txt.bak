@@ -40,3 +40,6 @@ streamlit-ace
 watchdog
 #Lib to run .env file
 python-dotenv
+
+#FOr Documentation
+mkdocs

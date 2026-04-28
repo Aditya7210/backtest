@@ -1,0 +1,188 @@
+from pathlib import Path
+
+import streamlit as st
+
+
+def _render_callout(title: str, body: str, tone: str = "info") -> None:
+    st.markdown(
+        f"""
+<div class="doc-callout doc-{tone}">
+  <div class="doc-callout-title">{title}</div>
+  <div class="doc-callout-body">{body}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_styles() -> None:
+    st.markdown(
+        """
+<style>
+.doc-hero {
+  border: 1px solid #dbe3f5;
+  background: linear-gradient(130deg, #f8fbff 0%, #eef4ff 100%);
+  border-radius: 14px;
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.doc-hero h2 {
+  margin: 0 0 6px 0;
+  font-size: 1.35rem;
+  color: #1f2a44;
+}
+.doc-hero p {
+  margin: 0;
+  color: #475569;
+  font-size: 0.96rem;
+  line-height: 1.5;
+}
+.doc-callout {
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 8px 0 12px 0;
+  border: 1px solid transparent;
+}
+.doc-callout-title {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.doc-callout-body {
+  color: #334155;
+  line-height: 1.45;
+}
+.doc-info {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+.doc-success {
+  background: #ecfdf3;
+  border-color: #86efac;
+}
+.doc-warn {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+.doc-muted {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render() -> None:
+    _render_styles()
+
+    st.markdown(
+        """
+<div class="doc-hero">
+  <h2>Algo Trading System Documentation</h2>
+  <p>
+    This page is a professional documentation view of the current codebase design recorded in <code>CODEBASE.md</code>.
+    It explains architecture, execution flow, reliability controls, and operational boundaries in developer-first language.
+  </p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    _render_callout(
+        "System Intent",
+        "The platform is a Python + Streamlit algorithmic trading workstation focused on strategy authoring, data selection, and repeatable backtesting for Indian markets using CSV and Zerodha API modes.",
+        "info",
+    )
+
+    st.subheader("Architecture at a Glance")
+    st.markdown(
+        """
+- **Pattern**: Modular monolith with layered responsibilities.
+- **Primary layers**:
+  - UI layer (`Dashboard/*`) for interaction and workflow control.
+  - Feature/service layer (`Dashboard/Backtesting_page/Features/*`) for validation, task building, data access, and lifecycle helpers.
+  - Execution/orchestration layer (`Backtesting/*`) for queueing, retries, normalization, and Backtrader execution.
+  - File-based persistence layer (`Data/*`) for queue state, metrics, logs, outputs, and cached market data.
+- **External integrations**: Zerodha Kite APIs, optional yfinance datasets, local CSV workflows.
+"""
+    )
+
+    st.subheader("Section Map from CODEBASE")
+    with st.expander("1-4: Overview, stack, structure, architecture", expanded=True):
+        st.markdown(
+            """
+- Project is an active prototype with production-aware hardening already present: task persistence, retries, timeout isolation, path safety, and cache-aware API fetching.
+- Runtime stack centers on Python 3.11, Streamlit UI, Backtrader, Pandas/NumPy, TA-Lib, and Docker-based deployment.
+- Repository structure is split cleanly into `Backtesting/`, `Dashboard/`, `Data/`, `Strategies/`, and `Guide/`.
+- End-to-end architecture routes from UI selection -> execution manager queue -> CSV/API executor -> normalizer -> Backtrader core -> file artifacts.
+"""
+        )
+
+    with st.expander("5-8: Modules, connection map, data flow, state model"):
+        st.markdown(
+            """
+- `backtest_core.py` is the execution primitive for strategy class validation, broker setup, analyzers, and result artifacts.
+- `execution_manager.py` is the queue controller responsible for worker lifecycle, retries, task status transitions, and persistence snapshots.
+- `data_normalizer.py` enforces an execution-safe OHLCV contract.
+- `Backtests_section.py` is the primary UI orchestration surface for data source selection, strategy editing, and execution triggering.
+- Flow variants are explicitly documented for:
+  - Local CSV execution,
+  - Zerodha API-backed execution,
+  - strategy save/version workflows,
+  - dashboard visualization workflows.
+- Runtime state is managed mostly in `st.session_state` with explicit sync contracts for data, strategy, and execution state.
+"""
+        )
+
+    with st.expander("9-14: API surface, configuration, design patterns, failure handling, lifecycle, contracts"):
+        st.markdown(
+            """
+- Environment config is `.env`-driven for API credentials and session tokens.
+- Execution follows strict task lifecycle stages (`PENDING`, `RUNNING`, `SUCCESS`, `FAILED`) with retry classification by error type.
+- Failure taxonomy includes `API_ERROR`, `DATA_ERROR`, `VALIDATION_ERROR`, `STRATEGY_ERROR`, and `TIMEOUT_ERROR`.
+- Data contract is explicit: normalized datetime index + required OHLCV columns + deterministic task/result schema.
+- Strategy contract requires safe, loadable strategy classes compatible with Backtrader execution expectations.
+"""
+        )
+
+    with st.expander("15-19: Performance, limits, design philosophy, edge cases, end-to-end sequence"):
+        st.markdown(
+            """
+- Performance profile is bounded by CPU-heavy backtesting, queue throughput, memory footprint of large dataframes, and API retrieval constraints.
+- Known limits include local-machine scaling ceilings, Streamlit rerun behavior, and file-based persistence overhead at high task volumes.
+- Design choices intentionally favor transparency and local operability over distributed complexity.
+- Edge cases are actively treated: empty/partial data, cache corruption, no-trade strategies, and concurrent worker consistency.
+"""
+        )
+
+    with st.expander("20-27: Security, testing, observability, scaling, trade-offs, failure impact, complexity, LLM summary"):
+        st.markdown(
+            """
+- Security model includes strategy path controls, unsafe execution checks, filesystem boundaries, and failure containment.
+- Testing strategy covers unit, integration, failure simulation, regression, and performance stress patterns.
+- Observability model defines terminal logs, task-stage visibility, and execution metrics.
+- Scaling analysis is explicit about CPU, memory, I/O, queue, API, and UI bottlenecks.
+- Architectural trade-off matrix documents why current decisions were made and what alternatives were deferred.
+- Failure impact analysis maps each failure class to user impact, recovery behavior, and risk severity.
+- Complexity analysis explains practical computational behavior for normalization, API chunking, queue processing, and backtest execution.
+"""
+        )
+
+    st.subheader("Operational Guidance")
+    _render_callout(
+        "What to read first",
+        "Start with sections 4, 7, 13, and 19 in CODEBASE.md if you are onboarding. These sections explain how a task moves through the system and where to inspect when behavior diverges.",
+        "success",
+    )
+    _render_callout(
+        "Production posture",
+        "The system is reliability-oriented but still a local modular monolith. For larger multi-user and high-throughput needs, DB-backed persistence and distributed workers are future-scale upgrades.",
+        "warn",
+    )
+
+    codebase_path = Path("CODEBASE.md")
+    if codebase_path.exists():
+        with st.expander("View Full CODEBASE.md Reference"):
+            st.caption("Raw reference file loaded from repository root.")
+            st.code(codebase_path.read_text(encoding="utf-8", errors="replace"), language="markdown")

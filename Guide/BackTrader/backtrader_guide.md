@@ -1,204 +1,263 @@
-# BackTrader Quick Reference
+﻿# Backtrader Strategy Guide
 
-## Core Workflow
+This document is a cleaned, practical reference for working with `backtrader.Strategy`.
+It focuses on the lifecycle, order APIs, notifications, and day-to-day usage patterns.
 
-```
-Strategy → Cerebro → Data Feed → cerebro.run() → cerebro.plot()
-```
+## 1) What a Strategy Is
 
-1. Create a `Strategy` (indicators, logic, order handling)
-2. Instantiate `Cerebro`
-3. Add strategy: `cerebro.addstrategy(MyStrategy)`
-4. Load & add data: `cerebro.adddata(data)`
-5. Configure broker (cash, commission, sizer)
-6. Run: `cerebro.run()`
-7. Plot (optional): `cerebro.plot()`
+In Backtrader, `Cerebro` is the engine and `Strategy` is your trading logic.
+A strategy typically does three things:
+
+1. Defines indicators and state in `__init__`
+2. Generates actions in `next`
+3. Reacts to broker updates in notify callbacks
 
 ---
 
-## Minimal Setup
+## 2) Strategy Lifecycle
+
+A strategy moves through this lifecycle during execution:
+
+- `__init__`: create indicators, data aliases, state variables
+- `start`: called once before bar processing starts
+- `prenext`: called while indicators are not fully warmed up
+- `nextstart`: called once when warm-up just completes
+- `next`: called for normal bar-by-bar logic
+- `stop`: called once when execution ends
+
+### Minimal Example
 
 ```python
 import backtrader as bt
 
-cerebro = bt.Cerebro()
-cerebro.broker.setcash(100000.0)
-cerebro.run()
-print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
-```
-
----
-
-## Loading a Data Feed
-
-```python
-import datetime
-import backtrader as bt
-
-data = bt.feeds.YahooFinanceCSVData(
-    dataname='path/to/data.csv',
-    fromdate=datetime.datetime(2000, 1, 1),
-    todate=datetime.datetime(2000, 12, 31),
-    reverse=False)   # True if CSV is date-descending (Yahoo online)
-
-cerebro = bt.Cerebro()
-cerebro.adddata(data)
-```
-
----
-
-## Strategy Structure
-
-```python
 class MyStrategy(bt.Strategy):
-    params = (
-        ('maperiod', 15),
-        ('printlog', False),
-    )
-
-    def log(self, txt, dt=None, doprint=False):
-        if self.params.printlog or doprint:
-            dt = dt or self.datas[0].datetime.date(0)
-            print('%s, %s' % (dt.isoformat(), txt))
+    params = dict(period=15)
 
     def __init__(self):
-        self.dataclose = self.datas[0].close
-        self.order = None
-        self.buyprice = None
-        self.buycomm = None
-        self.sma = bt.indicators.SimpleMovingAverage(
-            self.datas[0], period=self.params.maperiod)
-
-    def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-
-        if order.status in [order.Completed]:
-            if order.isbuy():
-                self.log('BUY EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
-                         (order.executed.price, order.executed.value, order.executed.comm))
-                self.buyprice = order.executed.price
-                self.buycomm = order.executed.comm
-            else:
-                self.log('SELL EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
-                         (order.executed.price, order.executed.value, order.executed.comm))
-            self.bar_executed = len(self)
-
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log('Order Canceled/Margin/Rejected')
-
-        self.order = None
-
-    def notify_trade(self, trade):
-        if not trade.isclosed:
-            return
-        self.log('OPERATION PROFIT, GROSS %.2f, NET %.2f' % (trade.pnl, trade.pnlcomm))
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.period)
 
     def next(self):
-        self.log('Close, %.2f' % self.dataclose[0])
+        if self.sma[0] > self.data.close[0]:
+            pass
+        elif self.sma[0] < self.data.close[0]:
+            pass
+```
 
+---
+
+## 3) Core Methods You Should Know
+
+### `__init__(self)`
+Use for:
+
+- indicator creation
+- static references (`self.data0`, `self.data1`, `self.dnames.xxx`)
+- state initialization (`self.order`, counters, flags)
+
+### `next(self)`
+Use for:
+
+- entries/exits
+- signal checks
+- position management
+
+Important: it can be called multiple times for the same bar in replay/live scenarios.
+
+### `notify_order(self, order)`
+Triggered when order status changes (Submitted, Accepted, Completed, Canceled, Margin, Rejected).
+
+Typical pattern:
+
+```python
+def notify_order(self, order):
+    if order.status in [order.Completed]:
+        action = "BUY" if order.isbuy() else "SELL"
+        print(f"{action} EXECUTED @ {order.executed.price}")
+
+    if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+        self.order = None
+```
+
+### `notify_trade(self, trade)`
+Triggered when a trade opens/updates/closes.
+
+```python
+def notify_trade(self, trade):
+    if trade.isclosed:
+        print(f"PnL Gross={trade.pnl:.2f}, Net={trade.pnlcomm:.2f}")
+```
+
+### `start(self)` / `stop(self)`
+Good for setup/summary logging.
+
+---
+
+## 4) Order APIs (Buy / Sell / Close / Cancel)
+
+### `buy(...)` and `sell(...)`
+Both create and submit an order. They return an `Order` object.
+
+Common parameters:
+
+- `data`: which feed to trade (`None` means `self.data0`)
+- `size`: quantity (if `None`, strategy sizer decides)
+- `price`: trigger/limit price depending on order type
+- `plimit`: limit price for `StopLimit`
+- `exectype`: order type
+- `valid`: order expiry
+- `tradeid`: used internally to track overlapping trades
+- `oco`: bind with another order in OCO group
+- `parent`, `transmit`: used in bracket/grouped orders
+- `trailamount`, `trailpercent`: for trailing stop variants
+
+### `close(data=None, size=None, **kwargs)`
+Closes existing position on target data.
+
+### `cancel(order)`
+Cancels a pending order.
+
+---
+
+## 5) Execution Types (`exectype`)
+
+Common values:
+
+- `Order.Market` (or `None`): execute at next available price
+- `Order.Limit`: execute at limit price or better
+- `Order.Stop`: trigger at stop, then market order
+- `Order.StopLimit`: trigger at stop, then limit order
+- `Order.Close`: execute on session close
+- `Order.StopTrail`: trailing stop
+- `Order.StopTrailLimit`: trailing stop + limit
+
+---
+
+## 6) Validity (`valid`) Options
+
+- `None`: good-til-cancel behavior
+- `datetime/date`: valid-until specific date/time
+- `Order.DAY` / `0` / `timedelta()`: day order
+- numeric matplotlib datetime value: valid-until that encoded time
+
+---
+
+## 7) Bracket and Target Helpers
+
+### Bracket helpers
+
+- `buy_bracket(...)`
+- `sell_bracket(...)`
+
+Used to place entry + protective stop + target orders as a managed group.
+
+### Target helpers
+
+- `order_target_size(data=None, target=0, **kwargs)`
+- `order_target_value(data=None, target=0.0, price=None, **kwargs)`
+- `order_target_percent(data=None, target=0.0, **kwargs)`
+
+These rebalance toward a target exposure rather than issuing raw buy/sell quantities.
+
+---
+
+## 8) Useful Strategy Attributes
+
+- `self.env`: owning `Cerebro`
+- `self.datas`: all data feeds
+- `self.data` / `self.data0`: first data feed
+- `self.dataX`: alias for `self.datas[X]`
+- `self.dnames`: named access to feeds
+- `self.broker`: broker instance
+- `self.position`: current position in `data0`
+- `self.stats`: observers created for strategy
+- `self.analyzers`: analyzers created for strategy
+
+### Named data example
+
+```python
+# setup side
+# cerebro.adddata(day_data, name='days')
+# cerebro.resampledata(day_data, timeframe=bt.TimeFrame.Weeks, name='weeks')
+
+# strategy side
+smadays = bt.indicators.SMA(self.dnames.days, period=30)
+smaweeks = bt.indicators.SMA(self.dnames.weeks, period=10)
+```
+
+---
+
+## 9) Notification Hooks Beyond Orders/Trades
+
+- `notify_cashvalue(cash, value)`: cash + portfolio value updates
+- `notify_fund(cash, value, fundvalue, shares)`: fund-mode updates
+- `notify_store(msg, *args, **kwargs)`: store/broker backend events
+- `notify_timer(timer, when, *args, **kwargs)`: timer callback events
+
+---
+
+## 10) Practical Starter Template
+
+```python
+import backtrader as bt
+
+class SmaCrossStrategy(bt.Strategy):
+    params = dict(fast=20, slow=50)
+
+    def __init__(self):
+        self.fast = bt.indicators.SMA(self.data.close, period=self.p.fast)
+        self.slow = bt.indicators.SMA(self.data.close, period=self.p.slow)
+        self.cross = bt.indicators.CrossOver(self.fast, self.slow)
+        self.order = None
+
+    def next(self):
         if self.order:
             return
 
-        if not self.position:
-            if self.dataclose[0] > self.sma[0]:
-                self.log('BUY CREATE, %.2f' % self.dataclose[0])
-                self.order = self.buy()
-        else:
-            if self.dataclose[0] < self.sma[0]:
-                self.log('SELL CREATE, %.2f' % self.dataclose[0])
-                self.order = self.sell()
+        if not self.position and self.cross[0] > 0:
+            self.order = self.buy()
+        elif self.position and self.cross[0] < 0:
+            self.order = self.close()
 
-    def stop(self):
-        self.log('(MA Period %2d) Ending Value %.2f' %
-                 (self.params.maperiod, self.broker.getvalue()), doprint=True)
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            print(f"Trade closed | Gross={trade.pnl:.2f} Net={trade.pnlcomm:.2f}")
 ```
 
 ---
 
-## Broker Configuration
+## 11) Common Mistakes to Avoid
 
-```python
-cerebro.broker.setcash(1000.0)
-cerebro.broker.setcommission(commission=0.001)  # 0.1%
-cerebro.addsizer(bt.sizers.FixedSize, stake=10)
-```
-
----
-
-## Running a Strategy
-
-```python
-if __name__ == '__main__':
-    cerebro = bt.Cerebro()
-    cerebro.addstrategy(MyStrategy)
-
-    data = bt.feeds.YahooFinanceCSVData(
-        dataname='path/to/data.csv',
-        fromdate=datetime.datetime(2000, 1, 1),
-        todate=datetime.datetime(2000, 12, 31),
-        reverse=False)
-
-    cerebro.adddata(data)
-    cerebro.broker.setcash(1000.0)
-    cerebro.addsizer(bt.sizers.FixedSize, stake=10)
-    cerebro.broker.setcommission(commission=0.001)
-
-    print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
-    cerebro.run()
-    print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
-    cerebro.plot()
-```
+1. Using indicator objects directly instead of indexed values (`ind[0]`)
+2. Placing duplicate orders because pending order state is not tracked
+3. Ignoring warm-up phase (`prenext`) for long-period indicators
+4. Assuming `next` runs exactly once per bar in replay/live modes
+5. Not handling rejection/cancel/margin statuses in `notify_order`
 
 ---
 
-## Strategy Optimization
+## 12) Quick API List (Strategy)
 
-Use `optstrategy` instead of `addstrategy` to sweep parameter ranges:
-
-```python
-cerebro.optstrategy(MyStrategy, maperiod=range(10, 31))
-cerebro.run(maxcpus=1)
-```
-
-The `stop()` hook prints results per parameter combination.
-
----
-
-## Key Concepts
-
-| Concept | Detail |
-|---|---|
-| `self.datas[0]` | Default data feed (system clock) |
-| `self.datas[0].close` | Close line reference |
-| `self.position` | Current open position (`None` if flat) |
-| `self.order` | Track pending order to avoid duplicates |
-| `self.bar_executed` | Bar index when last order was filled |
-| `notify_order` | Called on every order status change |
-| `notify_trade` | Called when a round-trip trade closes |
-| `next()` | Called on each bar once indicators are ready |
-| `stop()` | Called once when data is exhausted |
+- `next`, `nextstart`, `prenext`, `start`, `stop`
+- `notify_order`, `notify_trade`, `notify_cashvalue`, `notify_fund`, `notify_store`, `notify_timer`
+- `buy`, `sell`, `close`, `cancel`
+- `buy_bracket`, `sell_bracket`
+- `order_target_size`, `order_target_value`, `order_target_percent`
+- `getsizer`, `setsizer`, `getsizing`
+- `getposition`, `getpositionbyname`, `getpositionsbyname`
+- `getdatanames`, `getdatabyname`
+- `add_timer`
 
 ---
 
-## Indicators
+## 13) Notes for This Project
 
-```python
-# In __init__:
-self.sma  = bt.indicators.SimpleMovingAverage(self.data, period=15)
-self.ema  = bt.indicators.ExponentialMovingAverage(self.data, period=15)
-self.rsi  = bt.indicators.RSI(self.data)
-self.macd = bt.indicators.MACD(self.data)
-self.bb   = bt.indicators.BollingerBands(self.data)
-```
+When integrating strategies into this codebase:
 
-Indicators are auto-plotted by `cerebro.plot()`.
+- keep strategy classes deterministic and stateless outside Backtrader-managed attributes
+- avoid external side effects in `next` (file writes/network calls)
+- prefer logging via the platform execution logging path, not ad-hoc prints in production runs
 
----
-
-## Plotting
-
-```python
-cerebro.plot()                         # default
-cerebro.plot(style='candlestick')      # candlestick chart
-```

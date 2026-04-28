@@ -1,49 +1,3 @@
-Skip to content
-logo
-Kite Connect 3 / API documentation
-Orders
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-Glossary of constants
-Placing orders
-Order varieties
-Regular order parameters
-Modifying orders
-Regular order parameters
-Cover order (CO) parameters
-Cancelling orders
-Retrieving orders
-Response attributes
-Order statuses
-Tagging orders
-Market protection
-Auto slice orders
-Multi-legged orders (CO)
-Retrieving an order's history
-Retrieving all trades
-Response attributes
-Retrieving an order's trades
 Orders¶
 The order APIs let you place orders of different varities, modify and cancel pending orders, retrieve the daily order and more.
 
@@ -1004,51 +958,7 @@ curl "https://api.kite.trade/orders/200000000000000/trades" \
     }
   ]
 }
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
 
-
-
-
-Skip to content
-logo
-Kite Connect 3 / API documentation
-GTT orders
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-Placing triggers
-Order parameters
-Condition parameters
-Orders list
-Type
-single
-two-leg
-Retrieving triggers
-Retrieve trigger
-Status
-Modify trigger
-Delete trigger
 GTT - Good Till Triggered orders¶
 The GTT APIs allow you to place, modify and manage GTTs.
 
@@ -1375,48 +1285,7 @@ curl --request DELETE https://api.kite.trade/gtt/triggers/123 \
     -H 'X-Kite-Version: 3' \
     -H 'Authorization: token api_key:access_token' \
 {"status":"success","data":{"trigger_id":123}}
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
 
-
-Skip to content
-logo
-Kite Connect 3 / API documentation
-Market quotes and instruments
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-Instruments
-Retrieving the full instrument list
-CSV response columns
-Market quotes
-Retrieving full market quotes
-Response attributes
-Retrieving OHLC quotes
-Response attributes
-Retrieving LTP quotes
-Response attributes
-Limits
 Market quotes and instruments¶
 type	endpoint	 
 GET	/instruments	Retrieve the CSV dump of all tradable instruments
@@ -1740,48 +1609,7 @@ attribute	number of instruments
 /quote	500
 /quote/ohlc	1000
 /quote/ltp	1000
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
 
-
-
-Skip to content
-logo
-Kite Connect 3 / API documentation
-WebSocket streaming
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-Connecting to the WebSocket endpoint
-Request structure
-Modes
-Binary market data
-Message structure
-Quote packet structure
-Index packet structure
-Market depth structure
-Postbacks and non-binary updates
-Message types
 WebSocket streaming¶
 The WebSocket API is the most efficient (speed, latency, resource consumption, and bandwidth) way to receive quotes for instruments across all exchanges during live market hours. A quote consists of fields such as open, high, low, close, last traded price, 5 levels of bid/offer market depth data etc.
 
@@ -1897,44 +1725,7 @@ type
 order	Order Postback. The data field will contain the full order Postback payload
 error	Error responses. The data field contain the error string
 message	Messages and alerts from the broker. The data field will contain the message string
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
 
-
-
-Skip to content
-logo
-Kite Connect 3 / API documentation
-Historical candle data
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-URI parameters
-Request parameters
-Response structure
-Continuous data
-Examples
-OI Data
 Historical candle data¶
 The historical data API provides archived data (up to date as of the time of access) for instruments across various exchanges spanning back several years. A historical record is presented in the form of a candle (Timestamp, Open, High, Low, Close, Volume, OI), and the data is available in several intervals—minute, 3 minutes, 5 minutes, hourly ... daily.
 
@@ -2102,40 +1893,7 @@ curl "https://api.kite.trade/instruments/historical/12517890/minute?from=2019-12
     ]
   }
 }
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
 
-
-
-Skip to content
-logo
-Kite Connect 3 / API documentation
-Postbacks / WebHooks
-Search
-
-Kite Connect 3 / API documentation
-Introduction
-Libraries and SDKs
-Response structure
-Exceptions and errors
-User
-Orders
-GTT orders
-Alerts
-Portfolio
-Market quotes and instruments
-WebSocket streaming
-Historical candle data
-Postbacks / WebHooks
-Mutual funds
-Margin calculation
-Publisher - Offsite orders
-Publisher JS plugin
-Mobile and Desktop apps
-Changelog
-Table of contents
-Checksum
-Payload attributes
 Postback (WebHooks)¶
 The Postback API sends a POST request with a JSON payload to the registered postback_url of your app when an order's status changes. This enables you to get arbitrary updates to your orders reliably, irrespective of when they happen (COMPLETE, CANCEL, REJECTED, UPDATE). An UPDATE postback is triggered when an open order is modified or when there's a partial fill. This can be used to track trades.
 
@@ -2289,6 +2047,3 @@ An optional tag to apply to an order to identify it (alphanumeric, max 20 chars)
 Note
 
 Postback API works even when the user is not logged in. Just make sure you validate the checksum value to ensure that the update is indeed coming from Kite Connect.
-
-Copyright © 2015 - 2025, Zerodha Technology Pvt. Ltd.
-Made with Material for MkDocs
