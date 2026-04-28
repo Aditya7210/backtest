@@ -137,6 +137,7 @@ def render() -> None:
         st.session_state["live_selected_timeframe"] = timeframe
         st.session_state["live_selected_data_type"] = data_type
         st.session_state["data_mode"] = "live_market"
+        st.session_state["bt_data_mode_select"] = "Live Market"
         st.success("Live market selection updated.")
 
 

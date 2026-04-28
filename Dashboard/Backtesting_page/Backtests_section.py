@@ -1071,12 +1071,16 @@ def render() -> None:
         "zerodha": "Zerodha API",
         "live_market": "Live Market",
     }
-    expected_label = mode_to_label.get(
-        str(st.session_state.get("data_mode", "csv")),
-        "Local CSV",
-    )
-    if st.session_state.get("bt_data_mode_select") != expected_label:
-        st.session_state["bt_data_mode_select"] = expected_label
+    if "bt_data_mode_select" not in st.session_state:
+        st.session_state["bt_data_mode_select"] = mode_to_label.get(
+            str(st.session_state.get("data_mode", "csv")),
+            "Local CSV",
+        )
+    elif st.session_state.get("bt_data_mode_select") not in set(mode_to_label.values()):
+        st.session_state["bt_data_mode_select"] = mode_to_label.get(
+            str(st.session_state.get("data_mode", "csv")),
+            "Local CSV",
+        )
 
     if st.session_state["data_mode"] == "zerodha":
         st.session_state["selected_data_files"] = []
