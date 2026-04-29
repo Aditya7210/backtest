@@ -1,0 +1,11 @@
+{
+  "status": "running",
+  "pid": 215,
+  "started_at": "2026-04-29T10:00:10+05:30",
+  "trading_date": "2026-04-29",
+  "tokens_subscribed": 167,
+  "bars_written": 9851,
+  "last_tick_at": "2026-04-29T11:00:20+05:30",
+  "last_error": null,
+  "updated_at": "2026-04-29T11:00:20+05:30"
+}

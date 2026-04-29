@@ -6,10 +6,6 @@ __pycache__/
 *.pyc
 .ruff_cache/
 
-# Data (ignore data files, keep folder structure)
-Data/**
-!Data/**/
-!Data/.gitkeep
 
 # Logs
 *.log

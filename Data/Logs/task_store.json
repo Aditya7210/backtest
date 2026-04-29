@@ -1,0 +1,94 @@
+{
+  "updated_at": "2026-04-25T13:13:57.685335+00:00",
+  "task_counter": 1,
+  "queue": [
+    {
+      "task_id": "TASK-0001",
+      "task": {
+        "mode": "api",
+        "symbol": "RELIANCE",
+        "instrument_token": 128083204,
+        "instrument_type": "EQ",
+        "interval": "day",
+        "start_date": {
+          "__kind__": "datetime",
+          "value": "2025-01-01T00:00:00"
+        },
+        "end_date": {
+          "__kind__": "datetime",
+          "value": "2026-04-25T23:59:59.999999"
+        },
+        "continuous": false,
+        "oi": false,
+        "strategy_file_path": "strategy_versioning/Test_Strat_2_v1.py",
+        "strategy_class_name": "TrendPullbackStrategy",
+        "task_id": "TASK-0001"
+      },
+      "status": "SUCCESS",
+      "result": {
+        "symbol": "RELIANCE",
+        "status": "SUCCESS",
+        "final_value": 103369.76562,
+        "log_file": "/app/Data/Logs/Backtesting_result_log/RELIANCE_log_20260425_131357_616044.log",
+        "error": null,
+        "execution_time": 0.9560721930000113,
+        "retries": 0
+      },
+      "start_time": "2026-04-25T13:13:56.621210+00:00",
+      "end_time": "2026-04-25T13:13:57.685292+00:00",
+      "execution_time": 0.9560721930000113,
+      "retries": 0
+    }
+  ],
+  "completed_tasks": [
+    {
+      "task_id": "TASK-0001",
+      "task": {
+        "mode": "api",
+        "symbol": "RELIANCE",
+        "instrument_token": 128083204,
+        "instrument_type": "EQ",
+        "interval": "day",
+        "start_date": {
+          "__kind__": "datetime",
+          "value": "2025-01-01T00:00:00"
+        },
+        "end_date": {
+          "__kind__": "datetime",
+          "value": "2026-04-25T23:59:59.999999"
+        },
+        "continuous": false,
+        "oi": false,
+        "strategy_file_path": "strategy_versioning/Test_Strat_2_v1.py",
+        "strategy_class_name": "TrendPullbackStrategy",
+        "task_id": "TASK-0001"
+      },
+      "status": "SUCCESS",
+      "result": {
+        "symbol": "RELIANCE",
+        "status": "SUCCESS",
+        "final_value": 103369.76562,
+        "log_file": "/app/Data/Logs/Backtesting_result_log/RELIANCE_log_20260425_131357_616044.log",
+        "error": null,
+        "execution_time": 0.9560721930000113,
+        "retries": 0
+      },
+      "start_time": "2026-04-25T13:13:56.621210+00:00",
+      "end_time": "2026-04-25T13:13:57.685292+00:00",
+      "execution_time": 0.9560721930000113,
+      "retries": 0
+    }
+  ],
+  "failed_tasks": [],
+  "results_by_task_id": {
+    "TASK-0001": {
+      "symbol": "RELIANCE",
+      "status": "SUCCESS",
+      "final_value": 103369.76562,
+      "log_file": "/app/Data/Logs/Backtesting_result_log/RELIANCE_log_20260425_131357_616044.log",
+      "error": null,
+      "execution_time": 0.9560721930000113,
+      "retries": 0
+    }
+  }
+}

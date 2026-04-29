@@ -1,0 +1,9 @@
+{
+  "collector": {
+    "pid": 215,
+    "started_at": "2026-04-29T04:30:08",
+    "script": "/app/LiveMarket/run_collector.py",
+    "module": "LiveMarket.run_collector"
+  },
+  "calculator": {}
+}
