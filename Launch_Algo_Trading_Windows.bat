@@ -2,22 +2,18 @@
 setlocal EnableExtensions EnableDelayedExpansion
 title Algo Trading Launcher
 
-REM ---------------------------------------------------------------
-REM Windows one-click launcher
-REM 1) Resolve project directory (name-agnostic, scans common paths)
-REM 2) Custom GUI: Start/Update  |  Stop  |  Exit
-REM 3) Pull latest from GitHub (auto-stash only prompted if dirty)
-REM 4) Ensure Docker is running
-REM 5) Start/Stop docker compose
-REM 6) Open Streamlit once healthy (start path)
-REM ---------------------------------------------------------------
+REM ===============================================================
+REM Algo Trading Launcher (Windows)
+REM - Project folder name agnostic (marker-based detection)
+REM - GUI actions: Start/Update, Stop App, Change Project, Exit
+REM - Auto-stash compatibility before git pull
+REM ===============================================================
 
 REM ---- Self-elevate to Administrator ----
 net session >nul 2>&1
 if not "%errorlevel%"=="0" (
   echo Requesting Administrator privileges...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Start-Process -FilePath '%~f0' -Verb RunAs"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
 
@@ -26,244 +22,149 @@ set "PROJECT_DIR="
 set "ACTION="
 set "AUTO_STASH=0"
 set "STASH_CREATED=0"
+set "WORKTREE_DIRTY=0"
 
-REM ================================================================
-REM  PROJECT DIRECTORY RESOLUTION
-REM  Strategy (in order):
-REM   1. Env var override
-REM   2. Script's own directory
-REM   3. Saved path from last run
-REM   4. Scan subdirs of common locations (name-agnostic)
-REM   5. Folder-browser dialog
-REM ================================================================
-
-REM -- 1. Env var override --
-if not "%ALGO_TRADING_PROJECT_DIR%"=="" call :TryProject "%ALGO_TRADING_PROJECT_DIR%"
-
-REM -- 2. Script's own dir (launcher placed inside the project) --
-if not defined PROJECT_DIR call :TryProject "%~dp0"
-
-REM -- 3. Saved path --
-if not defined PROJECT_DIR if exist "%LAUNCHER_CONFIG%" (
-  set /p SAVED_DIR=<"%LAUNCHER_CONFIG%"
-  if not "!SAVED_DIR!"=="" call :TryProject "!SAVED_DIR!"
-)
-
-REM -- 4. Scan one level deep under common parent directories --
+call :ResolveProjectDir
 if not defined PROJECT_DIR (
-  for %%B in (
-    "%~dp0.."
-    "%USERPROFILE%\PROJECTS"
-    "%USERPROFILE%\Desktop"
-    "%USERPROFILE%\Documents"
-    "%USERPROFILE%"
-    "C:\Projects"
-    "C:\Dev"
-    "C:\src"
-  ) do (
-    if not defined PROJECT_DIR (
-      for /d %%S in ("%%~B\*") do (
-        if not defined PROJECT_DIR call :TryProject "%%S"
-      )
-    )
-  )
+  call :ChooseProjectFolder
 )
-
-REM -- 5. Folder-browser dialog as last resort --
 if not defined PROJECT_DIR (
-  echo.
-  echo Could not auto-detect the project folder.
-  echo Please select it using the folder browser...
-  for /f "usebackq delims=" %%P in (
-    `powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "Add-Type -AssemblyName System.Windows.Forms; $b=New-Object System.Windows.Forms.FolderBrowserDialog; $b.Description='Select your Algo Trading project folder (contains docker-compose.yml)'; $b.ShowNewFolderButton=$false; if($b.ShowDialog() -eq 'OK'){$b.SelectedPath} else {'CANCELLED'}"`)  do (
-    set "BROWSE_RESULT=%%P"
-  )
-  if not "!BROWSE_RESULT!"=="CANCELLED" call :TryProject "!BROWSE_RESULT!"
-)
-
-if not defined PROJECT_DIR (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Could not find a valid project folder.`n`nRequired files:`n  docker-compose.yml`n  Dashboard\dashboard.py`n`nSet ALGO_TRADING_PROJECT_DIR env var or place the launcher inside the project.','Project Not Found',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)"
+  call :ShowError "Could not find a valid project folder." "Project Not Found"
   exit /b 1
 )
 
-REM -- Save resolved path for next run --
->"#LAUNCHER_CONFIG#" echo !PROJECT_DIR!
-set "LAUNCHER_CONFIG_WRITE=%LAUNCHER_CONFIG%"
->"!LAUNCHER_CONFIG_WRITE!" echo !PROJECT_DIR!
+call :SyncDesktopLauncher
 
-echo Project directory: !PROJECT_DIR!
-cd /d "!PROJECT_DIR!" || (echo ERROR: Failed to cd into project folder. & pause & exit /b 1)
+:menu_loop
+call :SaveProjectDir
+cd /d "%PROJECT_DIR%" || (
+  call :ShowError "Failed to open project folder: %PROJECT_DIR%" "Launcher Error"
+  exit /b 1
+)
 
-REM ================================================================
-REM  MAIN GUI  –  custom WinForms dialog (no raw MessageBox)
-REM ================================================================
 for /f "usebackq delims=" %%A in (
   `powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; ^
-     $f=New-Object System.Windows.Forms.Form; ^
-     $f.Text='Algo Trading Launcher'; ^
-     $f.Size=New-Object System.Drawing.Size(420,260); ^
-     $f.StartPosition='CenterScreen'; ^
-     $f.FormBorderStyle='FixedDialog'; ^
-     $f.MaximizeBox=$false; $f.MinimizeBox=$false; ^
-     $f.BackColor=[System.Drawing.Color]::FromArgb(18,18,28); ^
-     $hdr=New-Object System.Windows.Forms.Label; ^
-     $hdr.Text='ALGO TRADING LAUNCHER'; ^
-     $hdr.Font=New-Object System.Drawing.Font('Segoe UI',13,[System.Drawing.FontStyle]::Bold); ^
-     $hdr.ForeColor=[System.Drawing.Color]::FromArgb(0,210,180); ^
-     $hdr.AutoSize=$false; $hdr.TextAlign='MiddleCenter'; ^
-     $hdr.Size=New-Object System.Drawing.Size(420,45); ^
-     $hdr.Location=New-Object System.Drawing.Point(0,12); ^
-     $sub=New-Object System.Windows.Forms.Label; ^
-     $sub.Text='Select an action to continue'; ^
-     $sub.Font=New-Object System.Drawing.Font('Segoe UI',9); ^
-     $sub.ForeColor=[System.Drawing.Color]::FromArgb(160,160,180); ^
-     $sub.AutoSize=$false; $sub.TextAlign='MiddleCenter'; ^
-     $sub.Size=New-Object System.Drawing.Size(420,22); ^
-     $sub.Location=New-Object System.Drawing.Point(0,56); ^
+     $form=New-Object Windows.Forms.Form; ^
+     $form.Text='Algo Trading Launcher'; ^
+     $form.Size=New-Object Drawing.Size(560,320); ^
+     $form.StartPosition='CenterScreen'; ^
+     $form.FormBorderStyle='FixedDialog'; ^
+     $form.MaximizeBox=$false; $form.MinimizeBox=$false; ^
+     $form.BackColor=[Drawing.Color]::FromArgb(24,24,34); ^
+     $title=New-Object Windows.Forms.Label; ^
+     $title.Text='ALGO TRADING LAUNCHER'; ^
+     $title.Font=New-Object Drawing.Font('Segoe UI',14,[Drawing.FontStyle]::Bold); ^
+     $title.ForeColor=[Drawing.Color]::FromArgb(24,210,170); ^
+     $title.AutoSize=$false; $title.TextAlign='MiddleCenter'; ^
+     $title.Size=New-Object Drawing.Size(540,40); $title.Location=New-Object Drawing.Point(10,14); ^
+     $subtitle=New-Object Windows.Forms.Label; ^
+     $subtitle.Text='Choose an action'; ^
+     $subtitle.Font=New-Object Drawing.Font('Segoe UI',9); ^
+     $subtitle.ForeColor=[Drawing.Color]::FromArgb(180,180,200); ^
+     $subtitle.AutoSize=$false; $subtitle.TextAlign='MiddleCenter'; ^
+     $subtitle.Size=New-Object Drawing.Size(540,20); $subtitle.Location=New-Object Drawing.Point(10,56); ^
+     $pathBox=New-Object Windows.Forms.TextBox; ^
+     $pathBox.ReadOnly=$true; ^
+     $pathBox.Text='Project: %PROJECT_DIR%'; ^
+     $pathBox.Font=New-Object Drawing.Font('Segoe UI',8); ^
+     $pathBox.BackColor=[Drawing.Color]::FromArgb(32,32,46); ^
+     $pathBox.ForeColor=[Drawing.Color]::FromArgb(210,210,220); ^
+     $pathBox.BorderStyle='FixedSingle'; ^
+     $pathBox.Size=New-Object Drawing.Size(520,24); $pathBox.Location=New-Object Drawing.Point(18,84); ^
      $result='EXIT'; ^
-     $mkBtn={ param($txt,$desc,$x,$clr) ^
-       $p=New-Object System.Windows.Forms.Panel; ^
-       $p.Size=New-Object System.Drawing.Size(108,80); ^
-       $p.Location=New-Object System.Drawing.Point($x,95); ^
-       $p.BackColor=$clr; $p.Cursor='Hand'; ^
-       $lbl=New-Object System.Windows.Forms.Label; ^
-       $lbl.Text=$txt; ^
-       $lbl.Font=New-Object System.Drawing.Font('Segoe UI',10,[System.Drawing.FontStyle]::Bold); ^
-       $lbl.ForeColor=[System.Drawing.Color]::White; ^
-       $lbl.AutoSize=$false; $lbl.TextAlign='MiddleCenter'; ^
-       $lbl.Size=New-Object System.Drawing.Size(108,30); ^
-       $lbl.Location=New-Object System.Drawing.Point(0,10); ^
-       $d=New-Object System.Windows.Forms.Label; ^
-       $d.Text=$desc; ^
-       $d.Font=New-Object System.Drawing.Font('Segoe UI',7.5); ^
-       $d.ForeColor=[System.Drawing.Color]::FromArgb(220,220,220); ^
-       $d.AutoSize=$false; $d.TextAlign='MiddleCenter'; ^
-       $d.Size=New-Object System.Drawing.Size(108,28); ^
-       $d.Location=New-Object System.Drawing.Point(0,40); ^
-       $p.Controls.AddRange(@($lbl,$d)); ^
-       return $p }; ^
-     $bStart=&$mkBtn 'START / UPDATE' 'Pull + launch app' 30 ([System.Drawing.Color]::FromArgb(0,140,100)); ^
-     $bStop =&$mkBtn 'STOP'           'Shut down containers' 156 ([System.Drawing.Color]::FromArgb(180,50,50)); ^
-     $bExit =&$mkBtn 'EXIT'           'Close this launcher' 282 ([System.Drawing.Color]::FromArgb(60,60,80)); ^
-     $act={param($v) $script:result=$v; $f.Close()}; ^
-     foreach($ctrl in $bStart.Controls){ $ctrl.Add_Click({&$act 'START'}) }; $bStart.Add_Click({&$act 'START'}); ^
-     foreach($ctrl in $bStop.Controls) { $ctrl.Add_Click({&$act 'STOP' }) }; $bStop.Add_Click( {&$act 'STOP' }); ^
-     foreach($ctrl in $bExit.Controls) { $ctrl.Add_Click({&$act 'EXIT' }) }; $bExit.Add_Click( {&$act 'EXIT' }); ^
-     $proj=New-Object System.Windows.Forms.Label; ^
-     $proj.Text='Project: ' + '!PROJECT_DIR!'; ^
-     $proj.Font=New-Object System.Drawing.Font('Segoe UI',7.5); ^
-     $proj.ForeColor=[System.Drawing.Color]::FromArgb(120,120,140); ^
-     $proj.AutoSize=$false; $proj.TextAlign='MiddleCenter'; ^
-     $proj.Size=New-Object System.Drawing.Size(400,18); ^
-     $proj.Location=New-Object System.Drawing.Point(10,200); ^
-     $f.Controls.AddRange(@($hdr,$sub,$bStart,$bStop,$bExit,$proj)); ^
-     $f.Add_Shown({$f.Activate()}); ^
-     [void]$f.ShowDialog(); ^
-     $script:result"`) do set "ACTION=%%A"
+     function New-ActionButton([string]$txt,[int]$x,[int]$y,[string]$tag,[Drawing.Color]$bg){ ^
+       $b=New-Object Windows.Forms.Button; ^
+       $b.Text=$txt; $b.Tag=$tag; ^
+       $b.Size=New-Object Drawing.Size(240,54); ^
+       $b.Location=New-Object Drawing.Point($x,$y); ^
+       $b.Font=New-Object Drawing.Font('Segoe UI',10,[Drawing.FontStyle]::Bold); ^
+       $b.BackColor=$bg; ^
+       $b.ForeColor=[Drawing.Color]::White; ^
+       $b.FlatStyle='Flat'; ^
+       $b.FlatAppearance.BorderSize=0; ^
+       $b.Add_Click({ $script:result=$this.Tag; $form.Close() }); ^
+       return $b ^
+     } ^
+     $b1=New-ActionButton 'Start / Update App' 18 124 'START' ([Drawing.Color]::FromArgb(0,130,92)); ^
+     $b2=New-ActionButton 'Stop App'           298 124 'STOP'  ([Drawing.Color]::FromArgb(170,52,52)); ^
+     $b3=New-ActionButton 'Change Project'     18 194 'CHANGE' ([Drawing.Color]::FromArgb(58,90,170)); ^
+     $b4=New-ActionButton 'Exit Launcher'      298 194 'EXIT'  ([Drawing.Color]::FromArgb(70,70,90)); ^
+     $form.Controls.AddRange(@($title,$subtitle,$pathBox,$b1,$b2,$b3,$b4)); ^
+     $form.Add_Shown({$form.Activate()}); ^
+     [void]$form.ShowDialog(); ^
+     $script:result"`
+) do set "ACTION=%%A"
 
 if /I "%ACTION%"=="EXIT" exit /b 0
-if /I not "%ACTION%"=="START" if /I not "%ACTION%"=="STOP" (
-  echo ERROR: No valid action selected.
-  pause
+if /I "%ACTION%"=="CHANGE" (
+  call :ChooseProjectFolder
+  if defined PROJECT_DIR (
+    call :SyncDesktopLauncher
+    goto menu_loop
+  )
+  call :ShowError "No project folder selected." "Launcher"
+  goto menu_loop
+)
+if /I "%ACTION%"=="STOP" goto :stop_app
+if /I "%ACTION%"=="START" goto :start_app
+
+call :ShowError "Invalid action selected." "Launcher Error"
+exit /b 1
+
+:start_app
+where docker >nul 2>&1 || (
+  call :ShowError "Docker CLI not found in PATH." "Missing Tool"
+  exit /b 1
+)
+where git >nul 2>&1 || (
+  call :ShowError "Git not found in PATH." "Missing Tool"
   exit /b 1
 )
 
-REM ================================================================
-REM  TOOL CHECKS
-REM ================================================================
-where docker >nul 2>&1 || (
-  echo ERROR: Docker CLI not found in PATH.
-  pause & exit /b 1
-)
-if /I "%ACTION%"=="START" (
-  where git >nul 2>&1 || (
-    echo ERROR: git not found in PATH.
-    pause & exit /b 1
-  )
-)
-
-if /I "%ACTION%"=="STOP" goto stop_app
-
-REM ================================================================
-REM  START / UPDATE PATH
-REM ================================================================
-
-REM ---- Git sanity check ----
 git rev-parse --is-inside-work-tree >nul 2>&1 || (
-  echo ERROR: Project folder is not a git repository.
-  pause & exit /b 1
+  call :ShowError "Project folder is not a git repository." "Git Error"
+  goto menu_loop
 )
 
-REM ---- Check dirty state BEFORE asking about stash ----
 echo.
 echo [1/5] Checking repository status...
 set "WORKTREE_DIRTY=0"
 for /f "tokens=*" %%I in ('git status --porcelain 2^>nul') do set "WORKTREE_DIRTY=1"
 
-if "!WORKTREE_DIRTY!"=="1" (
-  REM Only now ask about auto-stash (dirty tree detected)
-  for /f "usebackq delims=" %%A in (
+set "AUTO_STASH=0"
+set "STASH_CREATED=0"
+if "%WORKTREE_DIRTY%"=="1" (
+  for /f "usebackq delims=" %%R in (
     `powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; ^
-       $f=New-Object System.Windows.Forms.Form; ^
-       $f.Text='Local Changes Detected'; ^
-       $f.Size=New-Object System.Drawing.Size(400,200); ^
-       $f.StartPosition='CenterScreen'; ^
-       $f.FormBorderStyle='FixedDialog'; ^
-       $f.MaximizeBox=$false; $f.MinimizeBox=$false; ^
-       $f.BackColor=[System.Drawing.Color]::FromArgb(25,25,38); ^
-       $ico=New-Object System.Windows.Forms.Label; ^
-       $ico.Text='⚠  Uncommitted local changes found'; ^
-       $ico.Font=New-Object System.Drawing.Font('Segoe UI',10,[System.Drawing.FontStyle]::Bold); ^
-       $ico.ForeColor=[System.Drawing.Color]::FromArgb(255,190,0); ^
-       $ico.AutoSize=$false; $ico.TextAlign='MiddleCenter'; ^
-       $ico.Size=New-Object System.Drawing.Size(380,36); $ico.Location=New-Object System.Drawing.Point(10,12); ^
-       $msg=New-Object System.Windows.Forms.Label; ^
-       $msg.Text='Auto-stash will save your changes before pulling`nand restore them afterward.'; ^
-       $msg.Font=New-Object System.Drawing.Font('Segoe UI',9); ^
-       $msg.ForeColor=[System.Drawing.Color]::FromArgb(190,190,200); ^
-       $msg.AutoSize=$false; $msg.TextAlign='MiddleCenter'; ^
-       $msg.Size=New-Object System.Drawing.Size(380,40); $msg.Location=New-Object System.Drawing.Point(10,50); ^
-       $result='ABORT'; ^
-       $bY=New-Object System.Windows.Forms.Button; ^
-       $bY.Text='Auto-Stash && Continue'; ^
-       $bY.Size=New-Object System.Drawing.Size(160,34); $bY.Location=New-Object System.Drawing.Point(30,108); ^
-       $bY.BackColor=[System.Drawing.Color]::FromArgb(0,130,100); $bY.ForeColor=[System.Drawing.Color]::White; ^
-       $bY.FlatStyle='Flat'; $bY.Add_Click({$script:result='YES'; $f.Close()}); ^
-       $bN=New-Object System.Windows.Forms.Button; ^
-       $bN.Text='Abort Update'; ^
-       $bN.Size=New-Object System.Drawing.Size(140,34); $bN.Location=New-Object System.Drawing.Point(210,108); ^
-       $bN.BackColor=[System.Drawing.Color]::FromArgb(140,40,40); $bN.ForeColor=[System.Drawing.Color]::White; ^
-       $bN.FlatStyle='Flat'; $bN.Add_Click({$script:result='NO'; $f.Close()}); ^
-       $f.Controls.AddRange(@($ico,$msg,$bY,$bN)); ^
-       $f.Add_Shown({$f.Activate()}); ^
-       [void]$f.ShowDialog(); $script:result"`) do set "STASH_REPLY=%%A"
-
+      "Add-Type -AssemblyName System.Windows.Forms; ^
+       $r=[System.Windows.Forms.MessageBox]::Show('Uncommitted local changes detected.`n`nAuto-stash will save your local changes before pulling and restore them after pull.`n`nContinue?', 'Local Changes Detected', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning); ^
+       if($r -eq [System.Windows.Forms.DialogResult]::Yes){'YES'} else {'NO'}"`
+  ) do set "STASH_REPLY=%%R"
   if /I "!STASH_REPLY!"=="YES" (
     set "AUTO_STASH=1"
   ) else (
-    echo Update aborted. Resolve local changes manually and re-run.
-    pause & exit /b 0
+    echo Update cancelled by user.
+    goto menu_loop
   )
 )
 
-REM ---- Pull latest ----
 echo.
 echo [1/5] Fetching latest updates from GitHub...
-git fetch --all --prune || (echo ERROR: git fetch failed. & pause & exit /b 1)
+git fetch --all --prune || (
+  call :ShowError "git fetch failed." "Git Error"
+  goto menu_loop
+)
 
 for /f %%i in ('git rev-parse --abbrev-ref HEAD') do set "CURRENT_BRANCH=%%i"
 if not defined CURRENT_BRANCH set "CURRENT_BRANCH=main"
 
-if "!WORKTREE_DIRTY!"=="1" if "!AUTO_STASH!"=="1" (
+if "%WORKTREE_DIRTY%"=="1" if "%AUTO_STASH%"=="1" (
   for /f %%I in ('git stash list ^| find /c /v ""') do set "STASH_BEFORE=%%I"
+  if not defined STASH_BEFORE set "STASH_BEFORE=0"
   git stash push -u -m "launcher-auto-stash %DATE% %TIME%" >nul 2>&1
   for /f %%I in ('git stash list ^| find /c /v ""') do set "STASH_AFTER=%%I"
-  if not defined STASH_BEFORE set "STASH_BEFORE=0"
-  if not defined STASH_AFTER  set "STASH_AFTER=0"
+  if not defined STASH_AFTER set "STASH_AFTER=0"
   if !STASH_AFTER! GTR !STASH_BEFORE! (
     set "STASH_CREATED=1"
     echo Auto-stashed local changes.
@@ -272,104 +173,164 @@ if "!WORKTREE_DIRTY!"=="1" if "!AUTO_STASH!"=="1" (
 
 git pull --ff-only origin !CURRENT_BRANCH!
 if not "%errorlevel%"=="0" (
-  echo.
-  echo ERROR: git pull failed ^(possible merge conflict or non-fast-forward^).
-  if "!STASH_CREATED!"=="1" echo Your stash is intact. Run: git stash list
-  pause & exit /b 1
+  if "%STASH_CREATED%"=="1" echo Your stash is safe. Run: git stash list
+  call :ShowError "git pull failed (non-fast-forward/conflict)." "Git Error"
+  goto menu_loop
 )
 
-if "!STASH_CREATED!"=="1" (
+if "%STASH_CREATED%"=="1" (
   echo Restoring auto-stashed changes...
   git stash pop >nul 2>&1
   if not "%errorlevel%"=="0" (
-    echo WARNING: Stash pop had conflicts. Resolve manually ^(git stash list^).
+    call :ShowError "Stash restore had conflicts. Please resolve manually." "Git Warning"
   )
 )
 
-REM ================================================================
-REM  DOCKER
-REM ================================================================
 echo.
 echo [2/5] Verifying Docker...
 docker info >nul 2>&1
 if not "%errorlevel%"=="0" (
-  echo Docker not ready — attempting to start Docker Desktop...
+  echo Docker not ready. Attempting to start Docker Desktop...
   for %%P in (
     "%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
     "%ProgramFiles(x86)%\Docker\Docker\Docker Desktop.exe"
     "%LOCALAPPDATA%\Docker\Docker Desktop.exe"
   ) do (
-    if exist "%%P" start "" "%%P" & goto docker_wait
+    if exist "%%P" start "" "%%P"
   )
-  :docker_wait
   for /l %%I in (1,1,180) do (
     docker info >nul 2>&1
-    if "!errorlevel!"=="0" goto docker_ready
+    if "!errorlevel!"=="0" goto :docker_ready
     timeout /t 1 >nul
   )
-  echo ERROR: Docker did not become ready within 3 minutes.
-  pause & exit /b 1
+  call :ShowError "Docker did not become ready within 3 minutes." "Docker Error"
+  goto menu_loop
 )
+
 :docker_ready
 echo Docker is ready.
 
-REM ================================================================
-REM  CONTAINERS
-REM ================================================================
 echo.
 echo [3/5] Starting containers...
-docker compose up -d
+docker compose up -d >nul 2>&1
 if not "%errorlevel%"=="0" (
-  echo Retrying with --build...
-  docker compose up -d --build || (echo ERROR: docker compose up failed. & pause & exit /b 1)
+  docker compose up -d --build >nul 2>&1 || (
+    call :ShowError "docker compose up failed." "Docker Error"
+    goto menu_loop
+  )
 )
 
-REM ================================================================
-REM  HEALTH CHECK
-REM ================================================================
 echo.
-echo [4/5] Waiting for Streamlit to become healthy...
+echo [4/5] Waiting for Streamlit health...
 set "HEALTH_URL=http://localhost:8501/_stcore/health"
-
 for /l %%I in (1,1,180) do (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "try{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 '%HEALTH_URL%'; if($r.StatusCode -lt 500){exit 0}else{exit 1}}catch{exit 1}" >nul 2>&1
-  if "!errorlevel!"=="0" goto streamlit_ready
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "try{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 '%HEALTH_URL%'; if($r.StatusCode -lt 500){exit 0}else{exit 1}}catch{exit 1}" >nul 2>&1
+  if "!errorlevel!"=="0" goto :streamlit_ready
   timeout /t 1 >nul
 )
-echo ERROR: Streamlit health check timed out.
-echo Run: docker compose logs -f
-pause & exit /b 1
+call :ShowError "Streamlit health check timed out. Run: docker compose logs -f" "Startup Timeout"
+goto menu_loop
 
 :streamlit_ready
 echo [5/5] Streamlit is healthy. Opening browser...
 start "" "http://localhost:8501"
-echo.
-echo All done. App is running at http://localhost:8501
-exit /b 0
+call :ShowInfo "App is running at http://localhost:8501" "Launcher"
+goto menu_loop
 
-REM ================================================================
-REM  STOP PATH
-REM ================================================================
 :stop_app
+where docker >nul 2>&1 || (
+  call :ShowError "Docker CLI not found in PATH." "Missing Tool"
+  goto menu_loop
+)
 echo.
 echo Stopping containers...
-docker compose down
+docker compose down >nul 2>&1
 if not "%errorlevel%"=="0" (
-  echo ERROR: docker compose down failed.
-  pause & exit /b 1
+  call :ShowError "docker compose down failed." "Docker Error"
+  goto menu_loop
 )
-echo App stopped successfully.
-exit /b 0
+call :ShowInfo "Algo Trading app stopped successfully." "Launcher"
+goto menu_loop
 
-REM ================================================================
-REM  SUBROUTINE: validate a candidate project folder
-REM  Requires:  docker-compose.yml  AND  Dashboard\dashboard.py
-REM ================================================================
+REM ===============================================================
+REM Helpers
+REM ===============================================================
+:ResolveProjectDir
+if not "%ALGO_TRADING_PROJECT_DIR%"=="" call :TryProject "%ALGO_TRADING_PROJECT_DIR%"
+if not defined PROJECT_DIR call :TryProject "%~dp0"
+if not defined PROJECT_DIR call :TryProject "%CD%"
+
+if not defined PROJECT_DIR if exist "%LAUNCHER_CONFIG%" (
+  set /p SAVED_DIR=<"%LAUNCHER_CONFIG%"
+  if not "!SAVED_DIR!"=="" call :TryProject "!SAVED_DIR!"
+)
+
+if not defined PROJECT_DIR (
+  for /f "usebackq delims=" %%P in (
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$roots=@('%~dp0','%~dp0..',$env:USERPROFILE+'\Desktop',$env:USERPROFILE+'\Documents',$env:USERPROFILE+'\PROJECTS',$env:USERPROFILE+'\dev',$env:USERPROFILE+'\src','C:\Projects','C:\Dev','C:\src'); ^
+       function Test-Proj([string]$p){ if(-not $p){return $false}; $p=[IO.Path]::GetFullPath($p); return (Test-Path (Join-Path $p 'docker-compose.yml')) -and (Test-Path (Join-Path $p 'Dashboard\dashboard.py')) }; ^
+       function Scan-Level([string]$root,[int]$depth){ if(-not (Test-Path $root)){ return $null }; if(Test-Proj $root){ return (Resolve-Path $root).Path }; if($depth -le 0){ return $null }; $dirs=Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue; foreach($d in $dirs){ $r=Scan-Level $d.FullName ($depth-1); if($r){ return $r } }; return $null }; ^
+       foreach($r in $roots){ $f=Scan-Level $r 2; if($f){ Write-Output $f; break } }"`
+  ) do set "PROJECT_DIR=%%P"
+)
+goto :eof
+
 :TryProject
 set "TRY_DIR=%~1"
 if "%TRY_DIR%"=="" goto :eof
 if exist "%TRY_DIR%\docker-compose.yml" if exist "%TRY_DIR%\Dashboard\dashboard.py" (
-  set "PROJECT_DIR=%TRY_DIR%"
+  for %%F in ("%TRY_DIR%") do set "PROJECT_DIR=%%~fF"
 )
+goto :eof
+
+:ChooseProjectFolder
+set "BROWSE_RESULT="
+for /f "usebackq delims=" %%P in (
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Add-Type -AssemblyName System.Windows.Forms; ^
+     $d=New-Object System.Windows.Forms.FolderBrowserDialog; ^
+     $d.Description='Select your Algo Trading project folder (must contain docker-compose.yml)'; ^
+     $d.ShowNewFolderButton=$false; ^
+     if($d.ShowDialog() -eq 'OK'){$d.SelectedPath}else{'CANCELLED'}"`
+) do set "BROWSE_RESULT=%%P"
+if /I not "%BROWSE_RESULT%"=="CANCELLED" call :TryProject "%BROWSE_RESULT%"
+goto :eof
+
+:SaveProjectDir
+if defined PROJECT_DIR (
+  >"%LAUNCHER_CONFIG%" echo %PROJECT_DIR%
+)
+goto :eof
+
+:SyncDesktopLauncher
+if not defined PROJECT_DIR goto :eof
+set "SOURCE_LAUNCHER=%PROJECT_DIR%\Launch_Algo_Trading_Windows.bat"
+if not exist "%SOURCE_LAUNCHER%" goto :eof
+
+set "DESKTOP_DIR="
+for /f "usebackq delims=" %%D in (
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::GetFolderPath('Desktop')"`
+) do set "DESKTOP_DIR=%%D"
+if not defined DESKTOP_DIR goto :eof
+
+set "TARGET_LAUNCHER=%DESKTOP_DIR%\Launch_Algo_Trading_Windows.bat"
+if /I "%SOURCE_LAUNCHER%"=="%TARGET_LAUNCHER%" goto :eof
+
+copy /Y "%SOURCE_LAUNCHER%" "%TARGET_LAUNCHER%" >nul 2>&1
+if "%errorlevel%"=="0" (
+  echo Desktop launcher synced: "%TARGET_LAUNCHER%"
+)
+goto :eof
+
+:ShowError
+set "MSG=%~1"
+set "TTL=%~2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('%MSG%','%TTL%',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null"
+goto :eof
+
+:ShowInfo
+set "MSG=%~1"
+set "TTL=%~2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('%MSG%','%TTL%',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null"
 goto :eof

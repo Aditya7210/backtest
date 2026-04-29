@@ -4,15 +4,38 @@
 # Python
 __pycache__/
 *.pyc
+.ruff_cache/
 
-# Data (you should NOT push heavy data)
-Data/
+# Data (ignore data files, keep folder structure)
+Data/**
+!Data/**/
+!Data/.gitkeep
 
 # Logs
 *.log
 
 # CSV outputs
 *.csv
+
+# Theme folders
+theme/
+themes/
+Theme/
+Themes/
+**/theme/
+**/themes/
+**/Theme/
+**/Themes/
+
+# Project docs (local only)
+CODEBASE.md
+Report.md
+system_map.md
+Zerodha_API_Documentation.md
+Guide/BackTrader/backtrader_guide.md
+
+# Backup
+Backup/
 
 # IDE
 .vscode/

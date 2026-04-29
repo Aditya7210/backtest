@@ -5,10 +5,12 @@ from typing import Any
 
 import pandas as pd
 
+from LiveMarket.time_utils import now_ist_iso
+
 
 def _empty_payload() -> dict[str, Any]:
     return {
-        "generated_at": pd.Timestamp.now().isoformat(),
+        "generated_at": now_ist_iso(),
         "nifty_atm_strike": None,
         "nifty_atm_call_oi": 0,
         "nifty_atm_put_oi": 0,
@@ -100,7 +102,7 @@ def compute(options_1min_csv: Path, equities_1min_csv: Path) -> dict[str, Any]:
     bank_call_oi, bank_put_oi = _atm_oi(options_df, "BANKNIFTY", bank_strike)
 
     return {
-        "generated_at": pd.Timestamp.now().isoformat(),
+        "generated_at": now_ist_iso(),
         "nifty_atm_strike": int(nifty_strike) if nifty_strike is not None else None,
         "nifty_atm_call_oi": nifty_call_oi,
         "nifty_atm_put_oi": nifty_put_oi,
@@ -111,4 +113,3 @@ def compute(options_1min_csv: Path, equities_1min_csv: Path) -> dict[str, Any]:
 
 
 __all__ = ["compute"]
-

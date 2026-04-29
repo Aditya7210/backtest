@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pandas as pd
 
+from LiveMarket.time_utils import now_ist_iso
+
 
 def _empty_payload() -> dict[str, float | int | str]:
     return {
-        "generated_at": pd.Timestamp.now().isoformat(),
+        "generated_at": now_ist_iso(),
         "nifty_pcr": 0.0,
         "banknifty_pcr": 0.0,
         "total_call_oi": 0,
@@ -58,7 +60,7 @@ def compute(options_1min_csv: Path) -> dict[str, float | int | str]:
     bank_pcr, bank_calls, bank_puts = _compute_underlying_pcr(df, "BANKNIFTY")
 
     return {
-        "generated_at": pd.Timestamp.now().isoformat(),
+        "generated_at": now_ist_iso(),
         "nifty_pcr": nifty_pcr,
         "banknifty_pcr": bank_pcr,
         "total_call_oi": int(nifty_calls + bank_calls),
@@ -67,4 +69,3 @@ def compute(options_1min_csv: Path) -> dict[str, float | int | str]:
 
 
 __all__ = ["compute"]
-

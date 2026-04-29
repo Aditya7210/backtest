@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from LiveMarket import COLLECTOR_STATUS_PATH, LIVE_MARKET_ROOT, PROJECT_ROOT, SNAPSHOTS_ROOT
+from LiveMarket.time_utils import IST, coerce_to_ist, now_ist, now_ist_iso
 
 
 PROCESS_STATE_PATH = LIVE_MARKET_ROOT / "process_state.json"
@@ -24,7 +25,7 @@ _COLLECTOR_STATUS_MAX_STALE_SECONDS = 45
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return now_ist_iso()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -113,11 +114,8 @@ def _is_recent_iso_timestamp(value: Any, *, max_age_seconds: int) -> bool:
     if parsed is None:
         return False
 
-    if parsed.tzinfo is not None:
-        now = datetime.now(parsed.tzinfo)
-    else:
-        now = datetime.now()
-    age = (now - parsed).total_seconds()
+    parsed_ist = coerce_to_ist(parsed)
+    age = (now_ist() - parsed_ist).total_seconds()
     return 0 <= age <= float(max_age_seconds)
 
 
@@ -135,7 +133,12 @@ def _start_script(script_path: Path, key: str, module_name: str) -> tuple[bool, 
     log_path = _LOGS_DIR / f"{key}.log"
     stderr_path = _LOGS_DIR / f"{key}_error.log"
 
-    with log_path.open("a", encoding="utf-8") as out_handle, stderr_path.open("a", encoding="utf-8") as err_handle:
+    start_marker = f"\n=== start attempt {key} at {_now_iso()} ===\n"
+    with log_path.open("w", encoding="utf-8") as out_handle, stderr_path.open("w", encoding="utf-8") as err_handle:
+        out_handle.write(start_marker)
+        err_handle.write(start_marker)
+        out_handle.flush()
+        err_handle.flush()
         creationflags = 0
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -314,7 +317,7 @@ def get_status() -> dict[str, Any]:
     snapshots_last_modified: dict[str, str | None] = {}
     for key, path in snapshot_files.items():
         if path.is_file():
-            snapshots_last_modified[key] = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+            snapshots_last_modified[key] = datetime.fromtimestamp(path.stat().st_mtime, tz=IST).isoformat(timespec="seconds")
         else:
             snapshots_last_modified[key] = None
 

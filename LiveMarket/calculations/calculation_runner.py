@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-from datetime import datetime
 import json
 from pathlib import Path
 import time
@@ -9,6 +8,7 @@ from typing import Any
 from LiveMarket import COLLECTOR_STATUS_PATH, DAILY_ROOT, SNAPSHOTS_ROOT
 from LiveMarket.calculations import ad_calculator, atm_oi_calculator, pcr_calculator, snapshot_writer, vix_reader, vwap_calculator
 from LiveMarket.calculations.bar_resampler import resample_to_timeframes
+from LiveMarket.time_utils import now_ist_iso
 
 
 _RESAMPLE_TIMEFRAMES = [3, 5, 10, 15, 30, 60]
@@ -41,7 +41,7 @@ def _resolve_day_dir(status_path: Path = COLLECTOR_STATUS_PATH) -> Path | None:
 def _build_vwap_snapshot(day_dir: Path) -> dict[str, Any]:
     timeframe_payload = vwap_calculator.compute_all_timeframes(day_dir, base_name="equities")
     return {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": now_ist_iso(),
         "data": timeframe_payload,
     }
 
@@ -84,7 +84,7 @@ def run_once() -> dict[str, Any]:
     return {
         "status": "ok",
         "trading_date": day_dir.name,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": now_ist_iso(),
     }
 
 

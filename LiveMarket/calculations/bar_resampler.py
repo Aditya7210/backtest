@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from LiveMarket.time_utils import today_ist
+
 
 IST = "Asia/Kolkata"
 
@@ -16,17 +18,21 @@ def _normalize_timestamp_column(series: pd.Series) -> pd.Series:
 
 
 def _today_ist_date() -> datetime.date:
-    return pd.Timestamp.now(tz=IST).date()
+    return today_ist()
 
 
 def _build_agg_map(df: pd.DataFrame) -> dict[str, str]:
-    agg: dict[str, str] = {
+    agg: dict[str, str] = {}
+    base_agg: dict[str, str] = {
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
         "volume": "sum",
     }
+    for column, mode in base_agg.items():
+        if column in df.columns:
+            agg[column] = mode
     if "oi" in df.columns:
         agg["oi"] = "last"
     passthrough = ["tradingsymbol", "strike", "expiry", "option_type"]
@@ -122,4 +128,3 @@ def resample_to_timeframes(
 
 
 __all__ = ["resample_to_timeframes"]
-

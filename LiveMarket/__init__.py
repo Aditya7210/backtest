@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+from LiveMarket.time_utils import today_ist
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIVE_MARKET_ROOT = PROJECT_ROOT / "Data" / "live_market"
@@ -18,9 +20,7 @@ def ensure_live_market_dirs(*, trading_date: date | None = None) -> Path:
     SNAPSHOTS_ROOT.mkdir(parents=True, exist_ok=True)
 
     if trading_date is None:
-        from datetime import date as _date
-
-        trading_date = _date.today()
+        trading_date = today_ist()
     day_dir = DAILY_ROOT / trading_date.isoformat()
     day_dir.mkdir(parents=True, exist_ok=True)
     return day_dir
@@ -35,4 +35,3 @@ __all__ = [
     "SNAPSHOTS_ROOT",
     "ensure_live_market_dirs",
 ]
-

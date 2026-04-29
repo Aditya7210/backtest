@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from LiveMarket import PROJECT_ROOT
+from LiveMarket.time_utils import today_ist
 
 
 # Collection universe controls.
@@ -253,7 +254,7 @@ def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str,
         )
         options_df = options_df[options_df["underlying"].isin(set(OPTION_UNDERLYINGS))]
         options_df["expiry"] = pd.to_datetime(options_df["expiry"], errors="coerce").dt.date
-        today = date.today()
+        today = today_ist()
         max_day = today + timedelta(days=31)
         options_df = options_df[
             options_df["expiry"].notna()

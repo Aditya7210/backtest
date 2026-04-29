@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 import json
 import os
 
 from LiveMarket import COLLECTOR_STATUS_PATH, ensure_live_market_dirs
 from LiveMarket.collector import prev_close_loader, token_loader, trading_calendar, ws_collector
+from LiveMarket.time_utils import now_ist_iso, today_ist
 
 
 def _write_not_trading_day_status(today: date) -> None:
@@ -13,14 +14,14 @@ def _write_not_trading_day_status(today: date) -> None:
         "status": "not_trading_day",
         "pid": os.getpid(),
         "date": today.isoformat(),
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": now_ist_iso(),
     }
     COLLECTOR_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     COLLECTOR_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    today = date.today()
+    today = today_ist()
     if not trading_calendar.is_trading_day(today):
         print("[run_collector] Today is not a trading day. Collector will not start.")
         _write_not_trading_day_status(today)

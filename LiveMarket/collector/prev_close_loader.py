@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 import json
 from pathlib import Path
 import time
 from typing import Any
+
+from LiveMarket.time_utils import now_ist_iso, today_ist
 
 
 QUOTE_BATCH_SIZE = 500
@@ -18,7 +19,7 @@ def _is_today_snapshot(path: Path) -> bool:
     except Exception:
         return False
     snapshot_date = str(payload.get("date") or "").strip()
-    return snapshot_date == datetime.now().date().isoformat()
+    return snapshot_date == today_ist().isoformat()
 
 
 def load_cached_prev_close(path: Path) -> dict[str, Any] | None:
@@ -99,8 +100,8 @@ def fetch_and_save_prev_close(
             values_by_token[str(int(token))] = close_val
 
     payload = {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "date": datetime.now().date().isoformat(),
+        "generated_at": now_ist_iso(),
+        "date": today_ist().isoformat(),
         "data": values_by_token,
     }
     temp_path = output_path.with_suffix(".tmp")
@@ -132,4 +133,3 @@ __all__ = [
     "fetch_and_save_prev_close",
     "load_cached_prev_close",
 ]
-

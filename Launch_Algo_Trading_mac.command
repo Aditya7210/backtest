@@ -1,15 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# ---------------------------------------------------------------
-# macOS one-click launcher
-# 1) Resolve project directory (name-agnostic, scans common paths)
-# 2) Custom GUI: Start/Update  |  Stop  |  Exit
-# 3) Pull latest from GitHub (auto-stash only prompted if dirty)
-# 4) Ensure Docker is running
-# 5) Start/Stop docker compose
-# 6) Open Streamlit once healthy (start path)
-# ---------------------------------------------------------------
+# ===============================================================
+# Algo Trading Launcher (macOS)
+# - Project folder name agnostic (marker-based detection)
+# - GUI actions: Start/Update, Stop App, Change Project, Exit
+# - Auto-stash compatibility before git pull
+# ===============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LAUNCHER_CONFIG="$HOME/.algo_trading_launcher_path"
@@ -17,260 +14,275 @@ PROJECT_DIR=""
 AUTO_STASH="no"
 STASH_CREATED="no"
 
-# ================================================================
-#  PROJECT DIRECTORY VALIDATION
-# ================================================================
 is_project_dir() {
-  local d="$1"
+  local d="${1:-}"
   [[ -n "$d" ]] || return 1
   [[ -f "$d/docker-compose.yml" && -f "$d/Dashboard/dashboard.py" ]]
 }
 
 try_project_dir() {
-  local d="$1"
+  local d="${1:-}"
   if is_project_dir "$d"; then
-    PROJECT_DIR="$d"
+    PROJECT_DIR="$(cd "$d" && pwd)"
     return 0
   fi
   return 1
 }
 
-# Scan one level of subdirectories under a given parent
-scan_subdirs() {
-  local parent="$1"
-  [[ -d "$parent" ]] || return 0
-  while IFS= read -r -d '' sub; do
-    try_project_dir "$sub" && return 0
-  done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+scan_candidates() {
+  local root="${1:-}"
+  [[ -d "$root" ]] || return 1
+
+  if is_project_dir "$root"; then
+    echo "$(cd "$root" && pwd)"
+    return 0
+  fi
+
+  while IFS= read -r -d '' d1; do
+    if is_project_dir "$d1"; then
+      echo "$(cd "$d1" && pwd)"
+      return 0
+    fi
+    while IFS= read -r -d '' d2; do
+      if is_project_dir "$d2"; then
+        echo "$(cd "$d2" && pwd)"
+        return 0
+      fi
+    done < <(find "$d1" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
   return 1
 }
 
-# ================================================================
-#  PROJECT RESOLUTION  (name-agnostic)
-#  1. Env var override
-#  2. Script's own directory
-#  3. Saved path from last run
-#  4. Scan subdirs of common parent locations
-#  5. Folder-chooser dialog
-# ================================================================
+choose_project_folder() {
+  local chosen=""
+  chosen="$(osascript <<'OSA' 2>/dev/null || true
+set picked to choose folder with prompt "Select your Algo Trading project folder (must contain docker-compose.yml):"
+return POSIX path of picked
+OSA
+)"
+  chosen="${chosen%/}"
+  [[ -n "$chosen" ]] || return 1
+  try_project_dir "$chosen"
+}
 
-# 1. Env var override
-if [[ -n "${ALGO_TRADING_PROJECT_DIR:-}" ]]; then
-  try_project_dir "${ALGO_TRADING_PROJECT_DIR}" || true
-fi
+show_error() {
+  local msg="$1"
+  local title="${2:-Launcher Error}"
+  osascript -e "display dialog \"$msg\" buttons {\"OK\"} default button \"OK\" with title \"$title\" with icon stop" >/dev/null 2>&1 || true
+}
 
-# 2. Script's own directory (launcher placed inside the project)
-if [[ -z "$PROJECT_DIR" ]]; then
-  try_project_dir "$SCRIPT_DIR" || true
-fi
+show_info() {
+  local msg="$1"
+  local title="${2:-Launcher}"
+  osascript -e "display dialog \"$msg\" buttons {\"OK\"} default button \"OK\" with title \"$title\" with icon note" >/dev/null 2>&1 || true
+}
 
-# 3. Saved path from last run
-if [[ -z "$PROJECT_DIR" && -f "$LAUNCHER_CONFIG" ]]; then
-  SAVED_DIR="$(cat "$LAUNCHER_CONFIG" 2>/dev/null || true)"
-  [[ -n "$SAVED_DIR" ]] && { try_project_dir "$SAVED_DIR" || true; }
-fi
-
-# 4. Scan common parent locations (any folder name accepted)
-if [[ -z "$PROJECT_DIR" ]]; then
-  for search_root in \
-      "$SCRIPT_DIR/.." \
-      "$HOME/PROJECTS" \
-      "$HOME/Desktop" \
-      "$HOME/Documents" \
-      "$HOME/Developer" \
-      "$HOME/dev" \
-      "$HOME/src" \
-      "$HOME"
-  do
-    [[ -z "$PROJECT_DIR" ]] && { scan_subdirs "$search_root" || true; }
+ensure_mac_permissions() {
+  local target
+  for target in "$PROJECT_DIR/compose-up.sh" "$PROJECT_DIR/entrypoint.sh"; do
+    [[ -f "$target" ]] || continue
+    chmod +x "$target" >/dev/null 2>&1 || true
   done
-fi
+}
 
-# 5. Folder-chooser dialog as last resort
-if [[ -z "$PROJECT_DIR" ]]; then
-  echo "Could not auto-detect project folder. Showing folder chooser..."
-  CHOSEN="$(osascript <<'OSA' 2>/dev/null || true
-    set chosen to choose folder with prompt "Select your Algo Trading project folder (must contain docker-compose.yml):"
-    return POSIX path of chosen
-OSA
-  )"
-  # Strip trailing slash
-  CHOSEN="${CHOSEN%/}"
-  [[ -n "$CHOSEN" ]] && { try_project_dir "$CHOSEN" || true; }
-fi
+resolve_project_dir() {
+  if [[ -n "${ALGO_TRADING_PROJECT_DIR:-}" ]]; then
+    try_project_dir "$ALGO_TRADING_PROJECT_DIR" || true
+  fi
 
+  [[ -z "$PROJECT_DIR" ]] && try_project_dir "$SCRIPT_DIR" || true
+  [[ -z "$PROJECT_DIR" ]] && try_project_dir "$PWD" || true
+
+  if [[ -z "$PROJECT_DIR" && -f "$LAUNCHER_CONFIG" ]]; then
+    local saved
+    saved="$(cat "$LAUNCHER_CONFIG" 2>/dev/null || true)"
+    [[ -n "$saved" ]] && try_project_dir "$saved" || true
+  fi
+
+  if [[ -z "$PROJECT_DIR" ]]; then
+    local roots=(
+      "$SCRIPT_DIR"
+      "$SCRIPT_DIR/.."
+      "$HOME/Desktop"
+      "$HOME/Documents"
+      "$HOME/PROJECTS"
+      "$HOME/dev"
+      "$HOME/src"
+      "$HOME"
+    )
+    local found=""
+    for r in "${roots[@]}"; do
+      found="$(scan_candidates "$r" || true)"
+      if [[ -n "$found" ]]; then
+        PROJECT_DIR="$found"
+        break
+      fi
+    done
+  fi
+}
+
+resolve_project_dir
 if [[ -z "$PROJECT_DIR" ]]; then
-  osascript -e 'display dialog "Could not find a valid project folder.\n\nRequired files:\n  • docker-compose.yml\n  • Dashboard/dashboard.py\n\nTip: set ALGO_TRADING_PROJECT_DIR env var or place the launcher inside the project." buttons {"OK"} default button "OK" with title "Project Not Found" with icon stop' >/dev/null 2>&1 || true
-  echo "ERROR: Valid project folder not found."
+  choose_project_folder || true
+fi
+if [[ -z "$PROJECT_DIR" ]]; then
+  show_error "Could not find a valid project folder.\n\nRequired files:\n- docker-compose.yml\n- Dashboard/dashboard.py"
   exit 1
 fi
 
-# Save resolved path for next run
-echo "$PROJECT_DIR" > "$LAUNCHER_CONFIG"
-echo "Project directory: $PROJECT_DIR"
-cd "$PROJECT_DIR"
+sync_desktop_launcher() {
+  local source="$PROJECT_DIR/Launch_Algo_Trading_mac.command"
+  local target="$HOME/Desktop/Launch_Algo_Trading_mac.command"
+  [[ -f "$source" ]] || return 0
+  [[ "$source" == "$target" ]] && return 0
+  cp -f "$source" "$target" >/dev/null 2>&1 || return 0
+  chmod +x "$target" >/dev/null 2>&1 || true
+  echo "Desktop launcher synced: $target"
+}
 
-# ================================================================
-#  TOOL CHECKS
-# ================================================================
-command -v docker >/dev/null 2>&1 || { echo "ERROR: Docker CLI not found in PATH."; exit 1; }
-command -v curl   >/dev/null 2>&1 || { echo "ERROR: curl not found in PATH.";       exit 1; }
+sync_desktop_launcher
 
-# ================================================================
-#  MAIN GUI  –  single dialog, three clearly-labelled buttons
-#  osascript button order: left-to-right maps to buttons list 1→N
-#  We put "Exit" first so it is not the default/return key button.
-# ================================================================
-ACTION="$(osascript <<OSA
+menu_loop() {
+  echo "$PROJECT_DIR" > "$LAUNCHER_CONFIG"
+  cd "$PROJECT_DIR"
+
+  local project_name
+  project_name="$(basename "$PROJECT_DIR")"
+  local action
+  action="$(osascript <<OSA 2>/dev/null || echo "Exit Launcher"
+set msgText to "Project: $project_name" & return & "$PROJECT_DIR" & return & return & "Choose an action:"
 tell application "System Events"
-    set result to button returned of (display dialog ¬
-        "Project:  $PROJECT_DIR\n\nWhat would you like to do?" ¬
-        buttons {"Exit", "Stop App", "Start / Update"} ¬
-        default button "Start / Update" ¬
-        cancel button "Exit" ¬
-        with title "Algo Trading Launcher" ¬
-        with icon note)
-    return result
+  set pressed to button returned of (display dialog msgText buttons {"Exit Launcher", "Change Project", "Stop App", "Start / Update App"} default button "Start / Update App" cancel button "Exit Launcher" with title "Algo Trading Launcher" with icon note)
+  return pressed
 end tell
 OSA
-2>/dev/null || echo "EXIT")"
+)"
 
-case "$ACTION" in
-  "Start / Update") : ;;          # fall through to start path
-  "Stop App")       goto_stop=1 ;;
-  *)                exit 0 ;;     # Exit / cancelled
-esac
+  case "$action" in
+    "Start / Update App") start_update_flow ;;
+    "Stop App") stop_flow ;;
+    "Change Project")
+      if choose_project_folder; then
+        echo "$PROJECT_DIR" > "$LAUNCHER_CONFIG"
+        sync_desktop_launcher
+      else
+        show_info "Project selection cancelled."
+      fi
+      ;;
+    *) exit 0 ;;
+  esac
 
-# ================================================================
-#  STOP PATH
-# ================================================================
-if [[ "${goto_stop:-0}" == "1" ]]; then
-  echo
-  echo "Stopping containers..."
-  docker compose down
-  osascript -e 'display dialog "Algo Trading app stopped successfully." buttons {"OK"} default button "OK" with title "Algo Trading Launcher" with icon note' >/dev/null 2>&1 || true
-  exit 0
-fi
+  menu_loop
+}
 
-# ================================================================
-#  START / UPDATE PATH
-# ================================================================
-command -v git >/dev/null 2>&1 || { echo "ERROR: git not found in PATH."; exit 1; }
+start_update_flow() {
+  command -v docker >/dev/null 2>&1 || { show_error "Docker CLI not found in PATH." "Missing Tool"; return; }
+  command -v git >/dev/null 2>&1 || { show_error "Git not found in PATH." "Missing Tool"; return; }
+  command -v curl >/dev/null 2>&1 || { show_error "curl not found in PATH." "Missing Tool"; return; }
 
-echo
-echo "[1/5] Checking repository status..."
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: Not a git repository."; exit 1; }
+  ensure_mac_permissions
 
-# ---- Dirty-tree check BEFORE asking about stash ----
-WORKTREE_DIRTY=""
-[[ -n "$(git status --porcelain 2>/dev/null)" ]] && WORKTREE_DIRTY="yes"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    show_error "Selected folder is not a git repository." "Git Error"
+    return
+  }
 
-if [[ "$WORKTREE_DIRTY" == "yes" ]]; then
-  # Only now prompt about stash (tree is actually dirty)
-  STASH_REPLY="$(osascript <<'OSA' 2>/dev/null || echo "No"
+  echo "[1/5] Checking repository status..."
+  local dirty="no"
+  [[ -n "$(git status --porcelain 2>/dev/null)" ]] && dirty="yes"
+  AUTO_STASH="no"
+  STASH_CREATED="no"
+
+  if [[ "$dirty" == "yes" ]]; then
+    local stash_answer
+    stash_answer="$(osascript <<'OSA' 2>/dev/null || echo "Abort Update"
 tell application "System Events"
-    set result to button returned of (display dialog ¬
-        "⚠  Uncommitted local changes detected.\n\nAuto-stash will save your changes before pulling and restore them afterward." ¬
-        buttons {"Abort Update", "Auto-Stash & Continue"} ¬
-        default button "Auto-Stash & Continue" ¬
-        cancel button "Abort Update" ¬
-        with title "Local Changes Detected" ¬
-        with icon caution)
-    return result
+  set pressed to button returned of (display dialog "Uncommitted local changes detected.\n\nAuto-stash will save local changes before pull and restore after pull.\n\nContinue?" buttons {"Abort Update", "Auto-Stash & Continue"} default button "Auto-Stash & Continue" cancel button "Abort Update" with title "Local Changes Detected" with icon caution)
+  return pressed
 end tell
 OSA
-  )"
-
-  if [[ "$STASH_REPLY" == "Auto-Stash & Continue" ]]; then
-    AUTO_STASH="yes"
-  else
-    echo "Update aborted. Resolve local changes manually and re-run."
-    exit 0
+)"
+    if [[ "$stash_answer" == "Auto-Stash & Continue" ]]; then
+      AUTO_STASH="yes"
+    else
+      echo "Update cancelled by user."
+      return
+    fi
   fi
-fi
 
-# ---- Fetch ----
-echo
-echo "[1/5] Fetching latest updates from GitHub..."
-git fetch --all --prune
+  echo "[1/5] Fetching latest updates from GitHub..."
+  git fetch --all --prune || { show_error "git fetch failed." "Git Error"; return; }
 
-# ---- Stash if needed ----
-if [[ "$WORKTREE_DIRTY" == "yes" && "$AUTO_STASH" == "yes" ]]; then
-  STASH_BEFORE="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
-  git stash push -u -m "launcher-auto-stash $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null 2>&1 || true
-  STASH_AFTER="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${STASH_AFTER:-0}" -gt "${STASH_BEFORE:-0}" ]]; then
-    STASH_CREATED="yes"
-    echo "Auto-stashed local changes."
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+
+  if [[ "$dirty" == "yes" && "$AUTO_STASH" == "yes" ]]; then
+    local before after
+    before="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    git stash push -u -m "launcher-auto-stash $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null 2>&1 || true
+    after="$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${after:-0}" -gt "${before:-0}" ]]; then
+      STASH_CREATED="yes"
+      echo "Auto-stashed local changes."
+    fi
   fi
-fi
 
-# ---- Pull ----
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
-if ! git pull --ff-only origin "$CURRENT_BRANCH"; then
-  echo
-  echo "ERROR: git pull failed (possible merge conflict or non-fast-forward)."
-  [[ "$STASH_CREATED" == "yes" ]] && echo "Your stash is intact. Run: git stash list"
-  exit 1
-fi
-
-# ---- Restore stash ----
-if [[ "$STASH_CREATED" == "yes" ]]; then
-  echo "Restoring auto-stashed changes..."
-  if ! git stash pop >/dev/null 2>&1; then
-    echo "WARNING: Stash pop had conflicts. Resolve manually (git stash list)."
+  if ! git pull --ff-only origin "$branch"; then
+    [[ "$STASH_CREATED" == "yes" ]] && echo "Your stash is still available: git stash list"
+    show_error "git pull failed (non-fast-forward/conflict)." "Git Error"
+    return
   fi
-fi
 
-# ================================================================
-#  DOCKER
-# ================================================================
-echo
-echo "[2/5] Verifying Docker..."
-if ! docker info >/dev/null 2>&1; then
-  echo "Docker not ready — attempting to start Docker Desktop..."
-  open -a Docker 2>/dev/null || true
+  if [[ "$STASH_CREATED" == "yes" ]]; then
+    echo "Restoring auto-stashed changes..."
+    if ! git stash pop >/dev/null 2>&1; then
+      show_error "Stash restore had conflicts. Resolve manually (git stash list)." "Git Warning"
+    fi
+  fi
 
+  echo "[2/5] Verifying Docker..."
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker not ready. Attempting to start Docker Desktop..."
+    open -a Docker 2>/dev/null || true
+    for _ in $(seq 1 180); do
+      docker info >/dev/null 2>&1 && break
+      sleep 1
+    done
+  fi
+  docker info >/dev/null 2>&1 || { show_error "Docker did not become ready within 3 minutes." "Docker Error"; return; }
+
+  echo "[3/5] Starting containers..."
+  if [[ -f "$PROJECT_DIR/compose-up.sh" ]]; then
+    if ! "$PROJECT_DIR/compose-up.sh" >/dev/null 2>&1; then
+      docker compose up -d --build >/dev/null 2>&1 || { show_error "compose-up.sh and docker compose up failed." "Docker Error"; return; }
+    fi
+  elif ! docker compose up -d >/dev/null 2>&1; then
+    docker compose up -d --build >/dev/null 2>&1 || { show_error "docker compose up failed." "Docker Error"; return; }
+  fi
+
+  echo "[4/5] Waiting for Streamlit health..."
+  local health_url="http://localhost:8501/_stcore/health"
   for _ in $(seq 1 180); do
-    docker info >/dev/null 2>&1 && break
+    if curl -fsS --max-time 3 "$health_url" >/dev/null 2>&1; then
+      echo "[5/5] Streamlit is healthy."
+      open "http://localhost:8501" >/dev/null 2>&1 || true
+      show_info "App is running at http://localhost:8501"
+      return
+    fi
     sleep 1
   done
-fi
 
-if ! docker info >/dev/null 2>&1; then
-  echo "ERROR: Docker did not become ready within 3 minutes."
-  exit 1
-fi
-echo "Docker is ready."
+  show_error "Streamlit health check timed out.\nRun: docker compose logs -f" "Startup Timeout"
+}
 
-# ================================================================
-#  CONTAINERS
-# ================================================================
-echo
-echo "[3/5] Starting containers..."
-if ! docker compose up -d 2>&1; then
-  echo "Retrying with --build..."
-  docker compose up -d --build
-fi
-
-# ================================================================
-#  HEALTH CHECK
-# ================================================================
-echo
-echo "[4/5] Waiting for Streamlit to become healthy..."
-HEALTH_URL="http://localhost:8501/_stcore/health"
-
-for _ in $(seq 1 180); do
-  if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
-    echo "[5/5] Streamlit is healthy. Opening browser..."
-    open "http://localhost:8501"
-    echo
-    echo "All done. App is running at http://localhost:8501"
-    exit 0
+stop_flow() {
+  command -v docker >/dev/null 2>&1 || { show_error "Docker CLI not found in PATH." "Missing Tool"; return; }
+  echo "Stopping containers..."
+  if ! docker compose down >/dev/null 2>&1; then
+    show_error "docker compose down failed." "Docker Error"
+    return
   fi
-  sleep 1
-done
+  show_info "Algo Trading app stopped successfully."
+}
 
-echo "ERROR: Streamlit health check timed out."
-echo "Run: docker compose logs -f"
-exit 1
+menu_loop

@@ -5,6 +5,18 @@ from pathlib import Path
 
 import pandas as pd
 
+from LiveMarket.time_utils import now_ist_iso, today_ist
+
+
+def _empty_payload() -> dict[str, float | int | str]:
+    return {
+        "generated_at": now_ist_iso(),
+        "advances": 0,
+        "declines": 0,
+        "unchanged": 0,
+        "ad_ratio": 0.0,
+    }
+
 
 def _load_prev_close(path: Path) -> dict[str, float]:
     if not path.is_file():
@@ -31,62 +43,26 @@ def compute(
 ) -> dict[str, float | int | str]:
     prev_close = _load_prev_close(prev_close_json)
     if not equities_1min_csv.is_file():
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
+        return _empty_payload()
     df = pd.read_csv(equities_1min_csv)
     if df.empty:
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
+        return _empty_payload()
     required = {"timestamp", "instrument_token", "close"}
     if not required.issubset(set(df.columns)):
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
+        return _empty_payload()
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     if df.empty:
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
-    df = df[df["timestamp"].dt.date == pd.Timestamp.now().date()]
+        return _empty_payload()
+    df = df[df["timestamp"].dt.date == today_ist()]
     if df.empty:
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
+        return _empty_payload()
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df["instrument_token"] = pd.to_numeric(df["instrument_token"], errors="coerce")
     df = df.dropna(subset=["close", "instrument_token"]).sort_values("timestamp")
     if df.empty:
-        return {
-            "generated_at": pd.Timestamp.now().isoformat(),
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "ad_ratio": 0.0,
-        }
+        return _empty_payload()
     latest_close = df.groupby("instrument_token", sort=False)["close"].last()
 
     advances = 0
@@ -105,7 +81,7 @@ def compute(
 
     ad_ratio = round((advances / declines), 4) if declines > 0 else float(advances)
     return {
-        "generated_at": pd.Timestamp.now().isoformat(),
+        "generated_at": now_ist_iso(),
         "advances": advances,
         "declines": declines,
         "unchanged": unchanged,
@@ -114,4 +90,3 @@ def compute(
 
 
 __all__ = ["compute"]
-

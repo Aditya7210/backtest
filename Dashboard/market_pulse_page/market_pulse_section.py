@@ -15,6 +15,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from LiveMarket import LIVE_MARKET_ROOT, SNAPSHOTS_ROOT
+from LiveMarket.time_utils import coerce_to_ist, now_ist
 from .features import collector_controller
 
 
@@ -36,7 +37,8 @@ def _snapshot_age_seconds(snapshot_payload: dict[str, Any]) -> float | None:
         generated = datetime.fromisoformat(raw_ts)
     except ValueError:
         return None
-    return max(0.0, (datetime.now() - generated).total_seconds())
+    generated_ist = coerce_to_ist(generated)
+    return max(0.0, (now_ist() - generated_ist).total_seconds())
 
 
 def _format_badge(label: str, state: str) -> str:
