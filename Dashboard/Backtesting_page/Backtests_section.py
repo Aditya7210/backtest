@@ -278,7 +278,7 @@ def _initialize_zerodha_state() -> None:
     st.session_state.setdefault("live_selected_date", None)
     st.session_state.setdefault("live_selected_token", None)
     st.session_state.setdefault("live_selected_symbol", None)
-    st.session_state.setdefault("live_selected_timeframe", "5min")
+    st.session_state.setdefault("live_selected_timeframe", "1min")
     st.session_state.setdefault("live_selected_data_type", "equities")
     if "execution_terminal" not in st.session_state:
         st.session_state["execution_terminal"] = terminal_feature.ExecutionTerminal(max_lines=2000)
@@ -291,6 +291,18 @@ def _get_execution_terminal() -> terminal_feature.ExecutionTerminal:
         terminal_obj = terminal_feature.ExecutionTerminal(max_lines=2000)
         st.session_state["execution_terminal"] = terminal_obj
     return terminal_obj
+
+
+def _log_execution_terminal(
+    message: str,
+    *,
+    level: str = "INFO",
+    symbol: str | None = None,
+) -> None:
+    try:
+        _get_execution_terminal().log(message, level=level, symbol=symbol)
+    except Exception:
+        pass
 
 
 def _ensure_instrument_mapper_bootstrap() -> None:
@@ -310,11 +322,13 @@ def _start_execution_job(tasks: list[dict[str, object]], config: dict[str, float
     if existing_manager is not None and hasattr(existing_manager, "stop_worker"):
         try:
             existing_manager.stop_worker(timeout_seconds=0.5)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_execution_terminal(
+                f"Unable to stop previous execution manager cleanly: {type(exc).__name__}: {exc}",
+                level="WARNING",
+            )
 
     terminal_obj = _get_execution_terminal()
-    terminal_obj.clear()
     terminal_obj.log("Execution started", level="INFO")
     terminal_obj.log(f"Queued {len(tasks)} tasks", level="INFO")
 
@@ -1286,11 +1300,12 @@ def render() -> None:
             ).strip().lower()
             queue_count = len(selected_data_state.get("zerodha_queue", []))
             csv_count = len(selected_data_state.get("selected_files", []))
+            live_token = selected_data_state.get("live_instrument_token")
             live_ready = bool(
                 selected_data_state.get("live_date")
-                and selected_data_state.get("live_instrument_token")
-                and selected_data_state.get("live_tradingsymbol")
-                and selected_data_state.get("live_timeframe")
+                and (live_token is not None)
+                and str(selected_data_state.get("live_tradingsymbol") or "").strip()
+                and str(selected_data_state.get("live_timeframe") or "").strip()
             )
             if data_mode == "zerodha":
                 can_execute = queue_count > 0
@@ -1312,12 +1327,27 @@ def render() -> None:
             if execute_clicked:
                 if bool(st.session_state.get("execution_running", False)):
                     st.info("Execution is already running. Please wait for current run to finish.")
+                    _log_execution_terminal(
+                        "Execute request ignored because another execution is already running.",
+                        level="WARNING",
+                    )
                 else:
+                    terminal_obj = _get_execution_terminal()
+                    terminal_obj.clear()
+                    terminal_obj.log("Preparing execution request", level="INFO")
+                    terminal_obj.log(f"Data mode selected: {data_mode}", level="INFO")
                     try:
                         selected_file = selected_strategy_state.get("file")
                         selected_class_name = selected_strategy_state.get("class")
                         if not selected_file or not selected_class_name:
                             raise ValueError("Please select a valid strategy")
+                        terminal_obj.log(
+                            (
+                                "Strategy selected: "
+                                f"file={selected_file}, class={selected_class_name}"
+                            ),
+                            level="INFO",
+                        )
 
                         strategy_class = backtest_data_service.load_strategy_class(
                             str(selected_file),
@@ -1325,6 +1355,10 @@ def render() -> None:
                         )
 
                         if data_mode == "zerodha":
+                            terminal_obj.log(
+                                f"Building Zerodha API tasks from queue_count={queue_count}",
+                                level="INFO",
+                            )
                             tasks = backtest_data_service.build_zerodha_queue_tasks(
                                 queue=list(selected_data_state.get("zerodha_queue", [])),
                                 selected_strategy=strategy_class,
@@ -1335,6 +1369,16 @@ def render() -> None:
                             live_symbol = str(selected_data_state.get("live_tradingsymbol") or "").strip().upper()
                             live_timeframe = str(selected_data_state.get("live_timeframe") or "").strip().lower()
                             live_data_type = str(selected_data_state.get("live_data_type") or "equities").strip().lower()
+                            terminal_obj.log(
+                                (
+                                    "Validating Live Market selection: "
+                                    f"date={live_date}, symbol={live_symbol}, "
+                                    f"token={live_token}, timeframe={live_timeframe}, "
+                                    f"data_type={live_data_type}"
+                                ),
+                                level="INFO",
+                                symbol=live_symbol or None,
+                            )
                             ok, message = backtest_data_service.validate_live_data_selection(
                                 date_str=live_date,
                                 instrument_token=int(live_token) if live_token is not None else 0,
@@ -1348,6 +1392,11 @@ def render() -> None:
 
                             from LiveMarket.data_extractor import extract_instrument_data
 
+                            terminal_obj.log(
+                                "Extracting selected Live Market instrument into backtest CSV",
+                                level="INFO",
+                                symbol=live_symbol or None,
+                            )
                             extracted_path = extract_instrument_data(
                                 date_str=live_date,
                                 instrument_token=int(live_token),
@@ -1356,11 +1405,20 @@ def render() -> None:
                                 data_type=live_data_type,
                                 live_data_root=backtest_data_service.resolve_live_data_root(),
                             )
+                            terminal_obj.log(
+                                f"Live Market extraction complete: {extracted_path}",
+                                level="SUCCESS",
+                                symbol=live_symbol or None,
+                            )
                             tasks = backtest_data_service.build_csv_tasks(
                                 [str(extracted_path)],
                                 strategy_class,
                             )
                         else:
+                            terminal_obj.log(
+                                f"Building CSV tasks from selected_files={csv_count}",
+                                level="INFO",
+                            )
                             tasks = backtest_data_service.build_csv_tasks(
                                 list(selected_data_state.get("selected_files", [])),
                                 strategy_class,
@@ -1369,6 +1427,10 @@ def render() -> None:
                         for task in tasks:
                             task["strategy_file_path"] = str(selected_file)
                             task["strategy_class_name"] = str(selected_class_name)
+                        terminal_obj.log(
+                            f"Task build complete: {len(tasks)} task(s) ready",
+                            level="SUCCESS",
+                        )
 
                         config = {
                             "initial_capital": float(
@@ -1384,9 +1446,24 @@ def render() -> None:
                                 st.session_state.get("bt_task_timeout_seconds", 300)
                             ),
                         }
+                        terminal_obj.log(
+                            (
+                                "Execution config: "
+                                f"initial_capital={config['initial_capital']}, "
+                                f"commission={config['commission']}, "
+                                f"max_retries={config['max_retries']}, "
+                                f"task_timeout_seconds={config['task_timeout_seconds']}"
+                            ),
+                            level="INFO",
+                        )
                         _start_execution_job(tasks, config)
                     except Exception as exc:
-                        st.error(f"Failed to execute backtests: {exc}")
+                        error_message = f"{type(exc).__name__}: {exc}"
+                        terminal_obj.log(
+                            f"Failed before execution worker could start: {error_message}",
+                            level="ERROR",
+                        )
+                        st.error(f"Failed to execute backtests: {error_message}")
                         st.session_state["bt_execution_tasks"] = []
                         _sync_state_contract()
                     else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import os
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,10 @@ def save_access_token_to_env(env_path: str, access_token: str) -> None:
             except Exception:
                 pass
         raise RuntimeError(f"Failed to persist access token to .env: {path}") from exc
+
+    # Keep the current process environment in sync with the freshly written .env.
+    os.environ["ZERODHA_ACCESS_TOKEN"] = cleaned_token
+    os.environ["ZERODHA_TOKEN_DATE"] = today_str
 
 
 def is_token_expired(token_date: str) -> bool:

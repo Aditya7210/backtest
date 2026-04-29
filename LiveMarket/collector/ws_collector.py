@@ -40,6 +40,7 @@ _OPTIONS_HEADER = [
     "oi",
 ]
 _VIX_HEADER = ["timestamp", "open", "high", "low", "close"]
+_MAX_WS_TOKENS = 3000
 
 
 def _now_iso() -> str:
@@ -72,6 +73,18 @@ def _write_status(path: Path, **updates: Any) -> None:
 def _is_process_alive(pid: int | None) -> bool:
     if pid is None or pid <= 0:
         return False
+
+    # Linux: treat zombie processes as not alive so stale status does not block startup.
+    if os.name != "nt":
+        stat_path = Path("/proc") / str(pid) / "stat"
+        if stat_path.is_file():
+            try:
+                fields = stat_path.read_text(encoding="utf-8", errors="replace").split()
+                if len(fields) >= 3 and fields[2] == "Z":
+                    return False
+            except Exception:
+                pass
+
     try:
         os.kill(pid, 0)
     except OSError:
@@ -241,6 +254,11 @@ def start(
     )
     if not all_tokens:
         raise RuntimeError("No instruments available for WebSocket subscription")
+    if len(all_tokens) > _MAX_WS_TOKENS:
+        raise RuntimeError(
+            "Too many tokens selected for one WebSocket connection: "
+            f"{len(all_tokens)} > {_MAX_WS_TOKENS}"
+        )
 
     ticker = KiteTicker(
         api_key,

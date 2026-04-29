@@ -8,11 +8,36 @@ from pathlib import Path
 import queue as std_queue
 import threading
 import time
+import traceback
 from typing import Any
 
 from Backtesting.backtest_core import build_failed_result, validate_result
 from Backtesting.execution_engine import ExecutionEngine
 from Backtesting.performance_tracker import PerformanceTracker
+
+
+class _SubprocessTerminal:
+    def __init__(self, max_lines: int = 1500) -> None:
+        self.logs: list[dict[str, str | None]] = []
+        self.max_lines = max(100, int(max_lines))
+
+    def log(
+        self,
+        message: str,
+        level: str = "INFO",
+        task_id: str | None = None,
+        symbol: str | None = None,
+    ) -> None:
+        self.logs.append(
+            {
+                "message": str(message or "").strip() or "(empty message)",
+                "level": str(level or "INFO").strip().upper() or "INFO",
+                "task_id": str(task_id).strip() if task_id else None,
+                "symbol": str(symbol).strip().upper() if symbol else None,
+            }
+        )
+        if len(self.logs) > self.max_lines:
+            self.logs = self.logs[-self.max_lines :]
 
 
 def _execute_task_in_subprocess(
@@ -23,6 +48,7 @@ def _execute_task_in_subprocess(
     task: dict[str, Any],
     task_id: str,
 ) -> None:
+    subprocess_terminal = _SubprocessTerminal()
     try:
         execution_task = dict(task) if isinstance(task, dict) else {}
         if not isinstance(execution_task.get("strategy_class"), type):
@@ -41,16 +67,34 @@ def _execute_task_in_subprocess(
 
         engine = ExecutionEngine(
             base_config=dict(base_config) if isinstance(base_config, dict) else {},
-            terminal=None,
+            terminal=subprocess_terminal,
         )
         result = engine.execute(
             task=execution_task,
             task_id=str(task_id or ""),
             mode=str(mode or "").strip().lower(),
         )
-        result_queue.put({"ok": True, "result": result})
+        result_queue.put(
+            {
+                "ok": True,
+                "result": result,
+                "logs": subprocess_terminal.logs,
+            }
+        )
     except Exception as exc:
-        result_queue.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        subprocess_terminal.log(
+            f"Task subprocess crashed: {type(exc).__name__}: {exc}",
+            level="ERROR",
+            task_id=str(task_id or ""),
+        )
+        result_queue.put(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+                "logs": subprocess_terminal.logs,
+            }
+        )
 
 
 class ExecutionManager:
@@ -634,13 +678,49 @@ class ExecutionManager:
                 f"Task subprocess finished without result (exit_code={process.exitcode})"
             )
 
+        self._replay_subprocess_logs(payload)
+
         if bool(payload.get("ok")):
             result = payload.get("result")
             if isinstance(result, dict):
                 return result
             raise RuntimeError("Task subprocess returned invalid result payload")
 
-        raise RuntimeError(str(payload.get("error") or "Task subprocess failed"))
+        error_message = str(payload.get("error") or "Task subprocess failed")
+        traceback_text = str(payload.get("traceback") or "").strip()
+        if traceback_text:
+            self._log(
+                "Task subprocess traceback follows:",
+                level="ERROR",
+                task_id=task_id,
+                symbol=symbol,
+            )
+            for line in traceback_text.splitlines()[-25:]:
+                self._log(
+                    line,
+                    level="ERROR",
+                    task_id=task_id,
+                    symbol=symbol,
+                )
+        raise RuntimeError(error_message)
+
+    def _replay_subprocess_logs(self, payload: dict[str, Any]) -> None:
+        raw_logs = payload.get("logs")
+        if not isinstance(raw_logs, list):
+            return
+
+        for item in raw_logs:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message") or "").strip()
+            if not message:
+                continue
+            self._log(
+                message,
+                level=str(item.get("level") or "INFO"),
+                task_id=str(item.get("task_id") or "").strip() or None,
+                symbol=str(item.get("symbol") or "").strip().upper() or None,
+            )
 
     @staticmethod
     def _close_result_queue(result_queue: Any) -> None:

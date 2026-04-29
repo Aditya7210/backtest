@@ -116,20 +116,23 @@ def _validate_strategy_source_safety(resolved_path: Path) -> None:
 
 
 def get_zerodha_credentials(session_access_token: str | None = None) -> tuple[str, str]:
-    api_key = os.getenv("ZERODHA_API_KEY", "").strip()
+    api_key = ""
     access_token = (session_access_token or "").strip()
 
-    if not access_token:
-        env_path = resolve_env_path()
-        if env_path.is_file():
-            try:
-                env_data = zerodha_auth.load_env_variables(str(env_path))
-            except Exception:
-                env_data = {}
-            if not api_key:
-                api_key = str(env_data.get("api_key") or "").strip()
-            access_token = str(env_data.get("access_token") or "").strip()
+    env_path = resolve_env_path()
+    env_data: dict[str, str | None] = {}
+    if env_path.is_file():
+        try:
+            env_data = zerodha_auth.load_env_variables(str(env_path))
+        except Exception:
+            env_data = {}
 
+    api_key = str(env_data.get("api_key") or "").strip()
+    if not access_token:
+        access_token = str(env_data.get("access_token") or "").strip()
+
+    if not api_key:
+        api_key = os.getenv("ZERODHA_API_KEY", "").strip()
     if not access_token:
         access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
 
@@ -137,21 +140,25 @@ def get_zerodha_credentials(session_access_token: str | None = None) -> tuple[st
 
 
 def get_zerodha_session_metadata() -> dict[str, str]:
-    api_key, access_token = get_zerodha_credentials()
-    token_date = (os.getenv("ZERODHA_TOKEN_DATE") or "").strip()
-
     env_path = resolve_env_path()
+    env_data: dict[str, str | None] = {}
     if env_path.is_file():
         try:
             env_data = zerodha_auth.load_env_variables(str(env_path))
         except Exception:
             env_data = {}
-        if not api_key:
-            api_key = str(env_data.get("api_key") or "").strip()
-        if not access_token:
-            access_token = str(env_data.get("access_token") or "").strip()
-        if not token_date:
-            token_date = str(env_data.get("token_date") or "").strip()
+
+    # Source of truth is .env; process env is fallback only.
+    api_key = str(env_data.get("api_key") or "").strip()
+    access_token = str(env_data.get("access_token") or "").strip()
+    token_date = str(env_data.get("token_date") or "").strip()
+
+    if not api_key:
+        api_key = os.getenv("ZERODHA_API_KEY", "").strip()
+    if not access_token:
+        access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+    if not token_date:
+        token_date = (os.getenv("ZERODHA_TOKEN_DATE") or "").strip()
 
     return {
         "api_key": api_key,
@@ -419,14 +426,13 @@ def validate_live_data_selection(
     data_type: str,
     live_data_root: Path | None = None,
 ) -> tuple[bool, str]:
-    _ = instrument_token
-    _ = tradingsymbol
     normalized_date = str(date_str or "").strip()
     normalized_timeframe = str(timeframe or "").strip().lower()
     normalized_data_type = str(data_type or "").strip().lower()
+    normalized_symbol = str(tradingsymbol or "").strip().upper()
     if not normalized_date:
         return False, "No live market date selected."
-    if normalized_data_type not in {"equities", "options"}:
+    if normalized_data_type not in {"equities", "options", "vix"}:
         return False, "Invalid live market data type."
     if not normalized_timeframe:
         return False, "No live market timeframe selected."
@@ -439,7 +445,39 @@ def validate_live_data_selection(
     source_csv = daily_dir / f"{normalized_data_type}_{normalized_timeframe}.csv"
     if not source_csv.is_file():
         return False, f"{normalized_timeframe} data not available for {normalized_date}. Try 1min."
-    return True, ""
+
+    try:
+        frame = pd.read_csv(source_csv)
+    except Exception as exc:
+        return False, f"Unable to read selected live data file: {exc}"
+    if frame.empty:
+        return False, "Selected live data file is empty."
+
+    if normalized_data_type == "vix":
+        required = {"timestamp", "open", "high", "low", "close"}
+        missing = required - set(frame.columns)
+        if missing:
+            return False, f"Selected VIX data missing columns: {sorted(missing)}"
+        return True, ""
+
+    required = {"instrument_token", "tradingsymbol"}
+    missing = required - set(frame.columns)
+    if missing:
+        return False, f"Selected live data missing columns: {sorted(missing)}"
+
+    token_series = pd.to_numeric(frame["instrument_token"], errors="coerce")
+    token_matches = token_series == int(instrument_token)
+    if bool(token_matches.any()):
+        return True, ""
+
+    symbol_series = frame["tradingsymbol"].astype(str).str.strip().str.upper()
+    if normalized_symbol and bool((symbol_series == normalized_symbol).any()):
+        return True, ""
+
+    return (
+        False,
+        f"No rows found for selected instrument in {normalized_data_type}_{normalized_timeframe}.csv.",
+    )
 
 
 __all__ = [

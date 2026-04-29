@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
@@ -29,6 +30,7 @@ def _extract_request_token() -> str | None:
 def _persist_and_store_token(env_path: Path, token: str) -> None:
     save_access_token_to_env(str(env_path), token)
     st.session_state["ZERODHA_ACCESS_TOKEN"] = token
+    st.session_state["ZERODHA_TOKEN_DATE"] = date.today().isoformat()
     st.session_state["zerodha_auth_status"] = "Connected to Zerodha"
 
 

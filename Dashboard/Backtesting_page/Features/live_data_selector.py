@@ -10,6 +10,7 @@ from LiveMarket import LIVE_MARKET_ROOT
 
 
 _TIMEFRAMES = ["1min", "3min", "5min", "10min", "15min", "30min", "60min"]
+_LIVE_DATA_TYPES = ["equities", "options", "vix"]
 
 
 def _discover_available_dates(daily_root: Path) -> list[str]:
@@ -19,7 +20,11 @@ def _discover_available_dates(daily_root: Path) -> list[str]:
     for day_dir in daily_root.iterdir():
         if not day_dir.is_dir():
             continue
-        if (day_dir / "equities_1min.csv").is_file() or (day_dir / "options_1min.csv").is_file():
+        if (
+            (day_dir / "equities_1min.csv").is_file()
+            or (day_dir / "options_1min.csv").is_file()
+            or (day_dir / "vix_1min.csv").is_file()
+        ):
             available.append(day_dir.name)
     return sorted(available, reverse=True)
 
@@ -30,6 +35,18 @@ def _load_instrument_index(date_str: str, data_type: str) -> list[dict[str, Any]
         return []
 
     df = pd.read_csv(daily_csv)
+    if df.empty:
+        return []
+
+    if data_type == "vix":
+        return [
+            {
+                "token": 0,
+                "tradingsymbol": "INDIA VIX",
+                "bar_count": int(len(df)),
+            }
+        ]
+
     required = {"instrument_token", "tradingsymbol"}
     if not required.issubset(set(df.columns)):
         return []
@@ -62,6 +79,10 @@ def _timeframe_exists(date_str: str, data_type: str, timeframe: str) -> bool:
     return (LIVE_MARKET_ROOT / "daily" / date_str / f"{data_type}_{timeframe}.csv").is_file()
 
 
+def _available_timeframes(date_str: str, data_type: str) -> list[str]:
+    return [tf for tf in _TIMEFRAMES if _timeframe_exists(date_str, data_type, tf)]
+
+
 def render() -> None:
     st.markdown("### Live Market Data")
     daily_root = LIVE_MARKET_ROOT / "daily"
@@ -72,8 +93,21 @@ def render() -> None:
 
     col1, col2, col3 = st.columns(3, gap="small")
     selected_date = col1.selectbox("Available Dates", options=available_dates, key="live_selected_date")
-    data_type = col2.selectbox("Data Type", options=["equities", "options"], key="live_selected_data_type")
-    timeframe = col3.selectbox("Timeframe", options=_TIMEFRAMES, index=2, key="live_selected_timeframe")
+    data_type = col2.selectbox("Data Type", options=_LIVE_DATA_TYPES, key="live_selected_data_type")
+    available_timeframes = _available_timeframes(selected_date, data_type)
+    if not available_timeframes:
+        col3.selectbox("Timeframe", options=["Unavailable"], index=0, key="live_selected_timeframe_unavailable", disabled=True)
+        st.warning(f"No timeframe files found for {data_type} on {selected_date}.")
+        return
+
+    selected_tf = str(st.session_state.get("live_selected_timeframe") or "").strip().lower()
+    tf_index = available_timeframes.index(selected_tf) if selected_tf in available_timeframes else 0
+    timeframe = col3.selectbox(
+        "Timeframe",
+        options=available_timeframes,
+        index=tf_index,
+        key="live_selected_timeframe",
+    )
 
     cache_key = f"{selected_date}:{data_type}:instrument_index"
     cache_payload = st.session_state.get("_live_instrument_index_cache", {})
@@ -121,16 +155,16 @@ def render() -> None:
         st.warning("Select an instrument to continue.")
         return
 
-    timeframe_available = _timeframe_exists(selected_date, data_type, timeframe)
-    if not timeframe_available:
-        st.warning(f"{timeframe} data not available for {selected_date}. Try 1min.")
-
     st.caption(
         "Selected: "
         f"{selected_instrument['tradingsymbol']} · {selected_date} · {timeframe} · {selected_instrument['bar_count']} bars"
     )
 
-    if st.button("Use This Data for Backtest", use_container_width=True, key="live_use_for_backtest"):
+    if st.button(
+        "Use This Data for Backtest",
+        use_container_width=True,
+        key="live_use_for_backtest",
+    ):
         st.session_state["live_selected_date"] = selected_date
         st.session_state["live_selected_token"] = int(selected_instrument["token"])
         st.session_state["live_selected_symbol"] = str(selected_instrument["tradingsymbol"])

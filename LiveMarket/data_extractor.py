@@ -36,8 +36,8 @@ def extract_instrument_data(
     token = int(instrument_token)
     safe_symbol = _sanitize_symbol(tradingsymbol) or f"TOKEN_{token}"
     safe_type = str(data_type or "equities").strip().lower()
-    if safe_type not in {"equities", "options"}:
-        raise ValueError("data_type must be either 'equities' or 'options'")
+    if safe_type not in {"equities", "options", "vix"}:
+        raise ValueError("data_type must be one of: 'equities', 'options', 'vix'")
 
     tf = _validate_timeframe(timeframe)
     source_csv = live_data_root / "daily" / normalized_date / f"{safe_type}_{tf}.csv"
@@ -51,17 +51,25 @@ def extract_instrument_data(
     if frame.empty:
         raise ValueError(f"Source CSV is empty: {source_csv}")
 
-    required = {"timestamp", "instrument_token", "open", "high", "low", "close", "volume"}
-    missing = required - set(frame.columns)
-    if missing:
-        raise ValueError(f"Source CSV missing required columns: {sorted(missing)}")
+    if safe_type == "vix":
+        required = {"timestamp", "open", "high", "low", "close"}
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"Source CSV missing required columns: {sorted(missing)}")
+        output = frame[["timestamp", "open", "high", "low", "close"]].copy()
+        output["volume"] = 0
+    else:
+        required = {"timestamp", "instrument_token", "open", "high", "low", "close", "volume"}
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"Source CSV missing required columns: {sorted(missing)}")
 
-    token_series = pd.to_numeric(frame["instrument_token"], errors="coerce")
-    filtered = frame.loc[token_series == token].copy()
-    if filtered.empty:
-        raise ValueError(f"No data for {safe_symbol} on {normalized_date} at {tf}")
+        token_series = pd.to_numeric(frame["instrument_token"], errors="coerce")
+        filtered = frame.loc[token_series == token].copy()
+        if filtered.empty:
+            raise ValueError(f"No data for {safe_symbol} on {normalized_date} at {tf}")
+        output = filtered[["timestamp", "open", "high", "low", "close", "volume"]].copy()
 
-    output = filtered[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     output = output.rename(columns={"timestamp": "Date"})
 
     extracted_dir = live_data_root / "extracted"

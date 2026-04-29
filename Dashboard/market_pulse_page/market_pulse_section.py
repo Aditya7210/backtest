@@ -129,19 +129,28 @@ def _render_metrics(status_payload: dict[str, Any]) -> None:
 def _render_status_panel(status_payload: dict[str, Any]) -> None:
     st.markdown("### Runtime Status")
     collector_file_status = status_payload.get("collector_file_status", {})
+    collector_health = status_payload.get("collector_status_health", {})
     collector = status_payload.get("collector", {})
     calculator = status_payload.get("calculator", {})
 
     with st.expander("Collector Status", expanded=True):
         st.write(f"Collector running: {collector.get('running')}")
+        st.write(f"Collector healthy: {collector.get('healthy')}")
         st.write(f"Collector PID: {collector.get('pid')}")
+        st.write(f"Collector PID alive: {collector.get('pid_alive')}")
         st.write(f"Collector started_at: {collector.get('started_at')}")
         st.write(f"Bars written: {collector_file_status.get('bars_written')}")
         st.write(f"Last tick at: {collector_file_status.get('last_tick_at')}")
         st.write(f"Tokens subscribed: {collector_file_status.get('tokens_subscribed')}")
         st.write(f"Collector status file state: {collector_file_status.get('status')}")
+        st.write(f"Collector status file exists: {collector_health.get('status_file_exists')}")
+        st.write(f"Collector status freshness ok: {collector_health.get('status_recent')}")
         if collector_file_status.get("last_error"):
             st.error(f"Collector error: {collector_file_status.get('last_error')}")
+        error_excerpt = str(status_payload.get("collector_error_excerpt") or "").strip()
+        if error_excerpt and not collector.get("running"):
+            st.error("Collector recent stderr:")
+            st.code(error_excerpt, language="text")
 
     with st.expander("Calculation Status", expanded=False):
         st.write(f"Calculator running: {calculator.get('running')}")
