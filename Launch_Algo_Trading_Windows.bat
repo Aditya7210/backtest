@@ -15,7 +15,7 @@ set "WORKTREE_DIRTY=0"
 REM ===============================================================
 REM Algo Trading Launcher (Windows)
 REM - Project folder name agnostic (marker-based detection)
-REM - GUI actions: Start/Update, Stop App, Change Project, Exit
+REM - Terminal actions: Start App, Update App, Stop App, Change Project, Exit
 REM - Auto-stash compatibility before git pull
 REM ===============================================================
 
@@ -68,17 +68,19 @@ echo ALGO TRADING LAUNCHER
 echo ===============================================================
 echo Project: %PROJECT_DIR%
 echo.
-echo   1. Start / Update App
-echo   2. Stop App
-echo   3. Change Project
-echo   4. Exit Launcher
+echo   1. Start App
+echo   2. Update App
+echo   3. Stop App
+echo   4. Change Project
+echo   5. Exit Launcher
 echo.
-choice /c 1234 /n /m "Select action [1-4]: "
+choice /c 12345 /n /m "Select action [1-5]: "
 set "ACTION=EXIT"
 if "%errorlevel%"=="1" set "ACTION=START"
-if "%errorlevel%"=="2" set "ACTION=STOP"
-if "%errorlevel%"=="3" set "ACTION=CHANGE"
-if "%errorlevel%"=="4" set "ACTION=EXIT"
+if "%errorlevel%"=="2" set "ACTION=UPDATE"
+if "%errorlevel%"=="3" set "ACTION=STOP"
+if "%errorlevel%"=="4" set "ACTION=CHANGE"
+if "%errorlevel%"=="5" set "ACTION=EXIT"
 
 call :Log "Menu action selected: %ACTION%"
 
@@ -94,16 +96,19 @@ if /I "%ACTION%"=="CHANGE" (
 )
 if /I "%ACTION%"=="STOP" goto :stop_app
 if /I "%ACTION%"=="START" goto :start_app
+if /I "%ACTION%"=="UPDATE" goto :update_app
 
 call :ShowError "Invalid action selected." "Launcher Error"
 exit /b 1
 
 :start_app
-where docker >nul 2>&1
-if not "%errorlevel%"=="0" (
-  call :ShowError "Docker CLI not found in PATH." "Missing Tool"
-  exit /b 1
-)
+set "FLOW_MODE=START"
+set "FORCE_BUILD=0"
+goto :start_docker_flow
+
+:update_app
+set "FLOW_MODE=UPDATE"
+set "FORCE_BUILD=1"
 where git >nul 2>&1
 if not "%errorlevel%"=="0" (
   call :ShowError "Git not found in PATH." "Missing Tool"
@@ -168,8 +173,16 @@ if "%STASH_CREATED%"=="1" (
   )
 )
 
+:start_docker_flow
+where docker >nul 2>&1
+if not "%errorlevel%"=="0" (
+  call :ShowError "Docker CLI not found in PATH." "Missing Tool"
+  exit /b 1
+)
+
 echo.
-echo [2/5] Verifying Docker...
+if /I "%FLOW_MODE%"=="UPDATE" echo [2/5] Verifying Docker...
+if /I not "%FLOW_MODE%"=="UPDATE" echo [1/3] Verifying Docker...
 docker info >nul 2>&1
 if "%errorlevel%"=="0" goto :docker_ready
   echo Docker not ready. Attempting to start Docker Desktop...
@@ -186,9 +199,12 @@ if "%errorlevel%"=="0" goto :docker_ready
 echo Docker is ready.
 
 echo.
-echo [3/5] Starting containers...
+if /I "%FLOW_MODE%"=="UPDATE" echo [3/5] Rebuilding and starting containers...
+if /I not "%FLOW_MODE%"=="UPDATE" echo [2/3] Starting containers...
+if "%FORCE_BUILD%"=="1" goto :compose_with_build
 docker compose up -d >nul 2>&1
 if "%errorlevel%"=="0" goto :compose_started
+:compose_with_build
 docker compose up -d --build >nul 2>&1
 if not "%errorlevel%"=="0" (
   call :ShowError "docker compose up failed." "Docker Error"
@@ -197,7 +213,8 @@ if not "%errorlevel%"=="0" (
 :compose_started
 
 echo.
-echo [4/5] Waiting for Streamlit health...
+if /I "%FLOW_MODE%"=="UPDATE" echo [4/5] Waiting for Streamlit health...
+if /I not "%FLOW_MODE%"=="UPDATE" echo [3/3] Waiting for Streamlit health...
 set "HEALTH_URL=http://localhost:8501/_stcore/health"
 for /l %%I in (1,1,180) do (
   curl.exe -fsS "%HEALTH_URL%" >nul 2>&1
@@ -208,7 +225,8 @@ call :ShowError "Streamlit health check timed out. Run: docker compose logs -f" 
 goto menu_loop
 
 :streamlit_ready
-echo [5/5] Streamlit is healthy. Opening browser...
+if /I "%FLOW_MODE%"=="UPDATE" echo [5/5] Streamlit is healthy. Opening browser...
+if /I not "%FLOW_MODE%"=="UPDATE" echo Streamlit is healthy. Opening browser...
 start "" "http://localhost:8501"
 call :ShowInfo "App is running at http://localhost:8501" "Launcher"
 goto menu_loop
