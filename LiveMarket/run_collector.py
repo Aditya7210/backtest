@@ -36,6 +36,8 @@ def main() -> int:
     options_meta = dict(token_bundle.get("options_meta", {}))
     token_to_symbol = dict(token_bundle.get("token_to_symbol", {}))
     equity_symbol_by_token = dict(token_bundle.get("equity_symbol_by_token", {}))
+    token_counts = dict(token_bundle.get("token_counts", {}))
+    equity_universe = dict(token_bundle.get("equity_universe", {}))
 
     kite = ws_collector.build_kite_client()
     prev_close_loader.fetch_and_save(
@@ -51,6 +53,8 @@ def main() -> int:
         options_meta=options_meta,
         token_to_symbol=token_to_symbol,
         day_dir=day_dir,
+        token_counts=token_counts,
+        equity_universe=equity_universe,
         status_path=COLLECTOR_STATUS_PATH,
     )
     return 0

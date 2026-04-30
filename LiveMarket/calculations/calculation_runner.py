@@ -8,6 +8,7 @@ from typing import Any
 from LiveMarket import COLLECTOR_STATUS_PATH, DAILY_ROOT, SNAPSHOTS_ROOT
 from LiveMarket.calculations import ad_calculator, atm_oi_calculator, pcr_calculator, snapshot_writer, vix_reader, vwap_calculator
 from LiveMarket.calculations.bar_resampler import resample_to_timeframes
+from LiveMarket.collector import token_loader, ws_collector
 from LiveMarket.time_utils import now_ist_iso
 
 
@@ -46,6 +47,22 @@ def _build_vwap_snapshot(day_dir: Path) -> dict[str, Any]:
     }
 
 
+def _build_pcr_snapshot_from_quotes(options_1min: Path) -> dict[str, Any]:
+    try:
+        token_bundle = token_loader.load_all_tokens()
+        kite = ws_collector.build_kite_client()
+        return pcr_calculator.compute_from_quotes(
+            kite_client=kite,
+            options_meta=dict(token_bundle.get("options_meta", {})),
+            option_symbol_by_token=dict(token_bundle.get("option_symbol_by_token", {})),
+        )
+    except Exception as exc:
+        fallback = pcr_calculator.compute(options_1min)
+        fallback["source"] = "options_1min_csv_fallback"
+        fallback["quote_error"] = f"{type(exc).__name__}: {exc}"
+        return fallback
+
+
 def run_once() -> dict[str, Any]:
     day_dir = _resolve_day_dir()
     if day_dir is None:
@@ -68,7 +85,7 @@ def run_once() -> dict[str, Any]:
 
     vwap_snapshot = _build_vwap_snapshot(day_dir)
     ad_snapshot = ad_calculator.compute(equities_1min, prev_close)
-    pcr_snapshot = pcr_calculator.compute(options_1min)
+    pcr_snapshot = _build_pcr_snapshot_from_quotes(options_1min)
     atm_oi_snapshot = atm_oi_calculator.compute(options_1min, equities_1min)
     vix_snapshot = vix_reader.read(vix_1min)
 
@@ -88,7 +105,7 @@ def run_once() -> dict[str, Any]:
     }
 
 
-def start_loop(interval_seconds: float = 60.0) -> None:
+def start_loop(interval_seconds: float = 10.0) -> None:
     wait_seconds = max(5.0, float(interval_seconds))
     print(f"[calculation_runner] started interval={wait_seconds:.1f}s")
     while True:

@@ -1,11 +1,29 @@
 {
   "status": "running",
-  "pid": 215,
-  "started_at": "2026-04-29T10:00:10+05:30",
-  "trading_date": "2026-04-29",
-  "tokens_subscribed": 167,
-  "bars_written": 9851,
-  "last_tick_at": "2026-04-29T11:00:20+05:30",
+  "pid": 238,
+  "started_at": "2026-04-30T11:32:21+05:30",
+  "trading_date": "2026-04-30",
+  "tokens_subscribed": 1203,
+  "bars_written": 0,
+  "last_tick_at": "2026-04-30T11:33:58+05:30",
   "last_error": null,
-  "updated_at": "2026-04-29T11:00:20+05:30"
+  "updated_at": "2026-04-30T11:33:58+05:30",
+  "token_counts": {
+    "equity": 502,
+    "options": 700,
+    "vix": 1,
+    "total": 1203
+  },
+  "equity_universe": {
+    "name": "NIFTY500_PLUS_FNO",
+    "path": "/app/Data/live_market/universes/nifty500_symbols.csv",
+    "symbols": 500,
+    "source": "cache+fno_from_instruments",
+    "nifty500_symbols": 500,
+    "fno_stock_symbols": 209,
+    "fno_added_to_universe": 0,
+    "matched": 500,
+    "missing_from_instruments": 0,
+    "source_equity_rows": 9591
+  }
 }

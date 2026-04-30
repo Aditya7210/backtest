@@ -1,7 +1,92 @@
 {
-  "generated_at": "2026-04-29T12:48:05+05:30",
-  "advances": 2087,
-  "declines": 927,
-  "unchanged": 305,
-  "ad_ratio": 2.2513
+  "generated_at": "2026-04-30T11:33:58+05:30",
+  "selected_universe": "All Collected",
+  "universes": {
+    "All Collected": {
+      "advances": 69,
+      "declines": 430,
+      "unchanged": 1,
+      "ad_ratio": 0.1605,
+      "universe_observed": 500,
+      "matched_prev_close": 500,
+      "missing_prev_close": 0
+    },
+    "NIFTY 50": {
+      "advances": 3,
+      "declines": 47,
+      "unchanged": 0,
+      "ad_ratio": 0.0638,
+      "universe_observed": 50,
+      "matched_prev_close": 50,
+      "missing_prev_close": 0,
+      "configured_universe_size": 50
+    },
+    "NIFTY BANK": {
+      "advances": 0,
+      "declines": 14,
+      "unchanged": 0,
+      "ad_ratio": 0.0,
+      "universe_observed": 14,
+      "matched_prev_close": 14,
+      "missing_prev_close": 0,
+      "configured_universe_size": 14
+    },
+    "NIFTY 100": {
+      "advances": 5,
+      "declines": 95,
+      "unchanged": 0,
+      "ad_ratio": 0.0526,
+      "universe_observed": 100,
+      "matched_prev_close": 100,
+      "missing_prev_close": 0,
+      "configured_universe_size": 100
+    },
+    "NIFTY 200": {
+      "advances": 14,
+      "declines": 186,
+      "unchanged": 0,
+      "ad_ratio": 0.0753,
+      "universe_observed": 200,
+      "matched_prev_close": 200,
+      "missing_prev_close": 0,
+      "configured_universe_size": 200
+    },
+    "NIFTY 500": {
+      "advances": 69,
+      "declines": 430,
+      "unchanged": 1,
+      "ad_ratio": 0.1605,
+      "universe_observed": 500,
+      "matched_prev_close": 500,
+      "missing_prev_close": 0,
+      "configured_universe_size": 500
+    },
+    "F&O Stocks": {
+      "advances": 11,
+      "declines": 198,
+      "unchanged": 0,
+      "ad_ratio": 0.0556,
+      "universe_observed": 209,
+      "matched_prev_close": 209,
+      "missing_prev_close": 0,
+      "configured_universe_size": 209
+    },
+    "NIFTY500 + F&O": {
+      "advances": 69,
+      "declines": 430,
+      "unchanged": 1,
+      "ad_ratio": 0.1605,
+      "universe_observed": 500,
+      "matched_prev_close": 500,
+      "missing_prev_close": 0,
+      "configured_universe_size": 500
+    }
+  },
+  "advances": 69,
+  "declines": 430,
+  "unchanged": 1,
+  "ad_ratio": 0.1605,
+  "universe_observed": 500,
+  "matched_prev_close": 500,
+  "missing_prev_close": 0
 }

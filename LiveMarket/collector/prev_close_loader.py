@@ -22,6 +22,22 @@ def _is_today_snapshot(path: Path) -> bool:
     return snapshot_date == today_ist().isoformat()
 
 
+def _cache_covers_tokens(payload: dict[str, Any], expected_tokens: set[int]) -> tuple[bool, int]:
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        return False, len(expected_tokens)
+
+    cached_tokens: set[int] = set()
+    for token in data.keys():
+        try:
+            cached_tokens.add(int(token))
+        except (TypeError, ValueError):
+            continue
+
+    missing_count = len(expected_tokens - cached_tokens)
+    return missing_count == 0, missing_count
+
+
 def load_cached_prev_close(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -57,12 +73,19 @@ def fetch_and_save_prev_close(
     force: bool = False,
 ) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_tokens = {int(token) for token in equity_symbol_by_token.keys()}
 
     if (not force) and _is_today_snapshot(output_path):
         cached = load_cached_prev_close(output_path)
         if cached is not None:
-            print("[prev_close_loader] Using cached prev_close.json for today.")
-            return cached
+            cache_ok, missing_count = _cache_covers_tokens(cached, expected_tokens)
+            if cache_ok:
+                print("[prev_close_loader] Using cached prev_close.json for today.")
+                return cached
+            print(
+                "[prev_close_loader] Cached prev_close.json is incomplete for the "
+                f"current universe. missing_tokens={missing_count}; refreshing."
+            )
 
     token_by_symbol = {
         symbol: token
@@ -102,6 +125,9 @@ def fetch_and_save_prev_close(
     payload = {
         "generated_at": now_ist_iso(),
         "date": today_ist().isoformat(),
+        "expected_tokens": len(expected_tokens),
+        "loaded_tokens": len(values_by_token),
+        "missing_tokens": max(0, len(expected_tokens) - len(values_by_token)),
         "data": values_by_token,
     }
     temp_path = output_path.with_suffix(".tmp")
