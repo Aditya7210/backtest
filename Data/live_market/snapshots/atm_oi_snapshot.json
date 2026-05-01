@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-04-30T11:34:00+05:30",
-  "nifty_atm_strike": 23800,
-  "nifty_atm_call_oi": 4720170,
-  "nifty_atm_put_oi": 4781010,
-  "banknifty_atm_strike": 54500,
-  "banknifty_atm_call_oi": 133320,
-  "banknifty_atm_put_oi": 221130
+  "generated_at": "2026-04-30T15:29:26+05:30",
+  "nifty_atm_strike": 24050,
+  "nifty_atm_call_oi": 1413620,
+  "nifty_atm_put_oi": 1329900,
+  "banknifty_atm_strike": 55000,
+  "banknifty_atm_call_oi": 461580,
+  "banknifty_atm_put_oi": 559710
 }

@@ -1,0 +1,1374 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import LightweightCandlestickChart from '../components/LightweightCandlestickChart';
+import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
+import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
+import { computeIndicators, getBacktests, getCatalog, getHistoricalBars, getIndicators } from '../services/api';
+import type { BacktestResult, CatalogEntry, Trade } from '../types/backtest';
+import type { IndicatorMetadata, IndicatorSelection, IndicatorSeries } from '../types/indicators';
+import type { OHLCVBar } from '../types/market';
+
+interface PriceOption extends SearchableOption {
+  instrument_token: number;
+  tradingsymbol: string;
+  timeframe: string;
+  date_from: string;
+  date_to: string;
+  total_bars: number;
+  data_source: string;
+}
+
+interface ResultOption extends SearchableOption {
+  task_id: string;
+}
+
+interface MarkerDiagnostics {
+  totalTrades: number;
+  markersPlotted: number;
+  outsideVisibleRange: number;
+  unmatchedTimestamps: number;
+}
+
+interface DashboardModuleState {
+  id: number;
+  priceId: string;
+  tradeTaskId: string;
+  selectedIndicators: IndicatorSelection[];
+  plotSignals: boolean;
+  syncNonce: number;
+}
+
+const MAX_VISIBLE_CANDLES = 1400;
+
+function asObj(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+}
+
+function asNum(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') {
+    const parsed = Number(v);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function toUnixSeconds(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value);
+  if (typeof value !== 'string') return null;
+  const millis = Date.parse(value);
+  return Number.isFinite(millis) ? Math.floor(millis / 1000) : null;
+}
+
+function parseBars(rawBars: unknown): OHLCVBar[] {
+  if (!Array.isArray(rawBars)) return [];
+  const parsed: OHLCVBar[] = [];
+  for (const row of rawBars) {
+    const rec = asObj(row);
+    const time = asNum(rec.time) ?? toUnixSeconds(rec.timestamp);
+    const open = asNum(rec.open);
+    const high = asNum(rec.high);
+    const low = asNum(rec.low);
+    const close = asNum(rec.close);
+    const volume = asNum(rec.volume) ?? 0;
+    if (time == null || open == null || high == null || low == null || close == null) continue;
+    parsed.push({ time, open, high, low, close, volume });
+  }
+  parsed.sort((a, b) => a.time - b.time);
+  const deduped: OHLCVBar[] = [];
+  let lastTime = -1;
+  for (const bar of parsed) {
+    if (bar.time === lastTime) deduped[deduped.length - 1] = bar;
+    else {
+      deduped.push(bar);
+      lastTime = bar.time;
+    }
+  }
+  return deduped;
+}
+
+function normalizeTradeTimestampToUnix(input: string | null | undefined): number | null {
+  const raw = (input || '').trim();
+  if (!raw) return null;
+  const hasTz = /([zZ]|[+-]\d{2}:\d{2})$/.test(raw);
+  const normalized = hasTz ? raw : `${raw.replace(' ', 'T')}+05:30`;
+  const millis = Date.parse(normalized);
+  if (!Number.isFinite(millis)) return null;
+  return Math.floor(millis / 1000);
+}
+
+function nearestCandleTime(targetUnix: number, candleTimes: number[]): number | null {
+  if (!candleTimes.length) return null;
+  let best = candleTimes[0];
+  let diff = Math.abs(best - targetUnix);
+  for (let i = 1; i < candleTimes.length; i += 1) {
+    const d = Math.abs(candleTimes[i] - targetUnix);
+    if (d < diff) {
+      diff = d;
+      best = candleTimes[i];
+    }
+  }
+  return best;
+}
+
+function directionKind(direction: string): 'long' | 'short' | 'unknown' {
+  const d = (direction || '').toUpperCase();
+  if (d === 'BUY' || d === 'LONG') return 'long';
+  if (d === 'SELL' || d === 'SHORT') return 'short';
+  return 'unknown';
+}
+
+function buildPriceOptions(catalog: CatalogEntry[]): PriceOption[] {
+  const options: PriceOption[] = [];
+  for (const instrument of catalog) {
+    const symbol = instrument.tradingsymbol || `TOKEN ${instrument.instrument_token}`;
+    for (const tf of instrument.timeframes_available || []) {
+      const source = tf.data_source || 'historical';
+      const id = `${instrument.instrument_token}|${tf.timeframe}|${tf.date_from}|${tf.date_to}|${source}`;
+      const label = `${symbol} | ${instrument.instrument_token} | ${tf.timeframe} | ${tf.date_from} -> ${tf.date_to} | bars=${tf.total_bars} | ${source}`;
+      options.push({
+        id,
+        label,
+        searchText: `${symbol} ${instrument.instrument_token} ${tf.timeframe} ${tf.date_from} ${tf.date_to} ${source}`,
+        instrument_token: instrument.instrument_token,
+        tradingsymbol: symbol,
+        timeframe: tf.timeframe,
+        date_from: tf.date_from,
+        date_to: tf.date_to,
+        total_bars: tf.total_bars,
+        data_source: source,
+      });
+    }
+  }
+  return options.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function buildResultOptions(results: BacktestResult[]): ResultOption[] {
+  return results.map((result) => {
+    const ds = result.data_selection;
+    const symbol = ds?.tradingsymbol || result.symbol || `TOKEN ${ds?.instrument_token ?? '-'}`;
+    const tf = ds?.timeframe || '-';
+    const label = `${result.strategy_name} | ${result.task_id} | ${symbol} | ${tf} | ${result.status}`;
+    return {
+      id: result.task_id,
+      task_id: result.task_id,
+      label,
+      searchText: `${result.strategy_name} ${result.task_id} ${symbol} ${tf} ${result.status} ${ds?.instrument_token ?? ''}`,
+    };
+  });
+}
+
+function resultMismatchWarning(price: PriceOption | null, result: BacktestResult | null): string | null {
+  if (!price || !result || !result.data_selection) return null;
+  const ds = result.data_selection;
+  if (ds.instrument_token !== price.instrument_token) return 'Result instrument token does not match selected asset.';
+  if (ds.timeframe !== price.timeframe) return 'Result timeframe does not match selected timeframe.';
+  return null;
+}
+
+function defaultParamsFor(meta: IndicatorMetadata): Record<string, number | string | boolean> {
+  const out: Record<string, number | string | boolean> = {};
+  for (const p of meta.params || []) {
+    if (p.default != null) out[p.name] = p.default as number | string | boolean;
+  }
+  return out;
+}
+
+function paramsText(params: Record<string, number | string | boolean>): string {
+  const entries = Object.entries(params);
+  if (!entries.length) return 'default';
+  return entries.map(([k, v]) => `${k}:${String(v)}`).join(', ');
+}
+
+function findPriceOptionByTokenAndTimeframe(
+  options: PriceOption[],
+  instrumentToken: number,
+  timeframe: string,
+): PriceOption | null {
+  const matches = options.filter(
+    (opt) => opt.instrument_token === instrumentToken && opt.timeframe === timeframe,
+  );
+  if (!matches.length) return null;
+  return matches.sort((a, b) => b.date_to.localeCompare(a.date_to))[0];
+}
+
+interface DashboardModuleProps {
+  module: DashboardModuleState;
+  onUpdate: (id: number, patch: Partial<DashboardModuleState>) => void;
+  priceOptions: PriceOption[];
+  resultOptions: ResultOption[];
+  results: BacktestResult[];
+  indicatorMeta: IndicatorMetadata[];
+  backtestMode: boolean;
+  liveMode: boolean;
+}
+
+function IndicatorDropdown({
+  indicatorMeta,
+  selectedIndicators,
+  onToggle,
+}: {
+  indicatorMeta: IndicatorMetadata[];
+  selectedIndicators: IndicatorSelection[];
+  onToggle: (meta: IndicatorMetadata, checked: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const selectedNames = new Set(selectedIndicators.map((x) => x.name));
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (evt: MouseEvent) => {
+      if (!rootRef.current) return;
+      const target = evt.target as Node;
+      if (!rootRef.current.contains(target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return indicatorMeta;
+    return indicatorMeta.filter((meta) => {
+      const hay = `${meta.name} ${meta.label} ${meta.category}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [indicatorMeta, query]);
+
+  return (
+    <div className="trd-indicator-search-root" ref={rootRef}>
+      <div className="trd-indicator-search-shell">
+        <input
+          className="trd-indicator-search-input"
+          placeholder="Search indicators..."
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onClick={() => setOpen(true)}
+        />
+        <button
+          type="button"
+          className="trd-indicator-search-clear"
+          onClick={() => {
+            setQuery('');
+            setOpen(true);
+          }}
+        >
+          Clear
+        </button>
+      </div>
+      {open ? (
+        <div className="trd-dropdown-panel">
+          <div className="trd-indicator-list-head">
+            <span>{selectedIndicators.length} selected</span>
+            <button
+              type="button"
+              className="trd-indicator-search-clear small"
+              onClick={() => setQuery('')}
+            >
+              Clear
+            </button>
+          </div>
+          <div style={{ marginTop: 8, maxHeight: 250, overflowY: 'auto', display: 'grid', gap: 6 }}>
+            {filtered.length ? filtered.map((meta) => {
+              const checked = selectedNames.has(meta.name);
+              return (
+                <label
+                  key={meta.name}
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'center',
+                    fontSize: '0.82rem',
+                    color: '#334155',
+                    border: '1px solid #edf1f6',
+                    borderRadius: 10,
+                    padding: '8px 10px',
+                    background: checked ? '#eef2ff' : '#fff',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) => onToggle(meta, e.target.checked)}
+                  />
+                  <span>{meta.label}</span>
+                  <span style={{ marginLeft: 'auto', color: '#94a3b8', fontSize: '0.74rem' }}>
+                    {meta.category}
+                  </span>
+                </label>
+              );
+            }) : (
+              <div style={{ fontSize: '0.8rem', color: '#64748b', padding: '8px 4px' }}>
+                No indicators found
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DashboardModule({
+  module,
+  onUpdate,
+  priceOptions,
+  resultOptions,
+  results,
+  indicatorMeta,
+  backtestMode,
+  liveMode,
+}: DashboardModuleProps) {
+  const [bars, setBars] = useState<OHLCVBar[]>([]);
+  const [loadingBars, setLoadingBars] = useState(false);
+  const [barError, setBarError] = useState<string | null>(null);
+  const [indicatorSeries, setIndicatorSeries] = useState<IndicatorSeries[]>([]);
+  const [indicatorWarning, setIndicatorWarning] = useState<string | null>(null);
+  const [loadingIndicators, setLoadingIndicators] = useState(false);
+  const [activeParamEditId, setActiveParamEditId] = useState<string | null>(null);
+  const [tradeTypeFilter, setTradeTypeFilter] = useState<'ALL' | 'BUY' | 'SELL'>('ALL');
+  const [tradeAssetFilter, setTradeAssetFilter] = useState('');
+  const [crosshairTime, setCrosshairTime] = useState<number | null>(null);
+  const tradeLogRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedPrice = useMemo(
+    () => priceOptions.find((p) => p.id === module.priceId) ?? null,
+    [priceOptions, module.priceId],
+  );
+  const selectedResult = useMemo(
+    () => results.find((r) => r.task_id === module.tradeTaskId) ?? null,
+    [results, module.tradeTaskId],
+  );
+  const selectedTrades: Trade[] = selectedResult?.trades || [];
+
+  const indicatorMetaMap = useMemo(() => {
+    const map = new Map<string, IndicatorMetadata>();
+    for (const meta of indicatorMeta) map.set(meta.name, meta);
+    return map;
+  }, [indicatorMeta]);
+
+  useEffect(() => {
+    let active = true;
+    const fetchBars = async () => {
+      if (!selectedPrice) {
+        setBars([]);
+        return;
+      }
+      setLoadingBars(true);
+      try {
+        const response = await getHistoricalBars(
+          selectedPrice.instrument_token,
+          selectedPrice.timeframe,
+          selectedPrice.date_from,
+          selectedPrice.date_to,
+        );
+        if (!active) return;
+        setBars(parseBars((response as { bars?: unknown }).bars));
+        setBarError(null);
+      } catch (e: unknown) {
+        if (!active) return;
+        setBarError(e instanceof Error ? e.message : 'Failed to load candles');
+      } finally {
+        if (active) setLoadingBars(false);
+      }
+    };
+    fetchBars();
+    return () => {
+      active = false;
+    };
+  }, [selectedPrice, module.syncNonce]);
+
+  useEffect(() => {
+    let active = true;
+    const runIndicators = async () => {
+      if (!selectedPrice || !module.selectedIndicators.length) {
+        setIndicatorSeries([]);
+        setIndicatorWarning(null);
+        setLoadingIndicators(false);
+        return;
+      }
+      setLoadingIndicators(true);
+      try {
+        const response = await computeIndicators({
+          instrument_token: selectedPrice.instrument_token,
+          timeframe: selectedPrice.timeframe,
+          date_from: selectedPrice.date_from,
+          date_to: selectedPrice.date_to,
+          indicators: module.selectedIndicators.map((ind) => ({ name: ind.name, params: ind.params })),
+        });
+        if (!active) return;
+        const raw = ((response as { series?: unknown[] }).series || []) as IndicatorSeries[];
+        const cleaned = raw.map((s) => ({
+          ...s,
+          points: (s.points || [])
+            .filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value))
+            .sort((a, b) => a.time - b.time),
+        }));
+        setIndicatorSeries(cleaned);
+        const warnings = (response as { warnings?: string[] }).warnings || [];
+        setIndicatorWarning(warnings.length ? warnings.join(' | ') : null);
+      } catch (e: unknown) {
+        if (!active) return;
+        setIndicatorSeries([]);
+        setIndicatorWarning(e instanceof Error ? e.message : 'Indicator compute failed');
+      } finally {
+        if (active) setLoadingIndicators(false);
+      }
+    };
+    runIndicators();
+    return () => {
+      active = false;
+    };
+  }, [selectedPrice, module.selectedIndicators, module.syncNonce]);
+
+  const visibleBars = useMemo(
+    () => (bars.length <= MAX_VISIBLE_CANDLES ? bars : bars.slice(-MAX_VISIBLE_CANDLES)),
+    [bars],
+  );
+  const candleTimes = useMemo(() => visibleBars.map((b) => b.time), [visibleBars]);
+  const mismatchWarning = useMemo(
+    () => resultMismatchWarning(selectedPrice, selectedResult),
+    [selectedPrice, selectedResult],
+  );
+
+  const overlays = useMemo(
+    () =>
+      indicatorSeries
+        .filter((s) => s.pane !== 'oscillator')
+        .map((s) => ({
+          key: s.id,
+          label: s.label,
+          color: s.color,
+          data: s.points.map((p) => ({ time: p.time, value: p.value })),
+        })),
+    [indicatorSeries],
+  );
+
+  const oscillatorPanels = useMemo(() => {
+    const grouped = new Map<string, Array<{ id: string; label: string; color: string; data: LinePoint[] }>>();
+    for (const s of indicatorSeries) {
+      if (s.pane !== 'oscillator') continue;
+      const arr = grouped.get(s.name) || [];
+      arr.push({
+        id: s.id,
+        label: s.label,
+        color: s.color,
+        data: s.points.map((p) => ({ time: p.time, value: p.value })),
+      });
+      grouped.set(s.name, arr);
+    }
+    return Array.from(grouped.entries()).map(([name, series]) => ({ name, series }));
+  }, [indicatorSeries]);
+
+  const markerResult = useMemo(() => {
+    if (!module.plotSignals || !visibleBars.length || !selectedTrades.length) {
+      return {
+        markers: [] as Array<{
+          time: number;
+          position: 'aboveBar' | 'belowBar' | 'inBar';
+          color: string;
+          shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square';
+          text: string;
+        }>,
+        diagnostics: {
+          totalTrades: selectedTrades.length,
+          markersPlotted: 0,
+          outsideVisibleRange: 0,
+          unmatchedTimestamps: 0,
+        } as MarkerDiagnostics,
+      };
+    }
+
+    const minTime = candleTimes[0];
+    const maxTime = candleTimes[candleTimes.length - 1];
+    let outside = 0;
+    let unmatched = 0;
+    const markers: Array<{
+      time: number;
+      position: 'aboveBar' | 'belowBar' | 'inBar';
+      color: string;
+      shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square';
+      text: string;
+    }> = [];
+
+    for (const trade of selectedTrades) {
+      const kind = directionKind(trade.direction);
+      const entryUnix = normalizeTradeTimestampToUnix(trade.entry_date);
+      const exitUnix = normalizeTradeTimestampToUnix(trade.exit_date);
+      const entry = entryUnix != null ? nearestCandleTime(entryUnix, candleTimes) : null;
+      const exit = exitUnix != null ? nearestCandleTime(exitUnix, candleTimes) : null;
+      if (entryUnix == null) unmatched += 1;
+      if (trade.exit_date && exitUnix == null) unmatched += 1;
+
+      const entryInRange = entry != null && entry >= minTime && entry <= maxTime;
+      const exitInRange = exit != null && exit >= minTime && exit <= maxTime;
+      if (!entryInRange && !exitInRange) outside += 1;
+
+      if (entryInRange) {
+        const isLong = kind === 'long';
+        markers.push({
+          time: entry as number,
+          position: isLong ? 'belowBar' : kind === 'short' ? 'aboveBar' : 'inBar',
+          color: isLong ? '#10B981' : kind === 'short' ? '#EF4444' : '#64748B',
+          shape: isLong ? 'arrowUp' : kind === 'short' ? 'arrowDown' : 'circle',
+          text: isLong ? 'BUY' : kind === 'short' ? 'SELL' : trade.direction || 'ENTRY',
+        });
+      }
+      if (trade.exit_date && exitInRange) {
+        const isLong = kind === 'long';
+        markers.push({
+          time: exit as number,
+          position: isLong ? 'aboveBar' : kind === 'short' ? 'belowBar' : 'inBar',
+          color: isLong ? '#F97316' : kind === 'short' ? '#22C55E' : '#F59E0B',
+          shape: isLong ? 'arrowDown' : kind === 'short' ? 'arrowUp' : 'square',
+          text: 'EXIT',
+        });
+      }
+    }
+
+    markers.sort((a, b) => a.time - b.time);
+    const deduped = markers.filter((m, i) => {
+      if (i === 0) return true;
+      const p = markers[i - 1];
+      return !(p.time === m.time && p.text === m.text && p.position === m.position);
+    });
+
+    return {
+      markers: deduped,
+      diagnostics: {
+        totalTrades: selectedTrades.length,
+        markersPlotted: deduped.length,
+        outsideVisibleRange: outside,
+        unmatchedTimestamps: unmatched,
+      } as MarkerDiagnostics,
+    };
+  }, [module.plotSignals, visibleBars, selectedTrades, candleTimes]);
+
+  const tradeLogRows = useMemo(() => {
+    const rows: Array<{
+      id: number;
+      type: 'BUY' | 'SELL';
+      asset: string;
+      qty: number | null;
+      price: number | null;
+      time: string;
+      isLatest: boolean;
+    }> = [];
+    let id = 1;
+    for (const trade of selectedTrades) {
+      const type = directionKind(trade.direction) === 'short' ? 'SELL' : 'BUY';
+      const asset = selectedPrice?.tradingsymbol || selectedResult?.symbol || '-';
+      if (tradeTypeFilter !== 'ALL' && type !== tradeTypeFilter) continue;
+      if (tradeAssetFilter.trim() && !asset.toLowerCase().includes(tradeAssetFilter.trim().toLowerCase())) continue;
+      rows.push({
+        id: id++,
+        type,
+        asset,
+        qty: Number.isFinite(trade.size) ? trade.size : null,
+        price: Number.isFinite(trade.entry_price) ? trade.entry_price : null,
+        time: trade.entry_date || '-',
+        isLatest: false,
+      });
+    }
+    const reversed = rows.slice().reverse();
+    return reversed.map((row, idx) => ({ ...row, isLatest: idx < 3 }));
+  }, [selectedTrades, selectedPrice, selectedResult, tradeTypeFilter, tradeAssetFilter]);
+
+  const toggleIndicator = (meta: IndicatorMetadata, checked: boolean) => {
+    if (checked) {
+      const next: IndicatorSelection = {
+        id: `${meta.name}-${Date.now()}`,
+        name: meta.name,
+        label: meta.label,
+        pane: meta.pane,
+        params: defaultParamsFor(meta),
+      };
+      onUpdate(module.id, { selectedIndicators: [...module.selectedIndicators, next] });
+      return;
+    }
+    onUpdate(module.id, {
+      selectedIndicators: module.selectedIndicators.filter((ind) => ind.name !== meta.name),
+    });
+  };
+
+  const timeframeOptions = useMemo(() => {
+    if (!selectedPrice) return [];
+    const timeframes = priceOptions
+      .filter((opt) => opt.instrument_token === selectedPrice.instrument_token)
+      .map((opt) => opt.timeframe);
+    return Array.from(new Set(timeframes));
+  }, [selectedPrice, priceOptions]);
+
+  const indicatorSummary = useMemo(() => {
+    if (!module.selectedIndicators.length) return 'No indicators';
+    return module.selectedIndicators.map((i) => i.label).slice(0, 3).join(', ');
+  }, [module.selectedIndicators]);
+
+  useEffect(() => {
+    if (!tradeLogRef.current) return;
+    tradeLogRef.current.scrollTop = 0;
+  }, [tradeLogRows]);
+
+  return (
+    <section className="trd-module">
+      <div className="trd-toolbar">
+        <div className="trd-tool trd-tool-asset">
+          <div className="trd-tool-label">Asset</div>
+          <SearchableDropdown
+            label=""
+            value={module.priceId}
+            options={priceOptions}
+            onChange={(next) => onUpdate(module.id, { priceId: next })}
+            placeholder="Asset"
+          />
+        </div>
+
+        <div className="trd-tool trd-tool-timeframes">
+          {timeframeOptions.length ? (
+            timeframeOptions.slice(0, 6).map((tf) => (
+              <button
+                key={`${module.id}-tf-${tf}`}
+                type="button"
+                className={`trd-tf-btn ${selectedPrice?.timeframe === tf ? 'active' : ''}`}
+                onClick={() => {
+                  if (!selectedPrice) return;
+                  const next = findPriceOptionByTokenAndTimeframe(priceOptions, selectedPrice.instrument_token, tf);
+                  if (next) onUpdate(module.id, { priceId: next.id });
+                }}
+              >
+                {tf}
+              </button>
+            ))
+          ) : (
+            <span className="trd-muted">Timeframe</span>
+          )}
+        </div>
+
+        <div className="trd-tool trd-tool-date">
+          <div className="trd-readonly-control">
+            {selectedPrice ? `${selectedPrice.date_from} to ${selectedPrice.date_to}` : 'Date Range'}
+          </div>
+        </div>
+
+        <div className="trd-tool trd-tool-indicators">
+          <IndicatorDropdown
+            indicatorMeta={indicatorMeta}
+            selectedIndicators={module.selectedIndicators}
+            onToggle={toggleIndicator}
+          />
+        </div>
+
+        <div className="trd-tool trd-tool-compare">
+          <div className="trd-tool-label">Compare Result</div>
+          <SearchableDropdown
+            label=""
+            value={module.tradeTaskId}
+            options={resultOptions}
+            onChange={(next) => onUpdate(module.id, { tradeTaskId: next })}
+            placeholder="Compare"
+          />
+        </div>
+      </div>
+
+      <div className="trd-chip-wrap">
+        {module.selectedIndicators.map((ind) => (
+          <div key={ind.id} className="trd-chip">
+            <span>{ind.label}</span>
+            <button
+              type="button"
+              onClick={() => setActiveParamEditId((prev) => (prev === ind.id ? null : ind.id))}
+              className="trd-chip-btn"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                onUpdate(module.id, {
+                  selectedIndicators: module.selectedIndicators.filter((x) => x.id !== ind.id),
+                })
+              }
+              className="trd-chip-btn"
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {activeParamEditId ? (
+        <div className="trd-param-panel">
+          {module.selectedIndicators.filter((x) => x.id === activeParamEditId).map((selected) => {
+            const meta = indicatorMetaMap.get(selected.name);
+            if (!meta) return null;
+            return (
+              <div key={`${selected.id}-edit`}>
+                <div className="trd-param-summary">{paramsText(selected.params)}</div>
+                <div className="trd-param-grid">
+                  {(meta.params || []).slice(0, 4).map((param) => (
+                    <label key={`${selected.id}-${param.name}`} style={{ display: 'grid', gap: 4 }}>
+                      <span className="trd-label">{param.name}</span>
+                      <input
+                        className="input"
+                        type={param.type === 'number' ? 'number' : 'text'}
+                        min={param.min}
+                        max={param.max}
+                        value={String(selected.params[param.name] ?? param.default ?? '')}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          const val = param.type === 'number' ? Number(raw) : raw;
+                          onUpdate(module.id, {
+                            selectedIndicators: module.selectedIndicators.map((x) =>
+                              x.id === selected.id ? { ...x, params: { ...x.params, [param.name]: val } } : x,
+                            ),
+                          });
+                        }}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+
+      {mismatchWarning ? <div className="trd-warning">{mismatchWarning}</div> : null}
+      {barError ? (
+        <div className="trd-error">
+          {barError} | Try switching timeframe or refresh catalog data.
+        </div>
+      ) : null}
+
+      <div className="trd-context-strip">
+        <span className="trd-context-item"><strong>Asset:</strong> {selectedPrice?.tradingsymbol || 'Not selected'}</span>
+        <span className="trd-context-item"><strong>Timeframe:</strong> {selectedPrice?.timeframe || '-'}</span>
+        <span className="trd-context-item"><strong>Indicators:</strong> {indicatorSummary}</span>
+        <span className="trd-context-item"><strong>Mode:</strong> {backtestMode ? 'Backtest' : 'Review'} / {liveMode ? 'Live' : 'Paused'}</span>
+        {(loadingBars || loadingIndicators) ? <span className="trd-context-live">Updating...</span> : null}
+      </div>
+
+      <div className="trd-main-grid">
+        <div className="trd-chart-pane">
+          <div className="trd-chart-header">
+            <div>
+              <div className="trd-chart-symbol">{selectedPrice?.tradingsymbol || 'Asset'}</div>
+              <div className="trd-muted">
+                {selectedPrice?.timeframe || '-'} | {indicatorSummary}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <label className="trd-toggle">
+                <input
+                  type="checkbox"
+                  checked={module.plotSignals}
+                  onChange={(e) => onUpdate(module.id, { plotSignals: e.target.checked })}
+                />
+                Plot Buy/Sell
+              </label>
+              <button className="btn btn-ghost btn-sm" onClick={() => onUpdate(module.id, { syncNonce: module.syncNonce + 1 })}>
+                {loadingBars || loadingIndicators ? 'Syncing...' : 'Sync'}
+              </button>
+            </div>
+          </div>
+
+          <div className="trd-diag">
+            markers {markerResult.diagnostics.markersPlotted} | trades {markerResult.diagnostics.totalTrades} | outside {markerResult.diagnostics.outsideVisibleRange} | unmatched {markerResult.diagnostics.unmatchedTimestamps}
+            {crosshairTime ? ` | cursor ${new Date(crosshairTime * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}` : ''}
+          </div>
+
+          {indicatorWarning ? <div className="trd-warning">{indicatorWarning}</div> : null}
+          {loadingBars ? (
+            <div className="trd-skeleton-wrap">
+              <div className="trd-skeleton trd-skeleton-chart" />
+              <div className="trd-skeleton trd-skeleton-line" />
+            </div>
+          ) : visibleBars.length ? (
+            <>
+              <LightweightCandlestickChart
+                bars={visibleBars}
+                symbol={selectedPrice?.tradingsymbol || 'Instrument'}
+                overlays={overlays}
+                markers={markerResult.markers}
+                onCrosshairTime={setCrosshairTime}
+              />
+              {oscillatorPanels.map((panel) => (
+                <div key={`${module.id}-osc-${panel.name}`} style={{ marginTop: 10 }}>
+                  <LightweightLineChart title={panel.name.toUpperCase()} series={panel.series} height={145} />
+                </div>
+              ))}
+            </>
+          ) : (
+            <div className="trd-muted">Select pricing data to render chart.</div>
+          )}
+        </div>
+
+        <aside className="trd-trade-pane">
+          <div className="trd-trade-header">
+            <div className="trd-trade-title">Trade Log</div>
+            <div className="trd-trade-filters">
+              <select
+                className="trd-mini-filter"
+                value={tradeTypeFilter}
+                onChange={(e) => setTradeTypeFilter(e.target.value as 'ALL' | 'BUY' | 'SELL')}
+              >
+                <option value="ALL">All</option>
+                <option value="BUY">Buy</option>
+                <option value="SELL">Sell</option>
+              </select>
+              <input
+                className="trd-mini-filter"
+                value={tradeAssetFilter}
+                onChange={(e) => setTradeAssetFilter(e.target.value)}
+                placeholder="Asset"
+              />
+            </div>
+          </div>
+          <div className="trd-trade-wrap" ref={tradeLogRef}>
+            <table className="trd-trade-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Type</th>
+                  <th>Asset</th>
+                  <th>Qty</th>
+                  <th>Price</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(loadingBars || loadingIndicators) ? (
+                  Array.from({ length: 8 }).map((_, idx) => (
+                    <tr key={`${module.id}-skeleton-${idx}`}>
+                      <td colSpan={6}><div className="trd-skeleton trd-skeleton-row" /></td>
+                    </tr>
+                  ))
+                ) : tradeLogRows.length ? (
+                  tradeLogRows.map((row) => (
+                    <tr key={`${module.id}-log-${row.id}-${row.time}`} className={row.isLatest ? 'trd-row-latest' : ''}>
+                      <td>{row.id}</td>
+                      <td>
+                        <span className={`trd-badge ${row.type === 'BUY' ? 'buy' : 'sell'}`}>{row.type}</span>
+                      </td>
+                      <td>{row.asset}</td>
+                      <td className="trd-mono">{row.qty != null ? row.qty.toFixed(2) : '-'}</td>
+                      <td className="trd-mono">{row.price != null ? row.price.toFixed(2) : '-'}</td>
+                      <td className="trd-mono">{row.time}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={6} style={{ textAlign: 'center', color: '#64748b', padding: 14 }}>
+                      No trades selected
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+export default function Dashboard() {
+  const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
+  const [results, setResults] = useState<BacktestResult[]>([]);
+  const [indicatorMeta, setIndicatorMeta] = useState<IndicatorMetadata[]>([]);
+  const [modules, setModules] = useState<DashboardModuleState[]>([
+    { id: 1, priceId: '', tradeTaskId: '', selectedIndicators: [], plotSignals: false, syncNonce: 0 },
+  ]);
+  const [error, setError] = useState<string | null>(null);
+  const [backtestMode] = useState(true);
+  const [liveMode] = useState(true);
+
+  const refreshDashboardData = async () => {
+    const [catalogResp, resultResp, indicatorResp] = await Promise.all([
+      getCatalog(),
+      getBacktests(),
+      getIndicators(),
+    ]);
+    setCatalog((catalogResp.catalog || []) as CatalogEntry[]);
+    const sorted = ((resultResp.results || []) as BacktestResult[])
+      .slice()
+      .sort((a, b) => {
+        const at = Date.parse(a.started_at || '');
+        const bt = Date.parse(b.started_at || '');
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+      });
+    setResults(sorted);
+    setIndicatorMeta((indicatorResp.indicators || []) as IndicatorMetadata[]);
+  };
+
+  useEffect(() => {
+    let active = true;
+    const run = async () => {
+      try {
+        await refreshDashboardData();
+        if (!active) return;
+        setError(null);
+      } catch (e: unknown) {
+        if (!active) return;
+        setError(e instanceof Error ? e.message : 'Failed to load dashboard');
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const priceOptions = useMemo(() => buildPriceOptions(catalog), [catalog]);
+  const resultOptions = useMemo(() => buildResultOptions(results), [results]);
+
+  useEffect(() => {
+    setModules((prev) =>
+      prev.map((m) => ({
+        ...m,
+        priceId: priceOptions.some((o) => o.id === m.priceId) ? m.priceId : '',
+        tradeTaskId: resultOptions.some((o) => o.id === m.tradeTaskId) ? m.tradeTaskId : '',
+      })),
+    );
+  }, [priceOptions, resultOptions]);
+
+  const updateModule = (id: number, patch: Partial<DashboardModuleState>) => {
+    setModules((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+  };
+
+  const addModule = () => {
+    setModules((prev) => [
+      ...prev,
+      {
+        id: prev.length + 1,
+        priceId: '',
+        tradeTaskId: '',
+        selectedIndicators: [],
+        plotSignals: false,
+        syncNonce: 0,
+      },
+    ]);
+  };
+
+  return (
+    <div className="trd-root animate-in">
+      <style>{`
+        .trd-root { min-height: 100%; background: #FAFAFB; padding: 8px 10px 84px; }
+        .trd-module { margin-bottom: 12px; }
+
+        .trd-toolbar {
+          display: grid;
+          grid-template-columns: minmax(200px, 2.2fr) minmax(160px, 1fr) minmax(180px, 1.2fr) minmax(180px, 1.25fr) minmax(180px, 1.25fr);
+          gap: 8px;
+          border-bottom: 1px solid #F1F5F9;
+          padding: 4px 0 10px;
+          margin-bottom: 8px;
+          align-items: center;
+        }
+        .trd-tool-asset, .trd-tool-timeframes { grid-column: auto; }
+        .trd-tool-indicators { grid-column: auto; }
+        .trd-tool-compare { grid-column: auto; }
+        .trd-tool { position: relative; min-width: 0; }
+        .trd-tool .stat-label { display: none; }
+        .trd-tool-label {
+          font-size: 11px;
+          font-weight: 600;
+          color: #334155;
+          margin-bottom: 4px;
+          line-height: 1;
+        }
+        .trd-tool .input {
+          height: 40px;
+          min-height: 40px;
+          border: 1px solid #E5E7EB;
+          border-radius: 8px;
+          font-size: 13px;
+          background: #FAFAFB;
+          transition: border-color 200ms ease, background-color 200ms ease;
+        }
+        .trd-tool .input:hover { border-color: #d5d9e0; }
+        .trd-tool .input:focus {
+          outline: none;
+          border-color: #c7d2fe;
+          box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.1);
+        }
+        .trd-indicator-search-root { position: relative; }
+        .trd-indicator-search-shell {
+          height: 38px;
+          border: 1px solid #E5E7EB;
+          border-radius: 8px;
+          background: #FAFAFB;
+          display: flex;
+          align-items: center;
+          padding: 0 6px 0 10px;
+          gap: 6px;
+        }
+        .trd-indicator-search-shell:focus-within {
+          border-color: #c7d2fe;
+          box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.1);
+        }
+        .trd-indicator-search-input {
+          flex: 1;
+          border: 0;
+          outline: none;
+          background: transparent;
+          color: #0f172a;
+          font-size: 13px;
+        }
+        .trd-indicator-search-input::placeholder { color: #94a3b8; }
+        .trd-indicator-search-clear {
+          border: 1px solid #E5E7EB;
+          background: #FFFFFF;
+          color: #64748b;
+          border-radius: 6px;
+          font-size: 11px;
+          padding: 2px 8px;
+          cursor: pointer;
+          transition: all 200ms ease;
+        }
+        .trd-indicator-search-clear:hover {
+          color: #4F46E5;
+          border-color: #c7d2fe;
+          background: #eef2ff;
+        }
+        .trd-indicator-search-clear.small {
+          font-size: 10px;
+          padding: 1px 6px;
+        }
+        .trd-indicator-list-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          border-bottom: 1px solid #F1F5F9;
+          padding-bottom: 6px;
+          font-size: 12px;
+          color: #64748b;
+        }
+
+        .trd-pill-input {
+          width: 100%;
+          height: 38px;
+          border-radius: 8px;
+          border: 1px solid #E5E7EB;
+          background: #FAFAFB;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 0 12px;
+          font-size: 13px;
+          transition: border-color 200ms ease;
+        }
+        .trd-pill-input:hover { border-color: #d5d9e0; }
+        .trd-dropdown-panel {
+          position: absolute;
+          left: 0;
+          right: 0;
+          top: 44px;
+          border: 1px solid #e5e7eb;
+          border-radius: 10px;
+          background: #FAFAFB;
+          padding: 8px;
+          z-index: 24;
+          animation: trd-dropdown-in 180ms ease;
+        }
+        @keyframes trd-dropdown-in {
+          from { opacity: 0; transform: translateY(-3px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .trd-timeframe-row {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          padding: 2px;
+        }
+        .trd-tf-btn {
+          border: 1px solid #E5E7EB;
+          border-radius: 8px;
+          background: #FFFFFF;
+          color: #64748b;
+          font-size: 12px;
+          padding: 3px 8px;
+          cursor: pointer;
+          transition: all 200ms ease;
+        }
+        .trd-tf-btn.active {
+          color: #4f46e5;
+          border-color: #c7d2fe;
+          background: #eef2ff;
+          font-weight: 600;
+        }
+        .trd-readonly-control {
+          height: 38px;
+          border: 1px solid #E5E7EB;
+          border-radius: 8px;
+          background: #FAFAFB;
+          display: flex;
+          align-items: center;
+          padding: 0 12px;
+          font-size: 13px;
+          color: #334155;
+        }
+        .trd-context-strip {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+          align-items: center;
+          border-top: 1px solid #F1F5F9;
+          border-bottom: 1px solid #F1F5F9;
+          padding: 8px 2px;
+          margin: 0 0 10px 0;
+        }
+        .trd-context-item {
+          font-size: 12px;
+          color: #475569;
+          white-space: nowrap;
+        }
+        .trd-context-item strong {
+          color: #0f172a;
+          font-weight: 600;
+        }
+        .trd-context-live {
+          margin-left: auto;
+          font-size: 12px;
+          color: #4F46E5;
+          font-weight: 600;
+        }
+        .trd-chip-wrap {
+          margin-top: 8px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .trd-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          border: 1px solid #F1F5F9;
+          background: transparent;
+          border-radius: 999px;
+          padding: 4px 8px;
+          color: #4F46E5;
+          font-size: 12px;
+        }
+        .trd-chip-btn {
+          border: 0;
+          background: transparent;
+          color: #4338ca;
+          font-size: 11px;
+          cursor: pointer;
+          padding: 0;
+        }
+        .trd-param-panel {
+          margin-top: 8px;
+          border: 1px solid #F1F5F9;
+          border-radius: 8px;
+          background: transparent;
+          padding: 10px;
+        }
+        .trd-param-summary { font-size: 0.74rem; color: #64748b; margin-bottom: 6px; }
+        .trd-param-grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .trd-label { font-size: 0.74rem; color: #6b7280; }
+        .trd-warning {
+          font-size: 0.78rem;
+          color: #b45309;
+          margin: 2px 0 8px;
+        }
+        .trd-error {
+          font-size: 0.78rem;
+          color: #dc2626;
+          margin: 2px 0 10px;
+        }
+        .trd-muted { color: #64748b; font-size: 0.84rem; }
+
+        .trd-main-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 74fr) minmax(280px, 26fr);
+          gap: 16px;
+        }
+        .trd-chart-pane {
+          border: 1px solid #F1F5F9;
+          border-radius: 9px;
+          background: transparent;
+          padding: 8px 10px;
+        }
+        .trd-chart-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 6px;
+        }
+        .trd-chart-symbol {
+          font-size: 16px;
+          color: #0f172a;
+          font-weight: 600;
+        }
+        .trd-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          color: #334155;
+          font-size: 13px;
+        }
+        .trd-diag {
+          font-size: 12px;
+          color: #64748b;
+          border-bottom: 1px solid #f1f5f9;
+          padding-bottom: 4px;
+          margin-bottom: 5px;
+        }
+
+        .trd-trade-pane {
+          border: 1px solid #F1F5F9;
+          border-radius: 9px;
+          background: transparent;
+          padding: 8px 10px;
+          min-height: 590px;
+        }
+        .trd-trade-title {
+          font-size: 16px;
+          color: #111827;
+          font-weight: 600;
+          margin-bottom: 6px;
+        }
+        .trd-trade-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          margin-bottom: 6px;
+        }
+        .trd-trade-filters {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .trd-mini-filter {
+          height: 28px;
+          border: 1px solid #E5E7EB;
+          border-radius: 6px;
+          background: #FAFAFB;
+          color: #334155;
+          font-size: 12px;
+          padding: 0 8px;
+          min-width: 72px;
+        }
+        .trd-trade-wrap { max-height: 560px; overflow-y: auto; }
+        .trd-trade-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 12.5px;
+        }
+        .trd-trade-table th {
+          position: sticky;
+          top: 0;
+          z-index: 1;
+          background: #FAFAFB;
+          text-align: left;
+          padding: 7px 6px;
+          border-bottom: 1px solid #e5e7eb;
+          color: #64748b;
+          font-size: 11px;
+          text-transform: uppercase;
+        }
+        .trd-trade-table td {
+          padding: 6px 6px;
+          border-bottom: 1px solid #f1f5f9;
+          color: #334155;
+        }
+        .trd-trade-table tr:hover td { background: #f8fafc; }
+        .trd-row-latest td {
+          background: #f8fafc;
+          animation: trd-new-row 350ms ease;
+        }
+        @keyframes trd-new-row {
+          from { background: #eef2ff; }
+          to { background: #f8fafc; }
+        }
+        .trd-badge {
+          display: inline-flex;
+          align-items: center;
+          border-radius: 999px;
+          padding: 2px 8px;
+          font-size: 11px;
+          font-weight: 600;
+        }
+        .trd-badge.buy { color: #10b981; background: #dcfce7; }
+        .trd-badge.sell { color: #ef4444; background: #fee2e2; }
+        .trd-mono { font-family: var(--font-mono); }
+
+        .trd-skeleton-wrap { display: grid; gap: 8px; }
+        .trd-skeleton {
+          position: relative;
+          overflow: hidden;
+          background: #eef2f7;
+          border-radius: 6px;
+        }
+        .trd-skeleton::after {
+          content: '';
+          position: absolute;
+          inset: 0;
+          transform: translateX(-100%);
+          background: linear-gradient(90deg, transparent, rgba(255,255,255,0.7), transparent);
+          animation: trd-shimmer 1.25s infinite;
+        }
+        .trd-skeleton-chart { height: 380px; }
+        .trd-skeleton-line { height: 80px; }
+        .trd-skeleton-row { height: 18px; margin: 4px 0; }
+        @keyframes trd-shimmer {
+          100% { transform: translateX(100%); }
+        }
+
+        @media (max-width: 1280px) {
+          .trd-toolbar { grid-template-columns: 1fr; }
+          .trd-main-grid { grid-template-columns: 1fr; }
+          .trd-trade-pane { min-height: 300px; }
+          .trd-param-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+      `}</style>
+
+      {error ? (
+        <div style={{ border: '1px solid #fecaca', borderRadius: 10, padding: 10, color: '#dc2626', marginBottom: 12 }}>
+          {error}
+        </div>
+      ) : null}
+
+      {!priceOptions.length ? (
+        <div style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 10, color: '#64748b', marginBottom: 12 }}>
+          No catalog data found. Fetch historical data from Backtest first.
+        </div>
+      ) : null}
+
+      {modules.map((module) => (
+        <DashboardModule
+          key={module.id}
+          module={module}
+          onUpdate={updateModule}
+          priceOptions={priceOptions}
+          resultOptions={resultOptions}
+          results={results}
+          indicatorMeta={indicatorMeta}
+          backtestMode={backtestMode}
+          liveMode={liveMode}
+        />
+      ))}
+
+      <div style={{ display: 'flex', justifyContent: 'center', marginTop: 8 }}>
+        <button className="btn btn-primary" onClick={addModule}>
+          Add Another Comparator
+        </button>
+      </div>
+
+    </div>
+  );
+}

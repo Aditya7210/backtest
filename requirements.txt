@@ -1,42 +1,51 @@
-#For Back Testing
-backtrader
-#For Charting
-matplotlib
-#Essential for data manipulation, calculations, and preprocessing.
-pandas
-numpy
-#For Fast, Developer-Friendly Logging
-loguru
-#Zerodha kite connect for live algo trading
-kiteconnect
-#For making HTTP requests
-requests
-#For fetching data from NSE
-jugaad-data
-#For interactive charts
-plotly
-#For technical analysis
-ta-lib
-#For building web applications
-streamlit
-#For fetching data from Yahoo Finance
-yfinance
-#For fast, developer-friendly linting
-ruff
-#For fast, developer-friendly formatting
-black
-
 # ==========================================
-# PHASE 2: UI UPGRADE COMPONENTS
+# CORE DEPENDENCIES — ALL PINNED (E-29)
 # ==========================================
-streamlit-elements
-streamlit-option-menu
-streamlit-extras
-streamlit-shadcn-ui
-streamlit-toggle-switch
-streamlit-ace
 
-#Watchdog to check updates in files
-watchdog
-#Lib to run .env file
-python-dotenv
+# Web framework
+fastapi[standard]==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+pydantic-settings==2.2.1
+
+# MongoDB
+motor==3.4.0
+pymongo==4.7.2
+
+# Data processing
+pandas==3.0.2
+numpy==2.2.6
+
+# Backtesting engine
+backtrader==1.9.78.123
+
+# Technical indicators (replaces TA-Lib — pure Python, no C deps)
+pandas-ta==0.4.71b0
+numba==0.61.2
+llvmlite==0.44.0
+tqdm==4.67.3
+
+# Cython (for math kernel compilation)
+Cython==3.0.10
+setuptools==80.9.0
+
+# Zerodha API
+kiteconnect==5.0.1
+
+# HTTP requests
+requests==2.31.0
+
+# Environment variable management
+python-dotenv==1.0.1
+
+# Logging
+loguru==0.7.2
+
+# Charting (backend only for backtest plots)
+matplotlib==3.10.9
+
+# WebSocket support (included in fastapi[standard])
+websockets==12.0
+
+# File watching
+watchdog==4.0.0

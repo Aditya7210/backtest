@@ -45,7 +45,7 @@ show_info() {
 is_project_dir() {
   local d="${1:-}"
   [[ -n "$d" ]] || return 1
-  [[ -f "$d/docker-compose.yml" && -f "$d/Dashboard/dashboard.py" ]]
+  [[ -f "$d/docker-compose.yml" && -f "$d/backend/main.py" ]]
 }
 
 try_project_dir() {
@@ -61,7 +61,7 @@ choose_project_folder() {
   local chosen=""
   echo
   echo "Enter the full Algo Trading project folder path."
-  echo "It must contain docker-compose.yml and Dashboard/dashboard.py"
+  echo "It must contain docker-compose.yml and backend/main.py"
   read -r -p "Project folder: " chosen
   [[ -n "$chosen" ]] || return 1
   chosen="${chosen/#\~/$HOME}"
@@ -90,6 +90,16 @@ save_project_dir() {
   [[ -n "$PROJECT_DIR" ]] && printf '%s\n' "$PROJECT_DIR" > "$LAUNCHER_CONFIG"
 }
 
+ensure_env_file() {
+  [[ -n "$PROJECT_DIR" ]] || return 0
+  [[ -f "$PROJECT_DIR/.env" ]] && return 0
+  [[ -f "$PROJECT_DIR/.env.example" ]] || return 0
+  if cp -n "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env" >/dev/null 2>&1; then
+    echo "Created .env from .env.example. Update credentials before running the app."
+    log_msg "Created .env from .env.example."
+  fi
+}
+
 sync_desktop_launcher() {
   local source="$PROJECT_DIR/Launch_Algo_Trading_mac.command"
   local target="$HOME/Desktop/Launch_Algo_Trading_mac.command"
@@ -103,7 +113,7 @@ sync_desktop_launcher() {
 
 ensure_mac_permissions() {
   local target
-  for target in "$PROJECT_DIR/compose-up.sh" "$PROJECT_DIR/entrypoint.sh" "$PROJECT_DIR/Launch_Algo_Trading_mac.command"; do
+  for target in "$PROJECT_DIR/compose-up.sh" "$PROJECT_DIR/Launch_Algo_Trading_mac.command"; do
     [[ -f "$target" ]] || continue
     chmod +x "$target" >/dev/null 2>&1 || true
   done
@@ -174,26 +184,26 @@ start_docker_flow() {
 
   echo
   if [[ "$mode" == "update" ]]; then
-    echo "[4/5] Waiting for Streamlit health..."
+    echo "[4/5] Waiting for Backend API health..."
   else
-    echo "[3/3] Waiting for Streamlit health..."
+    echo "[3/3] Waiting for Backend API health..."
   fi
-  local health_url="http://localhost:8501/_stcore/health"
+  local health_url="http://localhost:8000/api/health"
   for _ in $(seq 1 180); do
     if curl -fsS --max-time 3 "$health_url" >/dev/null 2>&1; then
       if [[ "$mode" == "update" ]]; then
-        echo "[5/5] Streamlit is healthy."
+        echo "[5/5] Backend API is healthy."
       else
-        echo "Streamlit is healthy."
+        echo "Backend API is healthy."
       fi
-      open "http://localhost:8501" >/dev/null 2>&1 || true
-      show_info "App is running at http://localhost:8501"
+      open "http://localhost:3000" >/dev/null 2>&1 || true
+      show_info "App is running at http://localhost:3000"
       return
     fi
     sleep 1
   done
 
-  show_error "Streamlit health check timed out. Run: docker compose logs -f" "Startup Timeout"
+  show_error "Backend API health check timed out. Run: docker compose logs -f" "Startup Timeout"
 }
 
 start_app_flow() {
@@ -307,6 +317,7 @@ menu_loop() {
         log_msg "Menu action selected: CHANGE"
         PROJECT_DIR=""
         if choose_project_folder; then
+          ensure_env_file
           save_project_dir
           sync_desktop_launcher
         else
@@ -326,10 +337,11 @@ if [[ -z "$PROJECT_DIR" ]]; then
   choose_project_folder || true
 fi
 if [[ -z "$PROJECT_DIR" ]]; then
-  show_error $'Could not find a valid project folder.\nRequired files:\n- docker-compose.yml\n- Dashboard/dashboard.py'
+  show_error $'Could not find a valid project folder.\nRequired files:\n- docker-compose.yml\n- backend/main.py'
   exit 1
 fi
 
 log_msg "Using project folder: $PROJECT_DIR"
+ensure_env_file
 sync_desktop_launcher
 menu_loop

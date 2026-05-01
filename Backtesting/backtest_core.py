@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
+import traceback
 import warnings
 
 import backtrader as bt
@@ -528,6 +529,32 @@ def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
             except Exception:
                 return 0.0
 
+        def _describe_data_label(self, data_obj: Any | None) -> str:
+            if data_obj is None:
+                return "default"
+
+            raw_name: Any | None = None
+            try:
+                raw_name = getattr(data_obj, "_name", None)
+            except Exception:
+                raw_name = None
+
+            if isinstance(raw_name, str) and raw_name.strip():
+                return raw_name.strip()
+
+            try:
+                raw_data_name = getattr(data_obj, "_dataname", None)
+            except Exception:
+                raw_data_name = None
+
+            if isinstance(raw_data_name, str) and raw_data_name.strip():
+                return raw_data_name.strip()
+
+            if raw_data_name is not None:
+                return type(raw_data_name).__name__
+
+            return type(data_obj).__name__
+
         def _record_blocked_sell(
             self,
             *,
@@ -548,10 +575,7 @@ def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
             except Exception:
                 pass
 
-            data_label = "default"
-            if data_obj is not None:
-                raw_name = getattr(data_obj, "_name", "") or getattr(data_obj, "_dataname", "")
-                data_label = str(raw_name or "default")
+            data_label = self._describe_data_label(data_obj)
 
             events.append(
                 "[OrderGuard] Blocked sell order "
@@ -581,10 +605,7 @@ def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
             except Exception:
                 pass
 
-            data_label = "default"
-            if data_obj is not None:
-                raw_name = getattr(data_obj, "_name", "") or getattr(data_obj, "_dataname", "")
-                data_label = str(raw_name or "default")
+            data_label = self._describe_data_label(data_obj)
 
             events.append(
                 f"{message} at {timestamp} "
@@ -687,9 +708,18 @@ def _run_cerebro_with_isolation(
             warnings.simplefilter("always")
             results = cerebro.run()
     except Exception as exc:
+        trace = traceback.format_exc()
+        print(trace)
         _log_terminal(
             terminal,
             f"Backtrader sandbox trapped exception: {type(exc).__name__}: {exc}",
+            level="ERROR",
+            task_id=task_id,
+            symbol=symbol,
+        )
+        _log_terminal(
+            terminal,
+            trace,
             level="ERROR",
             task_id=task_id,
             symbol=symbol,

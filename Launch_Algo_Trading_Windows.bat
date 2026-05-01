@@ -19,26 +19,13 @@ REM - Terminal actions: Start App, Update App, Stop App, Change Project, Exit
 REM - Auto-stash compatibility before git pull
 REM ===============================================================
 
-REM ---- Self-elevate to Administrator ----
+REM ---- Launcher runs without forced elevation (distribution-friendly) ----
 net session >nul 2>&1
-if "%errorlevel%"=="0" goto :admin_ready
-
-echo Requesting Administrator privileges...
-call :Log "Requesting Administrator privileges."
-set "ELEVATED_WORKDIR=%~dp0"
-set "ELEVATED_TARGET=%~f0"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $q=[char]34; $arg='/d /k call ' + $q + $env:ELEVATED_TARGET + $q + ' --elevated'; Start-Process -FilePath $env:ComSpec -ArgumentList $arg -WorkingDirectory $env:ELEVATED_WORKDIR -Verb RunAs"
-if "%errorlevel%"=="0" exit /b
-
-echo Failed to request Administrator privileges.
-echo See log: %LAUNCHER_LOG%
-call :Log "Administrator elevation request failed."
-pause
-exit /b 1
-
-:admin_ready
-if /I "%~1"=="--elevated" shift
-call :Log "Running with Administrator privileges."
+if "%errorlevel%"=="0" (
+  call :Log "Running with Administrator privileges."
+) else (
+  call :Log "Running without Administrator privileges."
+)
 
 call :ResolveProjectDir
 if not defined PROJECT_DIR (
@@ -51,6 +38,7 @@ if not defined PROJECT_DIR (
   exit /b 1
 )
 call :Log "Using project folder: %PROJECT_DIR%"
+call :EnsureEnvFile
 
 call :SyncDesktopLauncher
 
@@ -88,6 +76,7 @@ if /I "%ACTION%"=="EXIT" exit /b 0
 if /I "%ACTION%"=="CHANGE" (
   call :ChooseProjectFolder
   if defined PROJECT_DIR (
+    call :EnsureEnvFile
     call :SyncDesktopLauncher
     goto menu_loop
   )
@@ -213,22 +202,22 @@ if not "%errorlevel%"=="0" (
 :compose_started
 
 echo.
-if /I "%FLOW_MODE%"=="UPDATE" echo [4/5] Waiting for Streamlit health...
-if /I not "%FLOW_MODE%"=="UPDATE" echo [3/3] Waiting for Streamlit health...
-set "HEALTH_URL=http://localhost:8501/_stcore/health"
+if /I "%FLOW_MODE%"=="UPDATE" echo [4/5] Waiting for Backend API health...
+if /I not "%FLOW_MODE%"=="UPDATE" echo [3/3] Waiting for Backend API health...
+set "HEALTH_URL=http://localhost:8000/api/health"
 for /l %%I in (1,1,180) do (
   curl.exe -fsS "%HEALTH_URL%" >nul 2>&1
-  if "!errorlevel!"=="0" goto :streamlit_ready
+  if "!errorlevel!"=="0" goto :backend_ready
   timeout /t 1 >nul
 )
-call :ShowError "Streamlit health check timed out. Run: docker compose logs -f" "Startup Timeout"
+call :ShowError "Backend API health check timed out. Run: docker compose logs -f" "Startup Timeout"
 goto menu_loop
 
-:streamlit_ready
-if /I "%FLOW_MODE%"=="UPDATE" echo [5/5] Streamlit is healthy. Opening browser...
-if /I not "%FLOW_MODE%"=="UPDATE" echo Streamlit is healthy. Opening browser...
-start "" "http://localhost:8501"
-call :ShowInfo "App is running at http://localhost:8501" "Launcher"
+:backend_ready
+if /I "%FLOW_MODE%"=="UPDATE" echo [5/5] Backend is healthy. Opening browser...
+if /I not "%FLOW_MODE%"=="UPDATE" echo Backend is healthy. Opening browser...
+start "" "http://localhost:3000"
+call :ShowInfo "App is running at http://localhost:3000" "Launcher"
 goto menu_loop
 
 :stop_app
@@ -270,7 +259,7 @@ goto :eof
 :TryProject
 set "TRY_DIR=%~1"
 if "%TRY_DIR%"=="" goto :eof
-if exist "%TRY_DIR%\docker-compose.yml" if exist "%TRY_DIR%\Dashboard\dashboard.py" (
+if exist "%TRY_DIR%\docker-compose.yml" if exist "%TRY_DIR%\backend\main.py" (
   for %%F in ("%TRY_DIR%") do set "PROJECT_DIR=%%~fF"
 )
 goto :eof
@@ -279,7 +268,7 @@ goto :eof
 set "BROWSE_RESULT="
 echo.
 echo Enter the full Algo Trading project folder path.
-echo It must contain docker-compose.yml and Dashboard\dashboard.py
+echo It must contain docker-compose.yml and backend\main.py
 set /p "BROWSE_RESULT=Project folder: "
 if not "%BROWSE_RESULT%"=="" call :TryProject "%BROWSE_RESULT%"
 goto :eof
@@ -287,6 +276,19 @@ goto :eof
 :SaveProjectDir
 if defined PROJECT_DIR (
   >"%LAUNCHER_CONFIG%" echo %PROJECT_DIR%
+)
+goto :eof
+
+:EnsureEnvFile
+if not defined PROJECT_DIR goto :eof
+if exist "%PROJECT_DIR%\.env" goto :eof
+if not exist "%PROJECT_DIR%\.env.example" goto :eof
+copy /Y "%PROJECT_DIR%\.env.example" "%PROJECT_DIR%\.env" >nul 2>&1
+if "%errorlevel%"=="0" (
+  echo Created .env from .env.example. Update credentials before running the app.
+  call :Log "Created .env from .env.example."
+) else (
+  call :Log "Failed to create .env from .env.example."
 )
 goto :eof
 

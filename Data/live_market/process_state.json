@@ -1,14 +1,4 @@
 {
-  "collector": {
-    "pid": 238,
-    "started_at": "2026-04-30T11:32:20+05:30",
-    "script": "/app/LiveMarket/run_collector.py",
-    "module": "LiveMarket.run_collector"
-  },
-  "calculator": {
-    "pid": 260,
-    "started_at": "2026-04-30T11:32:23+05:30",
-    "script": "/app/LiveMarket/run_calculations.py",
-    "module": "LiveMarket.run_calculations"
-  }
+  "collector": {},
+  "calculator": {}
 }

@@ -1,22 +1,49 @@
-version: "3.9"
+name: algo_trading_system
 
 services:
-  algo_trading:
-    build: .
-    container_name: algo_trading_app
-    working_dir: /app
-    env_file:
-      - .env
-
+  mongodb:
+    image: mongo:7
+    container_name: algo_mongodb
+    restart: unless-stopped
     volumes:
-      # Mount project folder so file changes reflect instantly (no rebuild needed)
-      - .:/app
-      - ~/.skills:/root/.skills
+      - mongo_data:/data/db
+    expose:
+      - "27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: algo_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/algo_trading
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./.env:/app/.env
+      - ./Strategies:/app/Strategies
+      - ./Data:/app/Data
     ports:
-      # Expose Streamlit port
-      - "8501:8501"
+      - "8000:8000"
 
-    # Keep container running so you can exec into it
-    stdin_open: true
-    tty: true
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: algo_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  mongo_data:

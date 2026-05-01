@@ -14,11 +14,11 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$healthUrl = "http://localhost:8501/_stcore/health"
+$healthUrl = "http://localhost:8000/api/health"
 for ($i = 0; $i -lt 45; $i++) {
     try {
         $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2
-        if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+        if ($resp.StatusCode -eq 200) {
             break
         }
     } catch {
@@ -27,4 +27,4 @@ for ($i = 0; $i -lt 45; $i++) {
     Start-Sleep -Seconds 1
 }
 
-Start-Process "http://localhost:8501"
+Start-Process "http://localhost:3000"

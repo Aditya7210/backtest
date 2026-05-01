@@ -1,52 +1,65 @@
-# Environment files
+# Environment files (never commit secrets)
 .env
+.env.*
+!.env.example
 
-# Python
+# Launcher local state
+.algo_trading_launcher_path
+.algo_trading_launcher_path.txt
+
+# Python caches / tooling
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 .ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-Data/
+# Node / frontend dependencies
+node_modules/
+frontend/node_modules/
 
+# Build artifacts
+build/
+dist/
+frontend/dist/
+*.egg-info/
+cython_build/
+*.so
+*.pyd
+*.dylib
+*.dll
 
-# Logs
+# Logs and temp files
 *.log
+*.tmp
+*.temp
 
-# CSV outputs
-*.csv
-
-# Theme folders
-theme/
-themes/
-Theme/
-Themes/
-**/theme/
-**/themes/
-**/Theme/
-**/Themes/
-
-# Project docs (local only)
-CODEBASE.md
-Report.md
-system_map.md
-Zerodha_API_Documentation.md
-Guide/BackTrader/backtrader_guide.md
-
-# Backup
-Backup/
-
-# IDE
+# IDE and OS
 .vscode/
 .idea/
-
-# Docker
-*.env
-
-# OS
 .DS_Store
 Thumbs.db
 
-.agents
-.claude
-.vscode
+# Local AI/dev assistant metadata
+.agents/
+.claude/
+
+# Runtime/generated data (do not distribute)
+Data/live_market/daily/
+Data/live_market/snapshots/
+Data/live_market/collector_status.json
+Data/live_market/process_state.json
+Data/Logs/
+Data/testing_data/Data_files/Zerodha_data/
+Data/instrument_mapper_data/zerodha_instruments_latest.csv
+Data/instrument_mapper_data/zerodha_instruments_archive.csv
+
+# Local docs and reports
+CODEBASE.md
+Report.md
+system_map.md
 Audit.txt
