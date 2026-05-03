@@ -3,7 +3,7 @@ import LightweightCandlestickChart from '../components/LightweightCandlestickCha
 import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
 import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
 import { computeIndicators, getBacktest, getBacktests, getCatalog, getHistoricalBars, getIndicators } from '../services/api';
-import type { BacktestResult, CatalogEntry, Trade } from '../types/backtest';
+import type { BacktestResult, CatalogEntry, OrderEvent, Trade } from '../types/backtest';
 import type { IndicatorMetadata, IndicatorSelection, IndicatorSeries } from '../types/indicators';
 import type { OHLCVBar } from '../types/market';
 
@@ -23,6 +23,8 @@ interface ResultOption extends SearchableOption {
 
 interface MarkerDiagnostics {
   totalTrades: number;
+  rawMarkers: number;
+  collapsedMarkers: number;
   markersPlotted: number;
   outsideVisibleRange: number;
   unmatchedTimestamps: number;
@@ -35,6 +37,8 @@ interface DashboardModuleState {
   selectedIndicators: IndicatorSelection[];
   plotSignals: boolean;
   syncNonce: number;
+  chartRangeMode: 'full_result' | 'last_1400' | 'last_5d' | 'last_20d';
+  tradebookMode: 'closed_trades' | 'order_events';
 }
 
 interface DashboardKpis {
@@ -83,11 +87,13 @@ function pickFirstText(source: Record<string, unknown>, keys: string[]): string 
 
 function normalizeDirection(value: unknown): string {
   const raw = String(value ?? '').trim().toUpperCase();
-  if (raw === 'LONG' || raw === 'BUY') return 'BUY';
-  if (raw === 'SHORT' || raw === 'SELL') return 'SELL';
-  if (raw.includes('SELL')) return 'SELL';
-  if (raw.includes('BUY')) return 'BUY';
-  return raw || 'BUY';
+  if (raw === 'LONG' || raw === 'BUY') return 'LONG';
+  if (raw === 'SHORT' || raw === 'SELL') return 'SHORT';
+  if (raw.includes('SHORT')) return 'SHORT';
+  if (raw.includes('LONG')) return 'LONG';
+  if (raw.includes('SELL')) return 'SHORT';
+  if (raw.includes('BUY')) return 'LONG';
+  return raw || 'LONG';
 }
 
 function normalizeResultTrades(resultLike: unknown): Trade[] {
@@ -114,19 +120,67 @@ function normalizeResultTrades(resultLike: unknown): Trade[] {
     const direction = normalizeDirection(
       pickFirstText(obj, ['direction', 'Direction', 'side', 'type']) || obj.direction || obj.Direction,
     );
+    const entry_action = pickFirstText(obj, ['entry_action', 'Entry Action']) || (direction === 'SHORT' ? 'SELL_SHORT' : 'BUY');
+    const exit_action = pickFirstText(obj, ['exit_action', 'Exit Action']) || (direction === 'SHORT' ? 'BUY_COVER' : 'SELL_EXIT');
     const entry_price = pickFirstNumber(obj, ['entry_price', 'Entry Price', 'entryPrice', 'price', 'buy_price']) ?? 0;
     const exit_price = pickFirstNumber(obj, ['exit_price', 'Exit Price', 'close_price', 'sell_price']) ?? 0;
     const pnl = pickFirstNumber(obj, ['pnl', 'Net P&L', 'net_pnl', 'profit', 'Gross P&L']) ?? 0;
     const size = pickFirstNumber(obj, ['size', 'Qty', 'qty', 'quantity', 'volume']) ?? 0;
     if (!entry_date && !exit_date) continue;
     normalized.push({
+      trade_id: pickFirstText(obj, ['trade_id', 'id']) || undefined,
+      instrument_token: pickFirstNumber(obj, ['instrument_token']) ?? undefined,
+      symbol: pickFirstText(obj, ['symbol', 'Symbol']) || undefined,
       entry_date,
       exit_date,
       direction,
+      entry_action,
+      exit_action,
       entry_price,
       exit_price,
       pnl,
+      net_pnl: pickFirstNumber(obj, ['net_pnl', 'Net P&L', 'pnl']) ?? pnl,
+      gross_pnl: pickFirstNumber(obj, ['gross_pnl', 'Gross P&L']) ?? undefined,
+      commission: pickFirstNumber(obj, ['commission']) ?? undefined,
       size,
+      quantity: pickFirstNumber(obj, ['quantity', 'Qty', 'qty']) ?? undefined,
+      bars_held: pickFirstNumber(obj, ['bars_held']) ?? undefined,
+      status: pickFirstText(obj, ['status']) || undefined,
+      position_before_entry: pickFirstNumber(obj, ['position_before_entry']) ?? undefined,
+      position_after_entry: pickFirstNumber(obj, ['position_after_entry']) ?? undefined,
+      position_before_exit: pickFirstNumber(obj, ['position_before_exit']) ?? undefined,
+      position_after_exit: pickFirstNumber(obj, ['position_after_exit']) ?? undefined,
+    });
+  }
+  return normalized;
+}
+
+function normalizeOrderEvents(resultLike: unknown): OrderEvent[] {
+  const root = asObj(resultLike);
+  const nestedResult = asObj(root.result);
+  const source = [root.order_events, nestedResult.order_events, root.trade_events, nestedResult.trade_events]
+    .find((rows) => Array.isArray(rows));
+  if (!Array.isArray(source)) return [];
+  const normalized: OrderEvent[] = [];
+  for (const row of source) {
+    const obj = asObj(row);
+    const time = pickFirstText(obj, ['time', 'timestamp', 'event_time']);
+    const action = pickFirstText(obj, ['action', 'type']);
+    const status = pickFirstText(obj, ['status']);
+    if (!time && !action) continue;
+    normalized.push({
+      event_id: pickFirstText(obj, ['event_id', 'id']) || undefined,
+      time: time || '-',
+      action: action || 'UNKNOWN',
+      status: status || 'UNKNOWN',
+      requested_size: pickFirstNumber(obj, ['requested_size']) ?? undefined,
+      executed_size: pickFirstNumber(obj, ['executed_size']) ?? undefined,
+      price: pickFirstNumber(obj, ['price']) ?? undefined,
+      reason: pickFirstText(obj, ['reason']) || undefined,
+      position_before: pickFirstNumber(obj, ['position_before']) ?? undefined,
+      position_after: pickFirstNumber(obj, ['position_after']) ?? undefined,
+      cash_before: pickFirstNumber(obj, ['cash_before']) ?? undefined,
+      cash_after: pickFirstNumber(obj, ['cash_after']) ?? undefined,
     });
   }
   return normalized;
@@ -264,7 +318,7 @@ function normalizeTradeTimestampToUnix(input: string | null | undefined): number
   return Math.floor(millis / 1000);
 }
 
-function nearestCandleTime(targetUnix: number, candleTimes: number[]): number | null {
+function nearestCandleTime(targetUnix: number, candleTimes: number[], toleranceSeconds: number): number | null {
   if (!candleTimes.length) return null;
   let best = candleTimes[0];
   let diff = Math.abs(best - targetUnix);
@@ -275,6 +329,7 @@ function nearestCandleTime(targetUnix: number, candleTimes: number[]): number | 
       best = candleTimes[i];
     }
   }
+  if (diff > toleranceSeconds) return null;
   return best;
 }
 
@@ -282,7 +337,49 @@ function directionKind(direction: string): 'long' | 'short' | 'unknown' {
   const d = (direction || '').toUpperCase();
   if (d === 'BUY' || d === 'LONG') return 'long';
   if (d === 'SELL' || d === 'SHORT') return 'short';
+  if (d.includes('LONG')) return 'long';
+  if (d.includes('SHORT') || d.includes('SELL')) return 'short';
   return 'unknown';
+}
+
+function timeframeToleranceSeconds(timeframe: string | undefined): number {
+  const normalized = String(timeframe || '').toLowerCase();
+  if (normalized === '1min' || normalized === 'minute') return 60;
+  if (normalized === '3min' || normalized === '3minute') return 180;
+  if (normalized === '5min' || normalized === '5minute') return 300;
+  if (normalized === '10min' || normalized === '10minute') return 600;
+  if (normalized === '15min' || normalized === '15minute') return 900;
+  if (normalized === '30min' || normalized === '30minute') return 1800;
+  if (normalized === '60min' || normalized === '60minute' || normalized === '1hour') return 3600;
+  if (normalized === '1day' || normalized === 'day') return 86400;
+  return 60;
+}
+
+function isOrderEventPlottable(status: string): boolean {
+  const s = String(status || '').toUpperCase();
+  return s === 'COMPLETED' || s === 'TRADE_CLOSED' || s === 'INFO' || s === 'EXECUTED';
+}
+
+function mapActionToMarker(actionInput: string): {
+  text: 'BUY' | 'EXIT' | 'SHORT' | 'COVER';
+  position: 'aboveBar' | 'belowBar' | 'inBar';
+  color: string;
+  shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square';
+} | null {
+  const action = String(actionInput || '').toUpperCase();
+  if (action.includes('BUY_ENTRY') || action === 'BUY') {
+    return { text: 'BUY', position: 'belowBar', color: '#10B981', shape: 'arrowUp' };
+  }
+  if (action.includes('SELL_EXIT')) {
+    return { text: 'EXIT', position: 'aboveBar', color: '#F97316', shape: 'arrowDown' };
+  }
+  if (action.includes('SELL_SHORT') || action === 'SHORT') {
+    return { text: 'SHORT', position: 'aboveBar', color: '#EF4444', shape: 'arrowDown' };
+  }
+  if (action.includes('BUY_COVER') || action.includes('COVER')) {
+    return { text: 'COVER', position: 'belowBar', color: '#22C55E', shape: 'arrowUp' };
+  }
+  return null;
 }
 
 function buildPriceOptions(catalog: CatalogEntry[]): PriceOption[] {
@@ -325,11 +422,36 @@ function buildResultOptions(results: BacktestResult[]): ResultOption[] {
   });
 }
 
+function ExpandIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M8 3H3V8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M16 3H21V8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8 21H3V16" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M16 21H21V16" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function CollapseIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M3 8H8V3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M21 8H16V3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M3 16H8V21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M21 16H16V21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function resultMismatchWarning(price: PriceOption | null, result: BacktestResult | null): string | null {
   if (!price || !result || !result.data_selection) return null;
   const ds = result.data_selection;
   if (ds.instrument_token !== price.instrument_token) return 'Result instrument token does not match selected asset.';
   if (ds.timeframe !== price.timeframe) return 'Result timeframe does not match selected timeframe.';
+  if (ds.date_from < price.date_from || ds.date_to > price.date_to) {
+    return `Result range (${ds.date_from} to ${ds.date_to}) is outside selected chart range (${price.date_from} to ${price.date_to}).`;
+  }
   return null;
 }
 
@@ -356,6 +478,24 @@ function findPriceOptionByTokenAndTimeframe(
     (opt) => opt.instrument_token === instrumentToken && opt.timeframe === timeframe,
   );
   if (!matches.length) return null;
+  return matches.sort((a, b) => b.date_to.localeCompare(a.date_to))[0];
+}
+
+function findPriceOptionForResult(
+  options: PriceOption[],
+  instrumentToken: number,
+  timeframe: string,
+  dateFrom: string,
+  dateTo: string,
+): PriceOption | null {
+  const matches = options.filter(
+    (opt) => opt.instrument_token === instrumentToken && opt.timeframe === timeframe,
+  );
+  if (!matches.length) return null;
+  const covering = matches
+    .filter((opt) => opt.date_from <= dateFrom && opt.date_to >= dateTo)
+    .sort((a, b) => a.date_from.localeCompare(b.date_from) || b.date_to.localeCompare(a.date_to));
+  if (covering.length) return covering[0];
   return matches.sort((a, b) => b.date_to.localeCompare(a.date_to))[0];
 }
 
@@ -502,8 +642,9 @@ function DashboardModule({
   const [indicatorWarning, setIndicatorWarning] = useState<string | null>(null);
   const [loadingIndicators, setLoadingIndicators] = useState(false);
   const [activeParamEditId, setActiveParamEditId] = useState<string | null>(null);
-  const [tradeTypeFilter, setTradeTypeFilter] = useState<'ALL' | 'BUY' | 'SELL'>('ALL');
+  const [tradeActionFilter, setTradeActionFilter] = useState<string>('ALL');
   const [tradeAssetFilter, setTradeAssetFilter] = useState('');
+  const [tradePaneFullscreen, setTradePaneFullscreen] = useState(false);
   const [crosshairTime, setCrosshairTime] = useState<number | null>(null);
   const tradeLogRef = useRef<HTMLDivElement | null>(null);
 
@@ -518,6 +659,10 @@ function DashboardModule({
   const selectedResult = selectedResultDetail ?? selectedResultSummary;
   const selectedTrades: Trade[] = useMemo(
     () => normalizeResultTrades(selectedResult),
+    [selectedResult],
+  );
+  const selectedOrderEvents: OrderEvent[] = useMemo(
+    () => normalizeOrderEvents(selectedResult),
     [selectedResult],
   );
   const selectedKpis = useMemo(
@@ -564,15 +709,22 @@ function DashboardModule({
     if (!selectedResult?.data_selection) return;
     if (selectedPrice) return;
     const ds = selectedResult.data_selection;
-    const match = findPriceOptionByTokenAndTimeframe(
+    const match = findPriceOptionForResult(
       priceOptions,
       ds.instrument_token,
       ds.timeframe,
+      ds.date_from,
+      ds.date_to,
     );
     if (match && match.id !== module.priceId) {
-      onUpdate(module.id, { priceId: match.id });
+      onUpdate(module.id, { priceId: match.id, chartRangeMode: 'full_result' });
     }
   }, [selectedResult, selectedPrice, priceOptions, module.id, module.priceId, onUpdate]);
+
+  const resultRange = useMemo(() => {
+    if (!selectedResult?.data_selection) return null;
+    return selectedResult.data_selection;
+  }, [selectedResult]);
 
   useEffect(() => {
     let active = true;
@@ -586,8 +738,8 @@ function DashboardModule({
         const response = await getHistoricalBars(
           selectedPrice.instrument_token,
           selectedPrice.timeframe,
-          selectedPrice.date_from,
-          selectedPrice.date_to,
+          resultRange?.date_from || selectedPrice.date_from,
+          resultRange?.date_to || selectedPrice.date_to,
         );
         if (!active) return;
         setBars(parseBars((response as { bars?: unknown }).bars));
@@ -603,7 +755,7 @@ function DashboardModule({
     return () => {
       active = false;
     };
-  }, [selectedPrice, module.syncNonce]);
+  }, [selectedPrice, resultRange, module.syncNonce]);
 
   useEffect(() => {
     let active = true;
@@ -619,8 +771,8 @@ function DashboardModule({
         const response = await computeIndicators({
           instrument_token: selectedPrice.instrument_token,
           timeframe: selectedPrice.timeframe,
-          date_from: selectedPrice.date_from,
-          date_to: selectedPrice.date_to,
+          date_from: resultRange?.date_from || selectedPrice.date_from,
+          date_to: resultRange?.date_to || selectedPrice.date_to,
           indicators: module.selectedIndicators.map((ind) => ({ name: ind.name, params: ind.params })),
         });
         if (!active) return;
@@ -646,12 +798,19 @@ function DashboardModule({
     return () => {
       active = false;
     };
-  }, [selectedPrice, module.selectedIndicators, module.syncNonce]);
+  }, [selectedPrice, resultRange, module.selectedIndicators, module.syncNonce]);
 
-  const visibleBars = useMemo(
-    () => (bars.length <= MAX_VISIBLE_CANDLES ? bars : bars.slice(-MAX_VISIBLE_CANDLES)),
-    [bars],
-  );
+  const visibleBars = useMemo(() => {
+    if (!bars.length) return [];
+    if (module.chartRangeMode === 'full_result') return bars;
+    if (module.chartRangeMode === 'last_1400') {
+      return bars.length <= MAX_VISIBLE_CANDLES ? bars : bars.slice(-MAX_VISIBLE_CANDLES);
+    }
+    const days = module.chartRangeMode === 'last_5d' ? 5 : 20;
+    const maxTime = bars[bars.length - 1].time;
+    const minTime = maxTime - (days * 24 * 60 * 60);
+    return bars.filter((bar) => bar.time >= minTime);
+  }, [bars, module.chartRangeMode]);
   const candleTimes = useMemo(() => visibleBars.map((b) => b.time), [visibleBars]);
   const mismatchWarning = useMemo(
     () => resultMismatchWarning(selectedPrice, selectedResult),
@@ -688,7 +847,7 @@ function DashboardModule({
   }, [indicatorSeries]);
 
   const markerResult = useMemo(() => {
-    if (!module.plotSignals || !visibleBars.length || !selectedTrades.length) {
+    if (!module.plotSignals || !visibleBars.length || (!selectedTrades.length && !selectedOrderEvents.length)) {
       return {
         markers: [] as Array<{
           time: number;
@@ -698,19 +857,21 @@ function DashboardModule({
           text: string;
         }>,
         diagnostics: {
-          totalTrades: selectedTrades.length,
+          totalTrades: selectedTrades.length || selectedOrderEvents.length,
+          rawMarkers: 0,
+          collapsedMarkers: 0,
           markersPlotted: 0,
           outsideVisibleRange: 0,
           unmatchedTimestamps: 0,
         } as MarkerDiagnostics,
       };
     }
-
+    const tolerance = timeframeToleranceSeconds(selectedPrice?.timeframe);
     const minTime = candleTimes[0];
     const maxTime = candleTimes[candleTimes.length - 1];
     let outside = 0;
     let unmatched = 0;
-    const markers: Array<{
+    const rawMarkers: Array<{
       time: number;
       position: 'aboveBar' | 'belowBar' | 'inBar';
       color: string;
@@ -718,88 +879,182 @@ function DashboardModule({
       text: string;
     }> = [];
 
-    for (const trade of selectedTrades) {
-      const kind = directionKind(trade.direction);
-      const entryUnix = normalizeTradeTimestampToUnix(trade.entry_date);
-      const exitUnix = normalizeTradeTimestampToUnix(trade.exit_date);
-      const entry = entryUnix != null ? nearestCandleTime(entryUnix, candleTimes) : null;
-      const exit = exitUnix != null ? nearestCandleTime(exitUnix, candleTimes) : null;
-      if (entryUnix == null) unmatched += 1;
-      if (trade.exit_date && exitUnix == null) unmatched += 1;
-
-      const entryInRange = entry != null && entry >= minTime && entry <= maxTime;
-      const exitInRange = exit != null && exit >= minTime && exit <= maxTime;
-      if (!entryInRange && !exitInRange) outside += 1;
-
-      if (entryInRange) {
-        const isLong = kind === 'long';
-        markers.push({
-          time: entry as number,
-          position: isLong ? 'belowBar' : kind === 'short' ? 'aboveBar' : 'inBar',
-          color: isLong ? '#10B981' : kind === 'short' ? '#EF4444' : '#64748B',
-          shape: isLong ? 'arrowUp' : kind === 'short' ? 'arrowDown' : 'circle',
-          text: isLong ? 'BUY' : kind === 'short' ? 'SELL' : trade.direction || 'ENTRY',
-        });
+    const pushMarker = (rawUnix: number | null, markerSeed: ReturnType<typeof mapActionToMarker>) => {
+      if (rawUnix == null || markerSeed == null) {
+        unmatched += 1;
+        return;
       }
-      if (trade.exit_date && exitInRange) {
-        const isLong = kind === 'long';
-        markers.push({
-          time: exit as number,
-          position: isLong ? 'aboveBar' : kind === 'short' ? 'belowBar' : 'inBar',
-          color: isLong ? '#F97316' : kind === 'short' ? '#22C55E' : '#F59E0B',
-          shape: isLong ? 'arrowDown' : kind === 'short' ? 'arrowUp' : 'square',
-          text: 'EXIT',
-        });
+      const snapped = nearestCandleTime(rawUnix, candleTimes, tolerance);
+      if (snapped == null) {
+        unmatched += 1;
+        return;
+      }
+      if (snapped < minTime || snapped > maxTime) {
+        outside += 1;
+        return;
+      }
+      rawMarkers.push({
+        time: snapped,
+        position: markerSeed.position,
+        color: markerSeed.color,
+        shape: markerSeed.shape,
+        text: markerSeed.text,
+      });
+    };
+
+    if (selectedOrderEvents.length) {
+      for (const event of selectedOrderEvents) {
+        if (!isOrderEventPlottable(event.status)) continue;
+        const markerSeed = mapActionToMarker(event.action);
+        if (!markerSeed) continue;
+        pushMarker(normalizeTradeTimestampToUnix(event.time), markerSeed);
+      }
+    } else {
+      for (const trade of selectedTrades) {
+        const kind = directionKind(trade.direction);
+        const entryAction = String(trade.entry_action || (kind === 'short' ? 'SELL_SHORT' : 'BUY')).toUpperCase();
+        const exitAction = String(trade.exit_action || (kind === 'short' ? 'BUY_COVER' : 'SELL_EXIT')).toUpperCase();
+        pushMarker(normalizeTradeTimestampToUnix(trade.entry_date), mapActionToMarker(entryAction));
+        if (trade.exit_date) {
+          pushMarker(normalizeTradeTimestampToUnix(trade.exit_date), mapActionToMarker(exitAction));
+        }
       }
     }
 
-    markers.sort((a, b) => a.time - b.time);
-    const deduped = markers.filter((m, i) => {
-      if (i === 0) return true;
-      const p = markers[i - 1];
-      return !(p.time === m.time && p.text === m.text && p.position === m.position);
-    });
+    const grouped = new Map<string, { marker: typeof rawMarkers[number]; count: number }>();
+    for (const marker of rawMarkers) {
+      const key = `${marker.time}|${marker.position}|${marker.text}|${marker.shape}|${marker.color}`;
+      const existing = grouped.get(key);
+      if (!existing) grouped.set(key, { marker, count: 1 });
+      else existing.count += 1;
+    }
+    const collapsed = Array.from(grouped.values()).map(({ marker, count }) => ({
+      ...marker,
+      text: count > 1 ? `${marker.text} x${count}` : marker.text,
+    }));
+    collapsed.sort((a, b) => a.time - b.time);
 
     return {
-      markers: deduped,
+      markers: collapsed,
       diagnostics: {
-        totalTrades: selectedTrades.length,
-        markersPlotted: deduped.length,
+        totalTrades: selectedTrades.length || selectedOrderEvents.length,
+        rawMarkers: rawMarkers.length,
+        collapsedMarkers: collapsed.length,
+        markersPlotted: collapsed.length,
         outsideVisibleRange: outside,
         unmatchedTimestamps: unmatched,
       } as MarkerDiagnostics,
     };
-  }, [module.plotSignals, visibleBars, selectedTrades, candleTimes]);
+  }, [module.plotSignals, visibleBars, selectedTrades, selectedOrderEvents, candleTimes, selectedPrice]);
 
-  const tradeLogRows = useMemo(() => {
+  const closedTradeRows = useMemo(() => {
     const rows: Array<{
       id: number;
-      type: 'BUY' | 'SELL';
-      asset: string;
+      direction: 'LONG' | 'SHORT';
+      entryAction: string;
+      entryTime: string;
+      entryPrice: number | null;
+      exitAction: string;
+      exitTime: string;
+      exitPrice: number | null;
       qty: number | null;
-      price: number | null;
-      time: string;
+      netPnl: number | null;
+      barsHeld: number | null;
+      asset: string;
       isLatest: boolean;
     }> = [];
     let id = 1;
     for (const trade of selectedTrades) {
-      const type = directionKind(trade.direction) === 'short' ? 'SELL' : 'BUY';
-      const asset = selectedPrice?.tradingsymbol || selectedResult?.symbol || '-';
-      if (tradeTypeFilter !== 'ALL' && type !== tradeTypeFilter) continue;
+      const direction = directionKind(trade.direction) === 'short' ? 'SHORT' : 'LONG';
+      const entryAction = String(trade.entry_action || (direction === 'SHORT' ? 'SELL_SHORT' : 'BUY')).toUpperCase();
+      const exitAction = String(trade.exit_action || (direction === 'SHORT' ? 'BUY_COVER' : 'SELL_EXIT')).toUpperCase();
+      const asset = trade.symbol || selectedPrice?.tradingsymbol || selectedResult?.symbol || '-';
+      const actionKey = `${entryAction}|${exitAction}|${direction}`;
+      if (tradeActionFilter !== 'ALL' && !actionKey.includes(tradeActionFilter)) continue;
       if (tradeAssetFilter.trim() && !asset.toLowerCase().includes(tradeAssetFilter.trim().toLowerCase())) continue;
       rows.push({
         id: id++,
-        type,
+        direction,
+        entryAction,
+        entryTime: trade.entry_date || '-',
+        entryPrice: Number.isFinite(trade.entry_price) ? trade.entry_price : null,
+        exitAction,
+        exitTime: trade.exit_date || '-',
+        exitPrice: Number.isFinite(trade.exit_price) ? trade.exit_price : null,
+        qty: Number.isFinite(trade.quantity ?? trade.size) ? Number(trade.quantity ?? trade.size) : null,
+        netPnl: Number.isFinite(trade.net_pnl ?? trade.pnl) ? Number(trade.net_pnl ?? trade.pnl) : null,
+        barsHeld: Number.isFinite(trade.bars_held) ? Number(trade.bars_held) : null,
         asset,
-        qty: Number.isFinite(trade.size) ? trade.size : null,
-        price: Number.isFinite(trade.entry_price) ? trade.entry_price : null,
-        time: trade.entry_date || '-',
         isLatest: false,
       });
     }
     const reversed = rows.slice().reverse();
     return reversed.map((row, idx) => ({ ...row, isLatest: idx < 3 }));
-  }, [selectedTrades, selectedPrice, selectedResult, tradeTypeFilter, tradeAssetFilter]);
+  }, [selectedTrades, selectedPrice, selectedResult, tradeActionFilter, tradeAssetFilter]);
+
+  const orderEventRows = useMemo(() => {
+    const rows: Array<{
+      id: number;
+      time: string;
+      action: string;
+      status: string;
+      qty: number | null;
+      price: number | null;
+      posBefore: number | null;
+      posAfter: number | null;
+      reason: string;
+      asset: string;
+      isLatest: boolean;
+    }> = [];
+    let id = 1;
+    for (const event of selectedOrderEvents) {
+      const action = String(event.action || 'UNKNOWN').toUpperCase();
+      const status = String(event.status || 'UNKNOWN').toUpperCase();
+      const asset = selectedPrice?.tradingsymbol || selectedResult?.symbol || '-';
+      if (tradeActionFilter !== 'ALL' && !(action.includes(tradeActionFilter) || status.includes(tradeActionFilter))) continue;
+      if (tradeAssetFilter.trim() && !asset.toLowerCase().includes(tradeAssetFilter.trim().toLowerCase())) continue;
+      rows.push({
+        id: id++,
+        time: event.time || '-',
+        action,
+        status,
+        qty: Number.isFinite(event.executed_size ?? event.requested_size) ? Number(event.executed_size ?? event.requested_size) : null,
+        price: Number.isFinite(event.price) ? Number(event.price) : null,
+        posBefore: Number.isFinite(event.position_before) ? Number(event.position_before) : null,
+        posAfter: Number.isFinite(event.position_after) ? Number(event.position_after) : null,
+        reason: event.reason || '-',
+        asset,
+        isLatest: false,
+      });
+    }
+    const reversed = rows.slice().reverse();
+    return reversed.map((row, idx) => ({ ...row, isLatest: idx < 3 }));
+  }, [selectedOrderEvents, selectedPrice, selectedResult, tradeActionFilter, tradeAssetFilter]);
+
+  const tradebookActionOptions = useMemo(() => {
+    if (module.tradebookMode === 'order_events') {
+      const actions = new Set<string>(['ALL']);
+      for (const event of selectedOrderEvents) {
+        const action = String(event.action || '').toUpperCase();
+        if (action) actions.add(action);
+        const status = String(event.status || '').toUpperCase();
+        if (status) actions.add(status);
+      }
+      return Array.from(actions).slice(0, 14);
+    }
+    const actions = new Set<string>(['ALL']);
+    for (const trade of selectedTrades) {
+      actions.add(String(trade.entry_action || '').toUpperCase() || 'BUY');
+      actions.add(String(trade.exit_action || '').toUpperCase() || 'SELL_EXIT');
+      actions.add(directionKind(trade.direction) === 'short' ? 'SHORT' : 'LONG');
+    }
+    return Array.from(actions).slice(0, 14);
+  }, [module.tradebookMode, selectedOrderEvents, selectedTrades]);
+
+  useEffect(() => {
+    if (tradebookActionOptions.includes(tradeActionFilter)) return;
+    setTradeActionFilter('ALL');
+  }, [tradebookActionOptions, tradeActionFilter]);
 
   const toggleIndicator = (meta: IndicatorMetadata, checked: boolean) => {
     if (checked) {
@@ -834,7 +1089,16 @@ function DashboardModule({
   useEffect(() => {
     if (!tradeLogRef.current) return;
     tradeLogRef.current.scrollTop = 0;
-  }, [tradeLogRows]);
+  }, [closedTradeRows, orderEventRows, module.tradebookMode]);
+
+  useEffect(() => {
+    if (!tradePaneFullscreen) return;
+    const onEsc = (evt: KeyboardEvent) => {
+      if (evt.key === 'Escape') setTradePaneFullscreen(false);
+    };
+    window.addEventListener('keydown', onEsc);
+    return () => window.removeEventListener('keydown', onEsc);
+  }, [tradePaneFullscreen]);
 
   return (
     <section className="trd-module">
@@ -1000,6 +1264,9 @@ function DashboardModule({
       ) : null}
 
       {mismatchWarning ? <div className="trd-warning">{mismatchWarning}</div> : null}
+      {selectedResult && Number(selectedResult.result_schema_version || 1) < 2 ? (
+        <div className="trd-warning">Legacy result detected: direction semantics may be ambiguous for older runs.</div>
+      ) : null}
       {resultLoading ? <div className="trd-muted">Loading selected result output...</div> : null}
       {resultError ? <div className="trd-error">{resultError}</div> : null}
       {barError ? (
@@ -1034,6 +1301,19 @@ function DashboardModule({
                 />
                 Plot Buy/Sell
               </label>
+              <select
+                className="trd-mini-filter"
+                value={module.chartRangeMode}
+                onChange={(e) =>
+                  onUpdate(module.id, {
+                    chartRangeMode: e.target.value as DashboardModuleState['chartRangeMode'],
+                  })}
+              >
+                <option value="full_result">Full Result</option>
+                <option value="last_1400">Last 1400</option>
+                <option value="last_5d">Last 5D</option>
+                <option value="last_20d">Last 20D</option>
+              </select>
               <button className="btn btn-ghost btn-sm" onClick={() => onUpdate(module.id, { syncNonce: module.syncNonce + 1 })}>
                 {loadingBars || loadingIndicators ? 'Syncing...' : 'Sync'}
               </button>
@@ -1041,7 +1321,11 @@ function DashboardModule({
           </div>
 
           <div className="trd-diag">
-            markers {markerResult.diagnostics.markersPlotted} | trades {markerResult.diagnostics.totalTrades} | outside {markerResult.diagnostics.outsideVisibleRange} | unmatched {markerResult.diagnostics.unmatchedTimestamps}
+            loaded {bars.length} | visible {visibleBars.length}
+            {selectedResult?.data_selection ? ` | result ${selectedResult.data_selection.date_from} to ${selectedResult.data_selection.date_to}` : ''}
+            {visibleBars.length ? ` | chart ${new Date(visibleBars[0].time * 1000).toLocaleDateString('en-IN')} to ${new Date(visibleBars[visibleBars.length - 1].time * 1000).toLocaleDateString('en-IN')}` : ''}
+            | markers {markerResult.diagnostics.markersPlotted} (raw {markerResult.diagnostics.rawMarkers}, collapsed {markerResult.diagnostics.collapsedMarkers})
+            | outside {markerResult.diagnostics.outsideVisibleRange} | unmatched {markerResult.diagnostics.unmatchedTimestamps}
             {crosshairTime ? ` | cursor ${new Date(crosshairTime * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}` : ''}
           </div>
 
@@ -1071,18 +1355,39 @@ function DashboardModule({
           )}
         </div>
 
-        <aside className="trd-trade-pane">
+        <aside className={`trd-trade-pane ${tradePaneFullscreen ? 'trd-trade-pane-fullscreen' : ''}`}>
           <div className="trd-trade-header">
-            <div className="trd-trade-title">Trade Log</div>
+            <div className="trd-trade-title-row">
+              <div className="trd-trade-title">{module.tradebookMode === 'closed_trades' ? 'Trade Book' : 'Order Events'}</div>
+              <button
+                type="button"
+                className="trd-icon-btn"
+                onClick={() => setTradePaneFullscreen((prev) => !prev)}
+                aria-label={tradePaneFullscreen ? 'Collapse trade table' : 'Expand trade table'}
+                title={tradePaneFullscreen ? 'Exit Full Screen (Esc)' : 'Full Screen'}
+              >
+                {tradePaneFullscreen ? <CollapseIcon /> : <ExpandIcon />}
+              </button>
+            </div>
             <div className="trd-trade-filters">
               <select
                 className="trd-mini-filter"
-                value={tradeTypeFilter}
-                onChange={(e) => setTradeTypeFilter(e.target.value as 'ALL' | 'BUY' | 'SELL')}
+                value={module.tradebookMode}
+                onChange={(e) => onUpdate(module.id, { tradebookMode: e.target.value as DashboardModuleState['tradebookMode'] })}
               >
-                <option value="ALL">All</option>
-                <option value="BUY">Buy</option>
-                <option value="SELL">Sell</option>
+                <option value="closed_trades">Closed Trades</option>
+                <option value="order_events">Order Events</option>
+              </select>
+              <select
+                className="trd-mini-filter"
+                value={tradeActionFilter}
+                onChange={(e) => setTradeActionFilter(e.target.value)}
+              >
+                {tradebookActionOptions.map((opt) => (
+                  <option key={`${module.id}-action-${opt}`} value={opt}>
+                    {opt}
+                  </option>
+                ))}
               </select>
               <input
                 className="trd-mini-filter"
@@ -1095,39 +1400,77 @@ function DashboardModule({
           <div className="trd-trade-wrap" ref={tradeLogRef}>
             <table className="trd-trade-table">
               <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>Type</th>
-                  <th>Asset</th>
-                  <th>Qty</th>
-                  <th>Price</th>
-                  <th>Time</th>
-                </tr>
+                {module.tradebookMode === 'closed_trades' ? (
+                  <tr>
+                    <th>#</th>
+                    <th>Dir</th>
+                    <th>Entry</th>
+                    <th>Entry Time</th>
+                    <th>Entry Px</th>
+                    <th>Exit</th>
+                    <th>Exit Time</th>
+                    <th>Exit Px</th>
+                    <th>Qty</th>
+                    <th>Net PnL</th>
+                  </tr>
+                ) : (
+                  <tr>
+                    <th>#</th>
+                    <th>Time</th>
+                    <th>Action</th>
+                    <th>Status</th>
+                    <th>Qty</th>
+                    <th>Price</th>
+                    <th>Pos</th>
+                    <th>Reason</th>
+                  </tr>
+                )}
               </thead>
               <tbody>
                 {(loadingBars || loadingIndicators || resultLoading) ? (
                   Array.from({ length: 8 }).map((_, idx) => (
                     <tr key={`${module.id}-skeleton-${idx}`}>
-                      <td colSpan={6}><div className="trd-skeleton trd-skeleton-row" /></td>
+                      <td colSpan={module.tradebookMode === 'closed_trades' ? 10 : 8}><div className="trd-skeleton trd-skeleton-row" /></td>
                     </tr>
                   ))
-                ) : tradeLogRows.length ? (
-                  tradeLogRows.map((row) => (
-                    <tr key={`${module.id}-log-${row.id}-${row.time}`} className={row.isLatest ? 'trd-row-latest' : ''}>
+                ) : module.tradebookMode === 'closed_trades' && closedTradeRows.length ? (
+                  closedTradeRows.map((row) => (
+                    <tr key={`${module.id}-trade-${row.id}-${row.entryTime}`} className={row.isLatest ? 'trd-row-latest' : ''}>
                       <td>{row.id}</td>
                       <td>
-                        <span className={`trd-badge ${row.type === 'BUY' ? 'buy' : 'sell'}`}>{row.type}</span>
+                        <span className={`trd-badge ${row.direction === 'LONG' ? 'buy' : 'sell'}`}>{row.direction}</span>
                       </td>
-                      <td>{row.asset}</td>
+                      <td className="trd-mono">{row.entryAction}</td>
+                      <td className="trd-mono">{row.entryTime}</td>
+                      <td className="trd-mono">{row.entryPrice != null ? row.entryPrice.toFixed(2) : '-'}</td>
+                      <td className="trd-mono">{row.exitAction}</td>
+                      <td className="trd-mono">{row.exitTime}</td>
+                      <td className="trd-mono">{row.exitPrice != null ? row.exitPrice.toFixed(2) : '-'}</td>
+                      <td className="trd-mono">{row.qty != null ? row.qty.toFixed(2) : '-'}</td>
+                      <td className={`trd-mono ${(row.netPnl ?? 0) < 0 ? 'trd-neg' : 'trd-pos'}`}>{row.netPnl != null ? row.netPnl.toFixed(2) : '-'}</td>
+                    </tr>
+                  ))
+                ) : module.tradebookMode === 'order_events' && orderEventRows.length ? (
+                  orderEventRows.map((row) => (
+                    <tr key={`${module.id}-evt-${row.id}-${row.time}`} className={row.isLatest ? 'trd-row-latest' : ''}>
+                      <td>{row.id}</td>
+                      <td className="trd-mono">{row.time}</td>
+                      <td className="trd-mono">{row.action}</td>
+                      <td className="trd-mono">{row.status}</td>
                       <td className="trd-mono">{row.qty != null ? row.qty.toFixed(2) : '-'}</td>
                       <td className="trd-mono">{row.price != null ? row.price.toFixed(2) : '-'}</td>
-                      <td className="trd-mono">{row.time}</td>
+                      <td className="trd-mono">
+                        {row.posBefore != null || row.posAfter != null ? `${row.posBefore ?? '-'} -> ${row.posAfter ?? '-'}` : '-'}
+                      </td>
+                      <td title={row.reason}>{row.reason || '-'}</td>
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={6} style={{ textAlign: 'center', color: '#64748b', padding: 14 }}>
-                      {module.tradeTaskId ? 'No trades found in selected result' : 'No trades selected'}
+                    <td colSpan={module.tradebookMode === 'closed_trades' ? 10 : 8} style={{ textAlign: 'center', color: '#64748b', padding: 14 }}>
+                      {module.tradeTaskId
+                        ? (module.tradebookMode === 'closed_trades' ? 'No closed trades found in selected result' : 'No order events found in selected result')
+                        : 'No result selected'}
                     </td>
                   </tr>
                 )}
@@ -1145,7 +1488,16 @@ export default function Dashboard() {
   const [results, setResults] = useState<BacktestResult[]>([]);
   const [indicatorMeta, setIndicatorMeta] = useState<IndicatorMetadata[]>([]);
   const [modules, setModules] = useState<DashboardModuleState[]>([
-    { id: 1, priceId: '', tradeTaskId: '', selectedIndicators: [], plotSignals: false, syncNonce: 0 },
+    {
+      id: 1,
+      priceId: '',
+      tradeTaskId: '',
+      selectedIndicators: [],
+      plotSignals: false,
+      syncNonce: 0,
+      chartRangeMode: 'full_result',
+      tradebookMode: 'closed_trades',
+    },
   ]);
   const [error, setError] = useState<string | null>(null);
   const [backtestMode] = useState(true);
@@ -1214,6 +1566,8 @@ export default function Dashboard() {
         selectedIndicators: [],
         plotSignals: false,
         syncNonce: 0,
+        chartRangeMode: 'full_result',
+        tradebookMode: 'closed_trades',
       },
     ]);
   };
@@ -1527,11 +1881,49 @@ export default function Dashboard() {
           padding: 8px 10px;
           min-height: 590px;
         }
+        .trd-trade-pane-fullscreen {
+          position: fixed;
+          top: 78px;
+          left: 12px;
+          right: 12px;
+          bottom: 12px;
+          z-index: 80;
+          background: #FAFAFB;
+          border-color: #E5E7EB;
+          border-radius: 12px;
+          min-height: 0;
+        }
+        .trd-trade-pane-fullscreen .trd-trade-wrap {
+          max-height: calc(100vh - 170px);
+        }
         .trd-trade-title {
           font-size: 16px;
           color: #111827;
           font-weight: 600;
-          margin-bottom: 6px;
+          margin-bottom: 0;
+        }
+        .trd-trade-title-row {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .trd-icon-btn {
+          height: 26px;
+          width: 26px;
+          border: 1px solid #E5E7EB;
+          border-radius: 7px;
+          background: #FFFFFF;
+          color: #64748b;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          transition: all 200ms ease;
+        }
+        .trd-icon-btn:hover {
+          color: #4F46E5;
+          border-color: #c7d2fe;
+          background: #eef2ff;
         }
         .trd-trade-header {
           display: flex;
@@ -1555,7 +1947,7 @@ export default function Dashboard() {
           padding: 0 8px;
           min-width: 72px;
         }
-        .trd-trade-wrap { max-height: 560px; overflow-y: auto; }
+        .trd-trade-wrap { max-height: 560px; overflow: auto; }
         .trd-trade-table {
           width: 100%;
           border-collapse: collapse;
@@ -1598,6 +1990,8 @@ export default function Dashboard() {
         .trd-badge.buy { color: #10b981; background: #dcfce7; }
         .trd-badge.sell { color: #ef4444; background: #fee2e2; }
         .trd-mono { font-family: var(--font-mono); }
+        .trd-pos { color: #0f766e; }
+        .trd-neg { color: #b91c1c; }
 
         .trd-skeleton-wrap { display: grid; gap: 8px; }
         .trd-skeleton {

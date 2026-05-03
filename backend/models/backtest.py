@@ -44,6 +44,9 @@ class BacktestResult(BaseModel):
     final_value: float | None = None
     metrics: dict[str, Any] = {}
     trades: list[dict[str, Any]] = []
+    order_events: list[dict[str, Any]] = []
+    integrity: dict[str, Any] = {}
+    result_schema_version: int = 2
     data_gaps: list[str] | None = None  # E-18: Optional
     error_message: str | None = None
 

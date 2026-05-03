@@ -30,21 +30,64 @@ def _normalize_trade_rows(raw_rows: Any) -> list[dict[str, Any]]:
     for row in raw_rows:
         if not isinstance(row, dict):
             continue
-        direction = str(
+        direction_raw = str(
             row.get("direction")
             or row.get("Direction")
             or row.get("side")
-            or "BUY",
+            or "LONG",
         ).upper()
+        direction = "SHORT" if "SHORT" in direction_raw or direction_raw == "SELL" else "LONG"
+        entry_action = str(row.get("entry_action") or ("BUY" if direction == "LONG" else "SELL_SHORT")).upper()
+        exit_action = str(row.get("exit_action") or ("SELL_EXIT" if direction == "LONG" else "BUY_COVER")).upper()
         normalized.append({
+            "trade_id": str(row.get("trade_id") or ""),
+            "instrument_token": row.get("instrument_token"),
+            "symbol": str(row.get("symbol") or row.get("Symbol") or ""),
             "entry_date": str(row.get("entry_date") or row.get("Entry Date") or row.get("entryDate") or ""),
             "exit_date": str(row.get("exit_date") or row.get("Close Date") or row.get("Exit Date") or ""),
-            "direction": "SELL" if "SELL" in direction or "SHORT" in direction else "BUY",
+            "direction": direction,
+            "entry_action": entry_action,
+            "exit_action": exit_action,
             "entry_price": _to_float(row.get("entry_price") or row.get("Entry Price") or row.get("entryPrice")) or 0.0,
             "exit_price": _to_float(row.get("exit_price") or row.get("Exit Price") or row.get("exitPrice")) or 0.0,
             "pnl": _to_float(row.get("pnl") or row.get("Net P&L") or row.get("net_pnl") or row.get("Gross P&L")) or 0.0,
             "size": _to_float(row.get("size") or row.get("Qty") or row.get("qty") or row.get("quantity")) or 0.0,
+            "gross_pnl": _to_float(row.get("gross_pnl") or row.get("Gross P&L")) or 0.0,
+            "net_pnl": _to_float(row.get("net_pnl") or row.get("Net P&L") or row.get("pnl")) or 0.0,
+            "commission": _to_float(row.get("commission")) or 0.0,
+            "bars_held": int(_to_float(row.get("bars_held")) or 0),
+            "status": str(row.get("status") or "CLOSED"),
+            "position_before_entry": _to_float(row.get("position_before_entry")),
+            "position_after_entry": _to_float(row.get("position_after_entry")),
+            "position_before_exit": _to_float(row.get("position_before_exit")),
+            "position_after_exit": _to_float(row.get("position_after_exit")),
         })
+    return normalized
+
+
+def _normalize_order_events(raw_rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        normalized.append(
+            {
+                "event_id": str(row.get("event_id") or ""),
+                "time": str(row.get("time") or ""),
+                "action": str(row.get("action") or ""),
+                "status": str(row.get("status") or ""),
+                "requested_size": _to_float(row.get("requested_size")),
+                "executed_size": _to_float(row.get("executed_size")),
+                "price": _to_float(row.get("price")),
+                "reason": str(row.get("reason") or "") or None,
+                "position_before": _to_float(row.get("position_before")),
+                "position_after": _to_float(row.get("position_after")),
+                "cash_before": _to_float(row.get("cash_before")),
+                "cash_after": _to_float(row.get("cash_after")),
+            }
+        )
     return normalized
 
 
@@ -69,10 +112,10 @@ def _build_metrics(
 
     if trades:
         total = len(trades)
-        wins = sum(1 for trade in trades if _to_float(trade.get("pnl")) and float(trade.get("pnl", 0)) > 0)
-        losses = sum(1 for trade in trades if _to_float(trade.get("pnl")) and float(trade.get("pnl", 0)) < 0)
-        gross_profit = sum(float(trade.get("pnl", 0)) for trade in trades if float(trade.get("pnl", 0)) > 0)
-        gross_loss = abs(sum(float(trade.get("pnl", 0)) for trade in trades if float(trade.get("pnl", 0)) < 0))
+        wins = sum(1 for trade in trades if _to_float(trade.get("net_pnl", trade.get("pnl"))) and float(trade.get("net_pnl", trade.get("pnl", 0))) > 0)
+        losses = sum(1 for trade in trades if _to_float(trade.get("net_pnl", trade.get("pnl"))) and float(trade.get("net_pnl", trade.get("pnl", 0))) < 0)
+        gross_profit = sum(float(trade.get("net_pnl", trade.get("pnl", 0))) for trade in trades if float(trade.get("net_pnl", trade.get("pnl", 0))) > 0)
+        gross_loss = abs(sum(float(trade.get("net_pnl", trade.get("pnl", 0))) for trade in trades if float(trade.get("net_pnl", trade.get("pnl", 0))) < 0))
         metrics.setdefault("total_trades", total)
         metrics.setdefault("winning_trades", wins)
         metrics.setdefault("losing_trades", losses)
@@ -80,6 +123,32 @@ def _build_metrics(
         if gross_loss > 0:
             metrics.setdefault("profit_factor", gross_profit / gross_loss)
     return metrics
+
+
+def _normalize_result_document(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    trades_source = (
+        out.get("trades")
+        or out.get("trade_log")
+        or out.get("orders")
+        or out.get("transactions")
+        or []
+    )
+    out["trades"] = _normalize_trade_rows(trades_source)
+    events_source = out.get("order_events") or out.get("trade_events") or []
+    out["order_events"] = _normalize_order_events(events_source)
+    out["metrics"] = dict(out.get("metrics") or {})
+    out["integrity"] = dict(out.get("integrity") or {})
+    out["result_schema_version"] = int(out.get("result_schema_version") or 1)
+    if out["result_schema_version"] < 2:
+        warnings = out["integrity"].get("warnings")
+        warning_list = warnings if isinstance(warnings, list) else []
+        if "legacy_trade_direction_ambiguous" not in warning_list:
+            warning_list.append("legacy_trade_direction_ambiguous")
+        out["integrity"]["warnings"] = warning_list
+    return out
 
 
 @router.post("/backtests/run")
@@ -140,7 +209,7 @@ async def run_backtest(
 async def list_backtests():
     """List all backtest results."""
     results = await backtest_repository.get_all()
-    return {"results": results}
+    return {"results": [_normalize_result_document(row) for row in results]}
 
 
 @router.get("/backtests/{task_id}")
@@ -149,7 +218,7 @@ async def get_backtest(task_id: str):
     result = await backtest_repository.get_by_id(task_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Backtest not found")
-    return result
+    return _normalize_result_document(result)
 
 
 def _resolve_strategy_class(mod: Any, requested_name: str | None) -> type[Any] | None:
@@ -289,6 +358,12 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
                     or result.get("trade_log")
                     or [],
                 )
+                normalized_events = _normalize_order_events(
+                    result.get("order_events")
+                    or result.get("trade_events")
+                    or [],
+                )
+                integrity = result.get("integrity") if isinstance(result.get("integrity"), dict) else {}
                 metrics = _build_metrics(
                     runtime_metrics=result.get("metrics"),
                     config=config,
@@ -300,6 +375,9 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
                     "final_value": final_value,
                     "metrics": metrics,
                     "trades": normalized_trades,
+                    "order_events": normalized_events,
+                    "integrity": integrity,
+                    "result_schema_version": int(result.get("result_schema_version", 2) or 2),
                 })
                 return
             except asyncio.TimeoutError as exc:

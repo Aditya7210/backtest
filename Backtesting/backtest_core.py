@@ -128,6 +128,8 @@ def build_success_result(
     log_file: str,
     metrics: dict[str, Any] | None = None,
     trades: list[dict[str, Any]] | None = None,
+    order_events: list[dict[str, Any]] | None = None,
+    integrity: dict[str, Any] | None = None,
     execution_time: float = 0.0,
     retries: int = 0,
 ) -> dict[str, Any]:
@@ -138,6 +140,9 @@ def build_success_result(
         "metrics": dict(metrics or {}),
         "trades": list(trades or []),
         "closed_trades": list(trades or []),
+        "order_events": list(order_events or []),
+        "integrity": dict(integrity or {}),
+        "result_schema_version": 2,
         "log_file": str(log_file or ""),
         "error": None,
         "execution_time": max(0.0, float(execution_time)),
@@ -354,7 +359,7 @@ def execute_backtest_dataframe(
             symbol=symbol,
         )
 
-    trade_events: list[str] = []
+    trade_events: list[dict[str, Any]] = []
     closed_trades: list[dict[str, Any]] = []
     trade_stats: dict[str, Any] = {}
     drawdown_stats: dict[str, Any] = {}
@@ -365,7 +370,7 @@ def execute_backtest_dataframe(
             for event in blocked_sell_events[:40]:
                 _log_terminal(
                     terminal,
-                    str(event),
+                    str(event.get("reason") if isinstance(event, dict) else event),
                     level="WARNING",
                     task_id=task_id,
                     symbol=symbol,
@@ -387,7 +392,12 @@ def execute_backtest_dataframe(
         except Exception:
             raw_events = []
         if isinstance(raw_events, list):
-            trade_events = [str(item) for item in raw_events]
+            trade_events = [dict(item) for item in raw_events if isinstance(item, dict)]
+
+        if isinstance(blocked_sell_events, list):
+            blocked_structured = [dict(item) for item in blocked_sell_events if isinstance(item, dict)]
+            if blocked_structured:
+                trade_events.extend(blocked_structured)
 
         try:
             raw_closed_trades = strategy_instance.analyzers.closed_trades.get_analysis()
@@ -402,7 +412,7 @@ def execute_backtest_dataframe(
             for event in trade_events[:40]:
                 _log_terminal(
                     terminal,
-                    str(event),
+                    str(event.get("reason") or event.get("action") or event),
                     task_id=task_id,
                     symbol=symbol,
                 )
@@ -503,36 +513,173 @@ def execute_backtest_dataframe(
         "drawdown_stats": drawdown_stats if isinstance(drawdown_stats, dict) else {},
         "sharpe_stats": sharpe_stats if isinstance(sharpe_stats, dict) else {},
     }
+    orders_submitted = sum(1 for evt in trade_events if str(evt.get("status", "")).upper() == "SUBMITTED")
+    orders_completed = sum(1 for evt in trade_events if str(evt.get("status", "")).upper() in {"COMPLETED", "TRADE_CLOSED"})
+    orders_rejected = sum(1 for evt in trade_events if str(evt.get("status", "")).upper() in {"REJECTED", "MARGIN", "CANCELED"})
+    orders_blocked = sum(1 for evt in trade_events if str(evt.get("status", "")).upper() == "BLOCKED")
+    long_trades = sum(1 for row in closed_trades if str(row.get("direction", "")).upper() == "LONG")
+    short_trades = sum(1 for row in closed_trades if str(row.get("direction", "")).upper() == "SHORT")
+    first_bar = prepared_df.index.min() if not prepared_df.empty else None
+    last_bar = prepared_df.index.max() if not prepared_df.empty else None
+    integrity = {
+        "bars_requested": int(raw_input_rows),
+        "bars_loaded": int(prepared_rows),
+        "bars_processed": int(bars_processed),
+        "date_from": _format_ist_datetime(first_bar) if first_bar is not None else None,
+        "date_to": _format_ist_datetime(last_bar) if last_bar is not None else None,
+        "first_bar_time": _format_ist_datetime(first_bar) if first_bar is not None else None,
+        "last_bar_time": _format_ist_datetime(last_bar) if last_bar is not None else None,
+        "orders_submitted": int(orders_submitted),
+        "orders_completed": int(orders_completed),
+        "orders_rejected": int(orders_rejected),
+        "orders_blocked": int(orders_blocked),
+        "trades_opened": int(total_trades),
+        "trades_closed": int(len(closed_trades)),
+        "invalid_sell_attempts": int(orders_blocked),
+        "short_trades": int(short_trades),
+        "long_trades": int(long_trades),
+        "data_gap_warnings": [],
+        "schema_version": 2,
+    }
     return build_success_result(
         symbol=symbol,
         final_value=final_value,
         log_file=str(artifacts["log_file"]),
         metrics=metrics,
         trades=closed_trades,
+        order_events=trade_events,
+        integrity=integrity,
     )
 
 
 class _TradeEventAnalyzer(bt.Analyzer):
     def start(self) -> None:
-        self.events: list[str] = []
+        self.events: list[dict[str, Any]] = []
+        self._seq = 0
+        self._positions_before: dict[int, float] = {}
+
+    def _next_id(self) -> str:
+        self._seq += 1
+        return f"evt_{self._seq}"
+
+    def _status_text(self, order: Any) -> str:
+        try:
+            return str(order.getstatusname()).upper()
+        except Exception:
+            return "UNKNOWN"
+
+    def _safe_price(self, order: Any) -> float | None:
+        for key in ("executed.price", "created.price", "price"):
+            try:
+                value = order
+                for part in key.split("."):
+                    value = getattr(value, part)
+                return float(value)
+            except Exception:
+                continue
+        return None
+
+    def _safe_size(self, order: Any) -> float | None:
+        for key in ("executed.size", "created.size", "size"):
+            try:
+                value = order
+                for part in key.split("."):
+                    value = getattr(value, part)
+                return abs(float(value))
+            except Exception:
+                continue
+        return None
+
+    def _event_time_from_order(self, order: Any) -> str:
+        dt_value = getattr(order.executed, "dt", 0) or getattr(order.created, "dt", 0)
+        if not dt_value:
+            return "N/A"
+        try:
+            return _format_ist_datetime(bt.num2date(dt_value))
+        except Exception:
+            return "N/A"
+
+    def _action_for_order(self, order: Any, position_before: float) -> str:
+        is_buy = bool(getattr(order, "isbuy", lambda: False)())
+        if is_buy:
+            return "BUY_COVER" if position_before < -_POSITION_SIZE_TOLERANCE else "BUY_ENTRY"
+        return "SELL_EXIT" if position_before > _POSITION_SIZE_TOLERANCE else "SELL_SHORT"
+
+    def notify_order(self, order: Any) -> None:
+        try:
+            ref = int(getattr(order, "ref", 0))
+            status = self._status_text(order)
+            position_now = float(getattr(self.strategy.position, "size", 0.0) or 0.0)
+            if ref not in self._positions_before:
+                self._positions_before[ref] = position_now
+            position_before = float(self._positions_before.get(ref, position_now))
+            action = self._action_for_order(order, position_before)
+            reason = status if status in {"REJECTED", "MARGIN", "CANCELED"} else None
+
+            self.events.append(
+                {
+                    "event_id": self._next_id(),
+                    "time": self._event_time_from_order(order),
+                    "action": action,
+                    "status": status,
+                    "requested_size": self._safe_size(order),
+                    "executed_size": self._safe_size(order),
+                    "price": self._safe_price(order),
+                    "reason": reason,
+                    "position_before": position_before,
+                    "position_after": position_now,
+                    "cash_before": None,
+                    "cash_after": None,
+                }
+            )
+
+            if status in {"COMPLETED", "REJECTED", "MARGIN", "CANCELED"}:
+                self._positions_before.pop(ref, None)
+        except Exception:
+            return
 
     def notify_trade(self, trade: Any) -> None:
         try:
             if trade.justopened:
-                side = "BUY" if trade.size > 0 else "SELL"
-                event_time = _format_ist_datetime(bt.num2date(trade.dtopen))
+                action = "BUY_ENTRY" if float(trade.size) > 0 else "SELL_SHORT"
                 self.events.append(
-                    f"{side} qty={abs(trade.size)} price={float(trade.price):.2f} at {event_time}"
+                    {
+                        "event_id": self._next_id(),
+                        "time": _format_ist_datetime(bt.num2date(trade.dtopen)),
+                        "action": action,
+                        "status": "TRADE_OPENED",
+                        "requested_size": abs(float(trade.size)),
+                        "executed_size": abs(float(trade.size)),
+                        "price": float(trade.price),
+                        "reason": None,
+                        "position_before": None,
+                        "position_after": float(getattr(self.strategy.position, "size", 0.0) or 0.0),
+                        "cash_before": None,
+                        "cash_after": None,
+                    }
                 )
             if trade.isclosed:
-                event_time = _format_ist_datetime(bt.num2date(trade.dtclose))
+                action = "SELL_EXIT" if float(trade.size) > 0 else "BUY_COVER"
                 self.events.append(
-                    f"CLOSE pnl={float(trade.pnlcomm):.2f} at {event_time}"
+                    {
+                        "event_id": self._next_id(),
+                        "time": _format_ist_datetime(bt.num2date(trade.dtclose)),
+                        "action": action,
+                        "status": "TRADE_CLOSED",
+                        "requested_size": abs(float(trade.size)),
+                        "executed_size": abs(float(trade.size)),
+                        "price": None,
+                        "reason": f"pnl={float(trade.pnlcomm):.2f}",
+                        "position_before": None,
+                        "position_after": float(getattr(self.strategy.position, "size", 0.0) or 0.0),
+                        "cash_before": None,
+                        "cash_after": None,
+                    }
                 )
         except Exception:
             return
 
-    def get_analysis(self) -> list[str]:
+    def get_analysis(self) -> list[dict[str, Any]]:
         return self.events
 
 
@@ -545,7 +692,7 @@ class _ClosedTradesAnalyzer(bt.Analyzer):
     def notify_trade(self, trade: Any) -> None:
         try:
             if trade.justopened:
-                direction = "BUY" if float(trade.size) > 0 else "SELL"
+                direction = "LONG" if float(trade.size) > 0 else "SHORT"
                 self._open_dirs[int(trade.ref)] = direction
                 self._open_qty[int(trade.ref)] = abs(float(trade.size))
 
@@ -553,14 +700,14 @@ class _ClosedTradesAnalyzer(bt.Analyzer):
                 return
 
             trade_ref = int(trade.ref)
-            direction = self._open_dirs.pop(trade_ref, "BUY")
+            direction = self._open_dirs.pop(trade_ref, "LONG")
             qty = abs(float(self._open_qty.pop(trade_ref, 0.0)))
             entry_px = float(trade.price)
             net_pnl = float(getattr(trade, "pnlcomm", 0.0) or 0.0)
 
             if qty > _POSITION_SIZE_TOLERANCE:
                 pnl_per_unit = net_pnl / qty
-                if direction == "SELL":
+                if direction == "SHORT":
                     # Short trade: profit when exit < entry.
                     exit_px = entry_px - pnl_per_unit
                 else:
@@ -576,15 +723,32 @@ class _ClosedTradesAnalyzer(bt.Analyzer):
 
             self.rows.append(
                 {
+                    "trade_id": f"tr_{trade_ref}",
+                    "instrument_token": None,
                     "Entry Date": _format_ist_datetime(bt.num2date(trade.dtopen)),
                     "Close Date": _format_ist_datetime(bt.num2date(trade.dtclose)),
                     "Symbol": "",
                     "Direction": direction,
+                    "direction": direction,
+                    "entry_action": "BUY" if direction == "LONG" else "SELL_SHORT",
+                    "exit_action": "SELL_EXIT" if direction == "LONG" else "BUY_COVER",
+                    "status": "CLOSED",
                     "Qty": qty_value,
+                    "quantity": qty_value,
                     "Entry Price": round(entry_px, 2),
+                    "entry_price": round(entry_px, 2),
                     "Exit Price": round(exit_px, 2),
+                    "exit_price": round(exit_px, 2),
                     "Gross P&L": round(float(trade.pnl), 2),
                     "Net P&L": round(net_pnl, 2),
+                    "gross_pnl": round(float(trade.pnl), 2),
+                    "net_pnl": round(net_pnl, 2),
+                    "commission": round(float(trade.pnl - net_pnl), 2),
+                    "bars_held": max(0, int((trade.barclose or 0) - (trade.baropen or 0))),
+                    "position_before_entry": 0.0,
+                    "position_after_entry": float(qty if direction == "LONG" else -qty),
+                    "position_before_exit": float(qty if direction == "LONG" else -qty),
+                    "position_after_exit": 0.0,
                 }
             )
         except Exception:
@@ -689,11 +853,23 @@ def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
             data_label = self._describe_data_label(data_obj)
 
             events.append(
-                "[OrderGuard] Blocked sell order "
-                f"at {timestamp} (data={data_label}, position_size={position_size}, "
-                f"short_enabled={short_enabled}, "
-                f"short_scaling_enabled={short_scaling_enabled}, "
-                f"reason={reason})."
+                {
+                    "event_id": f"guard_{len(events) + 1}",
+                    "time": timestamp,
+                    "action": "BLOCKED_SELL_FLAT" if abs(position_size) <= _POSITION_SIZE_TOLERANCE else "BLOCKED_SELL",
+                    "status": "BLOCKED",
+                    "requested_size": None,
+                    "executed_size": 0.0,
+                    "price": None,
+                    "reason": reason,
+                    "position_before": float(position_size),
+                    "position_after": float(position_size),
+                    "cash_before": None,
+                    "cash_after": None,
+                    "data": data_label,
+                    "short_enabled": bool(short_enabled),
+                    "short_scaling_enabled": bool(short_scaling_enabled),
+                }
             )
 
         def _record_sell_interpretation(
@@ -719,10 +895,23 @@ def _build_position_guarded_strategy(strategy_class: type[Any]) -> type[Any]:
             data_label = self._describe_data_label(data_obj)
 
             events.append(
-                f"{message} at {timestamp} "
-                f"(data={data_label}, position_size={position_size}, "
-                f"short_enabled={short_enabled}, "
-                f"short_scaling_enabled={short_scaling_enabled})."
+                {
+                    "event_id": f"guard_{len(events) + 1}",
+                    "time": timestamp,
+                    "action": "SELL_EXIT" if "LONG EXIT" in message else "SELL_SHORT",
+                    "status": "INFO",
+                    "requested_size": None,
+                    "executed_size": None,
+                    "price": None,
+                    "reason": message,
+                    "position_before": float(position_size),
+                    "position_after": float(position_size),
+                    "cash_before": None,
+                    "cash_after": None,
+                    "data": data_label,
+                    "short_enabled": bool(short_enabled),
+                    "short_scaling_enabled": bool(short_scaling_enabled),
+                }
             )
 
         def sell(self, *args: Any, **kwargs: Any) -> Any:
@@ -900,7 +1089,7 @@ def _write_dashboard_artifacts(
     symbol: str,
     final_value: float,
     config: dict[str, float],
-    trade_events: list[str],
+    trade_events: list[Any],
     closed_trades: list[dict[str, Any]],
 ) -> dict[str, Path]:
     log_dir = (
@@ -935,7 +1124,7 @@ def _write_dashboard_artifacts(
         normalized_rows.append(normalized)
     pd.DataFrame(normalized_rows, columns=trade_columns).to_csv(result_path, index=False)
 
-    event_lines = trade_events if trade_events else ["No trade events captured."]
+    event_lines = [str(item) for item in trade_events] if trade_events else ["No trade events captured."]
     log_path.write_text(
         "\n".join(
             [

@@ -74,6 +74,17 @@ const INGEST_INTERVALS = ['minute', '3minute', '5minute', '10minute', '15minute'
 const WORKSPACE_PANEL_HEIGHT = 760;
 const CONTROL_RAIL_MIN_WIDTH = 340;
 const QUEUE_SUBMIT_CONCURRENCY = 3;
+const EXECUTION_FIELD_HINTS: Record<string, string> = {
+  initial_cash: 'Starting portfolio capital used by the backtest engine before the first order.',
+  commission: 'Per-trade brokerage/fee rate applied to executed orders (for example 0.0003 = 0.03%).',
+  slippage: 'Extra execution price impact applied on fills to simulate real market friction.',
+  lot_size: 'Minimum tradable unit multiplier used when sizing orders.',
+  position_size: 'Base units submitted per entry signal before other constraints are applied.',
+  max_positions: 'Maximum simultaneous open positions allowed during execution.',
+  execution_mode: 'Order fill assumption: market fills on signal execution, close fills at bar close.',
+  max_retries: 'How many times the backend retries a failed run attempt before marking the task failed.',
+  task_timeout: 'Maximum allowed runtime in seconds for one backtest task before timeout.',
+};
 
 const STRATEGY_TEMPLATE = `import backtrader as bt
 
@@ -117,6 +128,28 @@ function entrySource(entry: CatalogEntry): string {
 
 function queueId(item: Omit<QueueItem, 'id'>): string {
   return `${item.instrument_token}|${item.timeframe}|${item.date_from}|${item.date_to}`;
+}
+
+function InfoIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M12 10.5V16" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="12" cy="7.5" r="1" fill="currentColor" />
+    </svg>
+  );
+}
+
+function HintLabel({ label, hint }: { label: string; hint: string }) {
+  return (
+    <label className="stat-label backtest-hint-label">
+      <span>{label}</span>
+      <span className="backtest-hint-anchor" tabIndex={0} aria-label={`${label} help`}>
+        <InfoIcon />
+      </span>
+      <span className="backtest-hint-tooltip" role="tooltip">{hint}</span>
+    </label>
+  );
 }
 
 function stemFromStrategy(strategy: Strategy | null): string {
@@ -1293,29 +1326,29 @@ export default function BacktestPage() {
           >
             <summary className="backtest-section-title backtest-section-title-nav">Execution Controls</summary>
             <div className="backtest-section-body">
-              <label className="stat-label">Initial Cash</label>
+              <HintLabel label="Initial Cash" hint={EXECUTION_FIELD_HINTS.initial_cash} />
               <input className="input" type="number" min={1} value={capital} onChange={(e) => setCapital(e.target.value)} />
-              <label className="stat-label">Commission</label>
+              <HintLabel label="Commission" hint={EXECUTION_FIELD_HINTS.commission} />
               <input className="input" type="number" step="0.0001" min={0} value={commission} onChange={(e) => setCommission(e.target.value)} />
-              <label className="stat-label">Slippage</label>
+              <HintLabel label="Slippage" hint={EXECUTION_FIELD_HINTS.slippage} />
               <input className="input" type="number" step="0.0001" min={0} value={slippage} onChange={(e) => setSlippage(e.target.value)} />
               <div className="grid grid-2 backtest-form-grid">
                 <div>
-                  <label className="stat-label">Lot Size</label>
+                  <HintLabel label="Lot Size" hint={EXECUTION_FIELD_HINTS.lot_size} />
                   <input className="input" type="number" min={1} value={lotSize} onChange={(e) => setLotSize(e.target.value)} />
                 </div>
                 <div>
-                  <label className="stat-label">Position Size</label>
+                  <HintLabel label="Position Size" hint={EXECUTION_FIELD_HINTS.position_size} />
                   <input className="input" type="number" min={1} value={positionSize} onChange={(e) => setPositionSize(e.target.value)} />
                 </div>
               </div>
               <div className="grid grid-2 backtest-form-grid">
                 <div>
-                  <label className="stat-label">Max Positions</label>
+                  <HintLabel label="Max Positions" hint={EXECUTION_FIELD_HINTS.max_positions} />
                   <input className="input" type="number" min={1} value={maxPositions} onChange={(e) => setMaxPositions(e.target.value)} />
                 </div>
                 <div>
-                  <label className="stat-label">Execution Mode</label>
+                  <HintLabel label="Execution Mode" hint={EXECUTION_FIELD_HINTS.execution_mode} />
                   <select value={executionMode} onChange={(e) => setExecutionMode(e.target.value)}>
                     <option value="market">market</option>
                     <option value="close">close</option>
@@ -1324,11 +1357,11 @@ export default function BacktestPage() {
               </div>
               <div className="grid grid-2 backtest-form-grid">
                 <div>
-                  <label className="stat-label">Max Retries</label>
+                  <HintLabel label="Max Retries" hint={EXECUTION_FIELD_HINTS.max_retries} />
                   <input className="input" type="number" min={0} value={maxRetries} onChange={(e) => setMaxRetries(e.target.value)} />
                 </div>
                 <div>
-                  <label className="stat-label">Task Timeout (s)</label>
+                  <HintLabel label="Task Timeout (s)" hint={EXECUTION_FIELD_HINTS.task_timeout} />
                   <input className="input" type="number" min={10} value={taskTimeoutSeconds} onChange={(e) => setTaskTimeoutSeconds(e.target.value)} />
                 </div>
               </div>

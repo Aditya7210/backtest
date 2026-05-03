@@ -37,18 +37,51 @@ export interface BacktestResult {
   final_value: number | null;
   metrics: Record<string, unknown>;
   trades: Trade[];
+  order_events?: OrderEvent[];
+  integrity?: Record<string, unknown>;
+  result_schema_version?: number;
   error_message: string | null;
   log_lines?: string[];
 }
 
 export interface Trade {
+  trade_id?: string;
+  instrument_token?: number | null;
+  symbol?: string;
   entry_date: string;
   exit_date: string;
   direction: string;
+  entry_action?: string;
+  exit_action?: string;
   entry_price: number;
   exit_price: number;
   pnl: number;
+  net_pnl?: number;
+  gross_pnl?: number;
+  commission?: number;
   size: number;
+  quantity?: number;
+  bars_held?: number;
+  status?: string;
+  position_before_entry?: number | null;
+  position_after_entry?: number | null;
+  position_before_exit?: number | null;
+  position_after_exit?: number | null;
+}
+
+export interface OrderEvent {
+  event_id?: string;
+  time: string;
+  action: string;
+  status: string;
+  requested_size?: number | null;
+  executed_size?: number | null;
+  price?: number | null;
+  reason?: string | null;
+  position_before?: number | null;
+  position_after?: number | null;
+  cash_before?: number | null;
+  cash_after?: number | null;
 }
 
 export interface Strategy {

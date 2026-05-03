@@ -1014,6 +1014,62 @@ textarea:focus {
   text-transform: none;
 }
 
+.backtest-page .backtest-hint-label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.backtest-page .backtest-hint-anchor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: #64748b;
+  cursor: help;
+}
+
+.backtest-page .backtest-hint-anchor:hover,
+.backtest-page .backtest-hint-anchor:focus-visible {
+  color: #4f46e5;
+  outline: none;
+}
+
+.backtest-page .backtest-hint-tooltip {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  min-width: 230px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  background: #ffffff;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.35;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(2px);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease,
+    visibility 0s linear 140ms;
+  z-index: 60;
+}
+
+.backtest-page .backtest-hint-label:hover .backtest-hint-tooltip,
+.backtest-page .backtest-hint-label:focus-within .backtest-hint-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition-delay: 2s, 2s, 2s;
+}
+
 .backtest-page .input,
 .backtest-page select,
 .backtest-page textarea {

@@ -21,6 +21,9 @@ async def create(task_id: str, config: dict[str, Any]) -> None:
         "final_value": None,
         "metrics": {},
         "trades": [],
+        "order_events": [],
+        "integrity": {},
+        "result_schema_version": 2,
         "data_gaps": None,
         "error_message": None,
         "log_lines": [],
@@ -35,6 +38,9 @@ async def update_result(task_id: str, result: dict[str, Any]) -> None:
         "final_value": result.get("final_value"),
         "metrics": result.get("metrics", {}),
         "trades": result.get("trades", []),
+        "order_events": result.get("order_events", []),
+        "integrity": result.get("integrity", {}),
+        "result_schema_version": int(result.get("result_schema_version", 2) or 2),
         "error_message": result.get("error_message"),
     }
     if status in ("COMPLETED", "FAILED"):
