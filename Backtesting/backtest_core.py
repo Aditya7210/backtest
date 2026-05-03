@@ -54,6 +54,11 @@ def extract_runtime_config(
     config = {
         "initial_capital": 100000.0,
         "commission": 0.0003,
+        "slippage": 0.0,
+        "lot_size": 1,
+        "position_size": 1,
+        "max_positions": 1,
+        "execution_mode": "market",
         "enforce_market_hours": True,
     }
     if isinstance(base_config, dict):
@@ -63,16 +68,36 @@ def extract_runtime_config(
 
     config["initial_capital"] = float(config["initial_capital"])
     config["commission"] = float(config["commission"])
+    config["slippage"] = float(config.get("slippage", 0.0))
+    config["lot_size"] = int(config.get("lot_size", 1))
+    config["position_size"] = int(config.get("position_size", 1))
+    config["max_positions"] = int(config.get("max_positions", 1))
+    config["execution_mode"] = str(config.get("execution_mode", "market") or "market").strip().lower()
     config["enforce_market_hours"] = bool(config.get("enforce_market_hours", True))
 
     if config["initial_capital"] <= 0:
         raise ValueError("initial_capital must be greater than 0")
     if config["commission"] < 0:
         raise ValueError("commission cannot be negative")
+    if config["slippage"] < 0:
+        raise ValueError("slippage cannot be negative")
+    if config["lot_size"] <= 0:
+        raise ValueError("lot_size must be greater than 0")
+    if config["position_size"] <= 0:
+        raise ValueError("position_size must be greater than 0")
+    if config["max_positions"] <= 0:
+        raise ValueError("max_positions must be greater than 0")
+    if config["execution_mode"] not in {"market", "close"}:
+        raise ValueError("execution_mode must be one of: market, close")
 
     return {
         "initial_capital": config["initial_capital"],
         "commission": config["commission"],
+        "slippage": config["slippage"],
+        "lot_size": config["lot_size"],
+        "position_size": config["position_size"],
+        "max_positions": config["max_positions"],
+        "execution_mode": config["execution_mode"],
         "enforce_market_hours": config["enforce_market_hours"],
     }
 
@@ -101,6 +126,8 @@ def build_success_result(
     final_value: float,
     *,
     log_file: str,
+    metrics: dict[str, Any] | None = None,
+    trades: list[dict[str, Any]] | None = None,
     execution_time: float = 0.0,
     retries: int = 0,
 ) -> dict[str, Any]:
@@ -108,6 +135,9 @@ def build_success_result(
         "symbol": symbol,
         "status": "SUCCESS",
         "final_value": float(final_value),
+        "metrics": dict(metrics or {}),
+        "trades": list(trades or []),
+        "closed_trades": list(trades or []),
         "log_file": str(log_file or ""),
         "error": None,
         "execution_time": max(0.0, float(execution_time)),
@@ -235,9 +265,20 @@ def execute_backtest_dataframe(
 
     initial_capital = float(config["initial_capital"])
     commission = float(config["commission"])
+    slippage = float(config.get("slippage", 0.0))
     _log_terminal(
         terminal,
         "Starting Backtest",
+        task_id=task_id,
+        symbol=symbol,
+    )
+    _log_terminal(
+        terminal,
+        (
+            f"Execution assumptions: mode={config.get('execution_mode')}, "
+            f"position_size={config.get('position_size')}, lot_size={config.get('lot_size')}, "
+            f"max_positions={config.get('max_positions')}, slippage={slippage}"
+        ),
         task_id=task_id,
         symbol=symbol,
     )
@@ -255,14 +296,20 @@ def execute_backtest_dataframe(
         symbol=symbol,
     )
     guarded_strategy_class = _build_position_guarded_strategy(strategy_class)
+    size_stake = max(1, int(config.get("position_size", 1)) * int(config.get("lot_size", 1)))
+    cerebro.addsizer(bt.sizers.FixedSize, stake=size_stake)
     cerebro.addstrategy(guarded_strategy_class)
     cerebro.addanalyzer(_TradeEventAnalyzer, _name="trade_events")
     cerebro.addanalyzer(_ClosedTradesAnalyzer, _name="closed_trades")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trade_stats")
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
+    # Uses annualized sharpe when possible; may be None for short/flat series.
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio_A, _name="sharpe", riskfreerate=0.0)
     _reset_cerebro_broker_state(
         cerebro,
         initial_capital=initial_capital,
         commission=commission,
+        slippage=slippage,
         terminal=terminal,
         task_id=task_id,
         symbol=symbol,
@@ -309,6 +356,9 @@ def execute_backtest_dataframe(
 
     trade_events: list[str] = []
     closed_trades: list[dict[str, Any]] = []
+    trade_stats: dict[str, Any] = {}
+    drawdown_stats: dict[str, Any] = {}
+    sharpe_stats: dict[str, Any] = {}
     if strategy_instance is not None:
         blocked_sell_events = getattr(strategy_instance, "_position_guard_events", [])
         if isinstance(blocked_sell_events, list):
@@ -366,9 +416,31 @@ def execute_backtest_dataframe(
                 )
 
         try:
-            trade_stats = strategy_instance.analyzers.trade_stats.get_analysis()
+            maybe_trade_stats = strategy_instance.analyzers.trade_stats.get_analysis()
+            if isinstance(maybe_trade_stats, dict):
+                trade_stats = maybe_trade_stats
+            else:
+                trade_stats = {}
         except Exception:
             trade_stats = {}
+
+        try:
+            maybe_drawdown = strategy_instance.analyzers.drawdown.get_analysis()
+            if isinstance(maybe_drawdown, dict):
+                drawdown_stats = maybe_drawdown
+            else:
+                drawdown_stats = {}
+        except Exception:
+            drawdown_stats = {}
+
+        try:
+            maybe_sharpe = strategy_instance.analyzers.sharpe.get_analysis()
+            if isinstance(maybe_sharpe, dict):
+                sharpe_stats = maybe_sharpe
+            else:
+                sharpe_stats = {}
+        except Exception:
+            sharpe_stats = {}
         total_trades = int(trade_stats.get("total", {}).get("total", 0)) if isinstance(trade_stats, dict) else 0
         if total_trades > 0:
             _log_terminal(
@@ -394,10 +466,49 @@ def execute_backtest_dataframe(
         trade_events=trade_events,
         closed_trades=closed_trades,
     )
+    initial_capital = float(config.get("initial_capital", 0.0) or 0.0)
+    net_pnl = final_value - initial_capital if initial_capital else None
+    return_pct = ((net_pnl / initial_capital) * 100.0) if initial_capital and net_pnl is not None else None
+    won = int(trade_stats.get("won", {}).get("total", 0)) if isinstance(trade_stats, dict) else 0
+    lost = int(trade_stats.get("lost", {}).get("total", 0)) if isinstance(trade_stats, dict) else 0
+    gross_profit = float(trade_stats.get("won", {}).get("pnl", {}).get("total", 0.0)) if isinstance(trade_stats, dict) else 0.0
+    gross_loss_raw = float(trade_stats.get("lost", {}).get("pnl", {}).get("total", 0.0)) if isinstance(trade_stats, dict) else 0.0
+    gross_loss = abs(gross_loss_raw)
+    trade_count = len(closed_trades)
+    win_rate = (won / trade_count * 100.0) if trade_count > 0 else 0.0
+    max_drawdown = None
+    try:
+        max_drawdown = float(drawdown_stats.get("max", {}).get("drawdown")) if isinstance(drawdown_stats, dict) else None
+    except Exception:
+        max_drawdown = None
+    sharpe_ratio = None
+    try:
+        raw_sharpe = sharpe_stats.get("sharperatio") if isinstance(sharpe_stats, dict) else None
+        sharpe_ratio = float(raw_sharpe) if raw_sharpe is not None else None
+    except Exception:
+        sharpe_ratio = None
+    metrics = {
+        "starting_value": initial_capital if initial_capital else None,
+        "final_value": final_value,
+        "net_pnl": net_pnl,
+        "return_pct": return_pct,
+        "total_trades": trade_count,
+        "winning_trades": won,
+        "losing_trades": lost,
+        "win_rate": win_rate,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
+        "max_drawdown": max_drawdown,
+        "sharpe_ratio": sharpe_ratio,
+        "trade_stats": trade_stats if isinstance(trade_stats, dict) else {},
+        "drawdown_stats": drawdown_stats if isinstance(drawdown_stats, dict) else {},
+        "sharpe_stats": sharpe_stats if isinstance(sharpe_stats, dict) else {},
+    }
     return build_success_result(
         symbol=symbol,
         final_value=final_value,
         log_file=str(artifacts["log_file"]),
+        metrics=metrics,
+        trades=closed_trades,
     )
 
 
@@ -676,6 +787,7 @@ def _reset_cerebro_broker_state(
     *,
     initial_capital: float,
     commission: float,
+    slippage: float,
     terminal: Any | None,
     task_id: str | None,
     symbol: str,
@@ -688,6 +800,14 @@ def _reset_cerebro_broker_state(
 
     cerebro.broker.setcash(float(initial_capital))
     cerebro.broker.setcommission(commission=float(commission))
+    if slippage > 0:
+        cerebro.broker.set_slippage_perc(
+            perc=float(slippage),
+            slip_open=True,
+            slip_limit=True,
+            slip_match=True,
+            slip_out=False,
+        )
     _log_terminal(
         terminal,
         "Broker state reset for isolated run",

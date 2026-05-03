@@ -13,8 +13,9 @@ import {
   getStrategySourceById,
   runBacktest,
   saveStrategy,
-  searchInstruments,
+  searchMapperInstruments,
   startHistoricalIngest,
+  updateMapperInstruments,
 } from '../services/api';
 import { useBacktestStore } from '../stores/backtestStore';
 import type {
@@ -25,7 +26,7 @@ import type {
   Strategy,
 } from '../types/backtest';
 
-type DataSourceFilter = 'all' | 'historical' | 'live' | 'mixed';
+type DataSourceMode = 'mongodb' | 'zerodha_api';
 
 interface QueueItem {
   id: string;
@@ -34,6 +35,17 @@ interface QueueItem {
   timeframe: string;
   date_from: string;
   date_to: string;
+  source: string;
+}
+
+interface CatalogSelectionOption {
+  id: string;
+  instrument_token: number;
+  tradingsymbol: string;
+  timeframe: string;
+  date_from: string;
+  date_to: string;
+  total_bars: number;
   source: string;
 }
 
@@ -49,6 +61,9 @@ const INTERVAL_TO_TIMEFRAME: Record<string, string> = {
 };
 
 const INGEST_INTERVALS = ['minute', '3minute', '5minute', '10minute', '15minute', '30minute', '60minute', 'day'];
+const WORKSPACE_PANEL_HEIGHT = 760;
+const CONTROL_RAIL_MIN_WIDTH = 340;
+const QUEUE_SUBMIT_CONCURRENCY = 3;
 
 const STRATEGY_TEMPLATE = `import backtrader as bt
 
@@ -72,11 +87,6 @@ function formatIst(value: string | null | undefined): string {
     second: '2-digit',
     hour12: false,
   }).format(dt);
-}
-
-function formatInr(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return '-';
-  return `INR ${value.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 }
 
 function parseToken(value: string): number | null {
@@ -107,18 +117,41 @@ function stemFromStrategy(strategy: Strategy | null): string {
 function canIngestInstrument(item: InstrumentSearchResult | null): boolean {
   if (!item) return false;
   const t = String(item.instrument_type || '').toUpperCase();
+  const segment = String(item.segment || '').toUpperCase();
+  if (segment === 'INDICES') return true;
   if (!t) return true;
-  return ['EQ', 'INDEX', 'ETF'].includes(t);
+  return ['EQ', 'INDEX', 'INDICES', 'ETF'].includes(t);
+}
+
+function instrumentCategory(item: InstrumentSearchResult): string {
+  const segment = String(item.segment || '').toUpperCase();
+  const instrumentType = String(item.instrument_type || '').toUpperCase();
+  const symbol = String(item.tradingsymbol || '').toUpperCase();
+  if (segment === 'INDICES' || instrumentType === 'INDEX' || symbol.includes('VIX')) return 'INDEX';
+  if (instrumentType === 'CE' || instrumentType === 'PE') return instrumentType;
+  if (instrumentType === 'FUT') return 'FUT';
+  if (symbol.includes('ETF')) return 'ETF';
+  if (instrumentType === 'EQ') return 'EQ';
+  return instrumentType || segment || 'OTHER';
+}
+
+function normalizeSource(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
+function normalizeStrategyNameInput(value: string): string {
+  const withoutExt = value.replace(/\.py$/i, '').trim();
+  const flattened = withoutExt.replace(/\s+/g, '_');
+  return flattened.replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 export default function BacktestPage() {
-  const { results, strategies, catalog, setResults, setStrategies, setCatalog, updateResult } = useBacktestStore();
+  const { strategies, catalog, setResults, setStrategies, setCatalog, updateResult } = useBacktestStore();
 
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
   const [executionLog, setExecutionLog] = useState<string[]>([]);
   const [runningTaskIds, setRunningTaskIds] = useState<string[]>([]);
-  const [selectedResultId, setSelectedResultId] = useState<string | null>(null);
 
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
   const [strategyName, setStrategyName] = useState('');
@@ -131,16 +164,22 @@ export default function BacktestPage() {
   const [versioningEnabled, setVersioningEnabled] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
 
-  const [dataSourceFilter, setDataSourceFilter] = useState<DataSourceFilter>('all');
+  const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>('mongodb');
   const [catalogQuery, setCatalogQuery] = useState('');
   const [instrumentToken, setInstrumentToken] = useState('');
   const [timeframe, setTimeframe] = useState('1day');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [selectedMongoOptionId, setSelectedMongoOptionId] = useState('');
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
 
   const [capital, setCapital] = useState('100000');
   const [commission, setCommission] = useState('0.0003');
+  const [slippage, setSlippage] = useState('0');
+  const [lotSize, setLotSize] = useState('1');
+  const [positionSize, setPositionSize] = useState('1');
+  const [maxPositions, setMaxPositions] = useState('1');
+  const [executionMode, setExecutionMode] = useState('market');
   const [maxRetries, setMaxRetries] = useState('0');
   const [taskTimeoutSeconds, setTaskTimeoutSeconds] = useState('300');
   const [enforceMarketHours, setEnforceMarketHours] = useState(true);
@@ -156,9 +195,11 @@ export default function BacktestPage() {
   const [ingestTo, setIngestTo] = useState('');
   const [ingestJob, setIngestJob] = useState<HistoricalIngestJob | null>(null);
   const [ingestStarting, setIngestStarting] = useState(false);
+  const [mapperUpdating, setMapperUpdating] = useState(false);
 
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const logCursor = useRef<Record<string, number>>({});
+  const ingestChunkCursor = useRef<Record<string, number>>({});
 
   const appendTerminal = (line: string) => {
     setExecutionLog((prev) => [...prev.slice(-1000), line]);
@@ -177,31 +218,37 @@ export default function BacktestPage() {
     [selectedCatalog, timeframe],
   );
 
-  const selectedResult = useMemo(
-    () => results.find((item) => item.task_id === selectedResultId) ?? null,
-    [results, selectedResultId],
-  );
-
   const filteredCatalog = useMemo(() => {
     const q = catalogQuery.trim().toUpperCase();
     return catalog.filter((entry) => {
-      const tfSources = new Set(
-        (entry.timeframes_available || [])
-          .map((tf) => String(tf.data_source || '').toLowerCase())
-          .filter(Boolean),
-      );
-      const sourceOk = dataSourceFilter === 'all'
-        ? true
-        : tfSources.has(dataSourceFilter)
-          || (dataSourceFilter === 'mixed' && tfSources.size > 1);
-      if (!sourceOk) return false;
       if (!q) return true;
-      return (
-        entry.tradingsymbol.toUpperCase().includes(q)
-        || String(entry.instrument_token).includes(q)
-      );
+      if (entry.tradingsymbol.toUpperCase().includes(q) || String(entry.instrument_token).includes(q)) return true;
+      return (entry.timeframes_available || []).some((tf) => {
+        const hay = `${tf.timeframe} ${tf.date_from} ${tf.date_to} ${tf.data_source || entrySource(entry)}`.toUpperCase();
+        return hay.includes(q);
+      });
     });
-  }, [catalog, catalogQuery, dataSourceFilter]);
+  }, [catalog, catalogQuery]);
+
+  const mongoOptions = useMemo<CatalogSelectionOption[]>(
+    () => filteredCatalog.flatMap((entry) =>
+      (entry.timeframes_available || []).map((tf) => ({
+        id: `${entry.instrument_token}|${tf.timeframe}|${tf.date_from}|${tf.date_to}`,
+        instrument_token: entry.instrument_token,
+        tradingsymbol: entry.tradingsymbol,
+        timeframe: tf.timeframe,
+        date_from: tf.date_from,
+        date_to: tf.date_to,
+        total_bars: tf.total_bars,
+        source: tf.data_source || entrySource(entry),
+      }))),
+    [filteredCatalog],
+  );
+
+  const selectedMongoOption = useMemo(
+    () => mongoOptions.find((option) => option.id === selectedMongoOptionId) ?? null,
+    [mongoOptions, selectedMongoOptionId],
+  );
 
   const timeframeOptions = useMemo(() => {
     const values = new Set((selectedCatalog?.timeframes_available || []).map((tf) => tf.timeframe));
@@ -209,7 +256,16 @@ export default function BacktestPage() {
     return Array.from(values);
   }, [selectedCatalog]);
 
-  const editorDirty = strategySource !== savedSource;
+  const editorDirty = normalizeSource(strategySource) !== normalizeSource(savedSource);
+
+  const ingestDisabledReason = useMemo(() => {
+    if (ingestStarting) return 'Ingestion already in progress.';
+    if (!selectedSearchInstrument) return 'Select one instrument from search results.';
+    if (!canIngestInstrument(selectedSearchInstrument)) return `Unsupported instrument type: ${selectedSearchInstrument.instrument_type || 'unknown'}.`;
+    if (!ingestFrom || !ingestTo) return 'Choose both from and to dates.';
+    if (ingestFrom > ingestTo) return 'From date cannot be after To date.';
+    return null;
+  }, [ingestStarting, selectedSearchInstrument, ingestFrom, ingestTo]);
 
   const connectTaskSocket = (taskId: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -269,6 +325,7 @@ export default function BacktestPage() {
     setTimeframe(tf.timeframe);
     setDateFrom(tf.date_from);
     setDateTo(tf.date_to);
+    setSelectedMongoOptionId(`${entry.instrument_token}|${tf.timeframe}|${tf.date_from}|${tf.date_to}`);
   };
 
   useEffect(() => {
@@ -300,6 +357,7 @@ export default function BacktestPage() {
             setTimeframe(firstTf.timeframe);
             setDateFrom(firstTf.date_from);
             setDateTo(firstTf.date_to);
+            setSelectedMongoOptionId(`${firstCatalog.instrument_token}|${firstTf.timeframe}|${firstTf.date_from}|${firstTf.date_to}`);
           }
         }
       } catch (e: unknown) {
@@ -323,7 +381,7 @@ export default function BacktestPage() {
       setEditorLoading(true);
       try {
         const strategy = strategies.find((s) => (s.relative_path || s.name) === selectedStrategyId) ?? null;
-        const fallbackName = strategy?.name || strategyName;
+        const fallbackName = strategy?.name || '';
         const [src, classesResp] = await Promise.all([
           getStrategySourceById(selectedStrategyId, fallbackName),
           getStrategyClassesById(selectedStrategyId, fallbackName),
@@ -337,11 +395,15 @@ export default function BacktestPage() {
         setStrategyClassName((prev) => (prev && classes.includes(prev) ? prev : (classes[0] || '')));
       } catch {
         try {
+          const strategy = strategies.find((s) => (s.relative_path || s.name) === selectedStrategyId) ?? null;
+          const legacyName = strategy?.name || '';
+          if (!legacyName) throw new Error('Strategy not found');
           const [src, classesResp] = await Promise.all([
-            getStrategySource(strategyName),
-            getStrategyClasses(strategyName),
+            getStrategySource(legacyName),
+            getStrategyClasses(legacyName),
           ]);
           if (!mounted) return;
+          setStrategyName(legacyName);
           setStrategySource(src.source || '');
           setSavedSource(src.source || '');
           const classes = classesResp.classes || [];
@@ -359,7 +421,7 @@ export default function BacktestPage() {
     return () => {
       mounted = false;
     };
-  }, [selectedStrategyId, strategies, strategyName]);
+  }, [selectedStrategyId, strategies]);
 
   useEffect(() => {
     if (!selectedCatalog || !selectedTfMeta) return;
@@ -369,6 +431,12 @@ export default function BacktestPage() {
   }, [selectedCatalog, selectedTfMeta, timeframeOptions, timeframe, dateFrom, dateTo]);
 
   useEffect(() => {
+    if (dataSourceMode !== 'zerodha_api') {
+      setSearchResults([]);
+      setSearchWarning(null);
+      setSelectedSearchInstrument(null);
+      return undefined;
+    }
     if (symbolQuery.trim().length < 2) {
       setSearchResults([]);
       setSearchWarning(symbolQuery.trim().length ? 'Type at least 2 characters to search.' : null);
@@ -378,7 +446,7 @@ export default function BacktestPage() {
     const timer = window.setTimeout(async () => {
       setSearchBusy(true);
       try {
-        const data = await searchInstruments(symbolQuery.trim(), 25);
+        const data = await searchMapperInstruments(symbolQuery.trim(), 40);
         if (!active) return;
         const items = (data.items || []) as InstrumentSearchResult[];
         setSearchResults(items);
@@ -394,7 +462,7 @@ export default function BacktestPage() {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [symbolQuery]);
+  }, [symbolQuery, dataSourceMode]);
 
   useEffect(() => {
     if (!ingestJob?.job_id) return undefined;
@@ -405,6 +473,15 @@ export default function BacktestPage() {
         const doc = await getHistoricalIngestJob(ingestJob.job_id);
         if (!active) return;
         const job = doc as unknown as HistoricalIngestJob;
+        const chunkSeen = ingestChunkCursor.current[job.job_id] ?? 0;
+        const chunkNow = Number(job.current_chunk ?? 0);
+        const totalChunks = Number(job.total_chunks ?? 0);
+        if (chunkNow > chunkSeen && totalChunks > 0) {
+          ingestChunkCursor.current[job.job_id] = chunkNow;
+          appendTerminal(
+            `[${formatIst(new Date().toISOString())}] [INFO] Ingest ${job.job_id}: chunk ${chunkNow}/${totalChunks}, rows=${job.rows ?? 0}.`,
+          );
+        }
         setIngestJob(job);
         if (job.status === 'COMPLETED' || job.status === 'NO_DATA' || job.status === 'FAILED') {
           if (job.status === 'COMPLETED') {
@@ -455,11 +532,12 @@ export default function BacktestPage() {
   }, [runningTaskIds, setResults]);
 
   const saveCurrentStrategy = async () => {
-    if (!strategyName.trim()) return;
+    const normalizedName = normalizeStrategyNameInput(strategyName);
+    if (!normalizedName) return;
     setEditorSaving(true);
     setPageError(null);
     try {
-      const resp = await saveStrategy(strategyName.trim(), strategySource, {
+      const resp = await saveStrategy(normalizedName, strategySource, {
         strategy_id: selectedStrategyId || null,
         versioning_enabled: versioningEnabled,
       });
@@ -475,7 +553,7 @@ export default function BacktestPage() {
         if (match) setStrategyName(stemFromStrategy(match));
       }
       setVersioningEnabled(false);
-      appendTerminal(`[${formatIst(new Date().toISOString())}] [SUCCESS] Saved strategy ${strategyName.trim()}.`);
+      appendTerminal(`[${formatIst(new Date().toISOString())}] [SUCCESS] Saved strategy ${normalizedName}.`);
     } catch (e: unknown) {
       setPageError(e instanceof Error ? e.message : 'Failed to save strategy');
     } finally {
@@ -484,7 +562,7 @@ export default function BacktestPage() {
   };
 
   const createNewStrategy = async () => {
-    const name = newStrategyName.trim();
+    const name = normalizeStrategyNameInput(newStrategyName);
     if (!name) return;
     try {
       const className = name.replace(/[^a-zA-Z0-9_]/g, '_') || 'NewStrategy';
@@ -544,13 +622,17 @@ export default function BacktestPage() {
       date_to: item.date_to,
       initial_capital: Number(capital),
       commission: Number(commission),
+      slippage: Number(slippage),
+      lot_size: Number(lotSize),
+      position_size: Number(positionSize),
+      max_positions: Number(maxPositions),
+      execution_mode: executionMode,
       max_retries: Number(maxRetries),
       task_timeout_seconds: Number(taskTimeoutSeconds),
       enforce_market_hours: enforceMarketHours,
     });
     const taskId = resp.task_id;
     setRunningTaskIds((prev) => [...prev, taskId]);
-    setSelectedResultId(taskId);
     appendTerminal(
       `[${formatIst(new Date().toISOString())}] [INFO] Submitted ${item.tradingsymbol} (${item.timeframe}) as task ${taskId}.`,
     );
@@ -589,10 +671,20 @@ export default function BacktestPage() {
     setQueueSubmitting(true);
     setPageError(null);
     try {
-      for (const item of queueItems) {
-        const { id: _id, ...requestItem } = item;
-        await submitRun(requestItem);
-      }
+      const queueSnapshot = [...queueItems];
+      let cursor = 0;
+      const workers = Array.from(
+        { length: Math.max(1, Math.min(QUEUE_SUBMIT_CONCURRENCY, queueSnapshot.length)) },
+        async () => {
+          while (cursor < queueSnapshot.length) {
+            const index = cursor;
+            cursor += 1;
+            const { id: _id, ...requestItem } = queueSnapshot[index];
+            await submitRun(requestItem);
+          }
+        },
+      );
+      await Promise.all(workers);
       setQueueItems([]);
       const refreshed = await getBacktests();
       setResults(refreshed.results as BacktestResult[]);
@@ -605,18 +697,11 @@ export default function BacktestPage() {
 
   const startIngest = async () => {
     setPageError(null);
-    if (!selectedSearchInstrument) {
-      setPageError('Select an instrument from search results first.');
+    if (ingestDisabledReason) {
+      setPageError(ingestDisabledReason);
       return;
     }
-    if (!canIngestInstrument(selectedSearchInstrument)) {
-      setPageError(`Unsupported instrument type for historical ingestion: ${selectedSearchInstrument.instrument_type || 'unknown'}.`);
-      return;
-    }
-    if (!ingestFrom || !ingestTo || ingestFrom > ingestTo) {
-      setPageError('Provide a valid historical ingestion date range.');
-      return;
-    }
+    if (!selectedSearchInstrument) return;
 
     setIngestStarting(true);
     try {
@@ -638,12 +723,52 @@ export default function BacktestPage() {
           interval: ingestInterval,
         },
       });
+      ingestChunkCursor.current[resp.job_id] = 0;
       appendTerminal(`[${formatIst(new Date().toISOString())}] [INFO] Started historical ingest job ${resp.job_id}.`);
     } catch (e: unknown) {
       setPageError(e instanceof Error ? e.message : 'Failed to start historical ingest');
     } finally {
       setIngestStarting(false);
     }
+  };
+
+  const refreshInstrumentMapper = async () => {
+    setMapperUpdating(true);
+    setPageError(null);
+    try {
+      const resp = await updateMapperInstruments();
+      appendTerminal(
+        `[${formatIst(new Date().toISOString())}] [SUCCESS] Instrument mapper updated. latest=${resp.rows_latest}, archive=${resp.rows_archive}.`,
+      );
+      if (symbolQuery.trim().length >= 2) {
+        const data = await searchMapperInstruments(symbolQuery.trim(), 40);
+        setSearchResults((data.items || []) as InstrumentSearchResult[]);
+        setSearchWarning((data.warning as string | null) || null);
+      }
+    } catch (e: unknown) {
+      setPageError(e instanceof Error ? e.message : 'Failed to update instrument mapper');
+    } finally {
+      setMapperUpdating(false);
+    }
+  };
+
+  const requestStrategySwitch = (nextId: string) => {
+    if (!nextId || nextId === selectedStrategyId) return;
+    if (editorDirty) {
+      const ok = window.confirm('You have unsaved strategy edits. Switch strategy and discard unsaved changes?');
+      if (!ok) return;
+    }
+    setSelectedStrategyId(nextId);
+    const strategy = strategies.find((s) => (s.relative_path || s.name) === nextId) ?? null;
+    setStrategyName(stemFromStrategy(strategy));
+  };
+
+  const clearMongoSelection = () => {
+    setSelectedMongoOptionId('');
+    setInstrumentToken('');
+    setTimeframe('1day');
+    setDateFrom('');
+    setDateTo('');
   };
 
   return (
@@ -664,13 +789,23 @@ export default function BacktestPage() {
       ) : null}
 
       <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 2.1fr) minmax(320px, 1fr)', marginBottom: 'var(--space-lg)' }}>
-        <div className="card">
+        <div className="card" style={{ height: WORKSPACE_PANEL_HEIGHT, display: 'flex', flexDirection: 'column' }}>
           <div className="card-header">
             <span className="card-title">Strategy Workspace</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                className="input"
+                style={{ width: 190 }}
+                placeholder="new_strategy_name"
+                value={newStrategyName}
+                onChange={(e) => setNewStrategyName(e.target.value)}
+              />
+              <button className="btn btn-topnav btn-sm" disabled={!normalizeStrategyNameInput(newStrategyName)} onClick={createNewStrategy}>
+                Create Strategy
+              </button>
               <span className={`badge ${editorDirty ? 'badge-warning' : 'badge-success'}`}>{editorDirty ? 'Dirty' : 'Saved'}</span>
-              <button className="btn btn-ghost btn-sm" disabled={!editorDirty || editorSaving} onClick={() => setStrategySource(savedSource)}>Revert</button>
-              <button className="btn btn-primary btn-sm" disabled={!editorDirty || editorSaving} onClick={saveCurrentStrategy}>
+              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving} onClick={() => setStrategySource(savedSource)}>Revert</button>
+              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving} onClick={saveCurrentStrategy}>
                 {editorSaving ? 'Saving...' : 'Save'}
               </button>
             </div>
@@ -682,10 +817,7 @@ export default function BacktestPage() {
               <select
                 value={selectedStrategyId}
                 onChange={(e) => {
-                  const id = e.target.value;
-                  setSelectedStrategyId(id);
-                  const strategy = strategies.find((s) => (s.relative_path || s.name) === id) ?? null;
-                  setStrategyName(stemFromStrategy(strategy));
+                  requestStrategySwitch(e.target.value);
                 }}
               >
                 <option value="">Select strategy...</option>
@@ -715,171 +847,181 @@ export default function BacktestPage() {
             <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} />
           </div>
 
-          {editorLoading ? (
-            <div style={{ color: 'var(--text-muted)' }}>Loading strategy source...</div>
-          ) : (
-            <CodeEditor value={strategySource} onChange={setStrategySource} height={640} />
-          )}
+          <div style={{ flex: 1, minHeight: 0 }}>
+            {editorLoading ? (
+              <div style={{ color: 'var(--text-muted)' }}>Loading strategy source...</div>
+            ) : (
+              <CodeEditor value={strategySource} onChange={setStrategySource} height={560} />
+            )}
+          </div>
 
-          {selectedResult ? (
-            <div className="card" style={{ marginTop: 'var(--space-md)', padding: 'var(--space-md)' }}>
-              <div className="card-header"><span className="card-title">Selected Result</span></div>
-              <div style={{ display: 'grid', gap: 6, fontSize: '0.84rem', color: 'var(--text-secondary)' }}>
-                <div><b>Task:</b> <span style={{ fontFamily: 'var(--font-mono)' }}>{selectedResult.task_id}</span></div>
-                <div><b>Status:</b> {selectedResult.status}</div>
-                <div><b>Final Value:</b> {formatInr(selectedResult.final_value)}</div>
-                <div><b>Started:</b> {formatIst(selectedResult.started_at)}</div>
-                <div><b>Completed:</b> {formatIst(selectedResult.completed_at)}</div>
-                {selectedResult.error_message ? <div style={{ color: 'var(--red)' }}><b>Error:</b> {selectedResult.error_message}</div> : null}
-                <div>
-                  <b>Metrics</b>
-                  <pre style={{ marginTop: 6, background: '#f8fafc', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 8, overflow: 'auto', maxHeight: 120 }}>
-                    {JSON.stringify(selectedResult.metrics || {}, null, 2)}
-                  </pre>
-                </div>
-                <div>
-                  <b>Trades</b>
-                  <div className="table-wrapper" style={{ maxHeight: 150, overflow: 'auto', marginTop: 6 }}>
-                    <table>
-                      <thead><tr><th>Entry</th><th>Exit</th><th>Dir</th><th>PNL</th></tr></thead>
-                      <tbody>
-                        {(selectedResult.trades || []).map((trade, idx) => (
-                          <tr key={`${selectedResult.task_id}-trade-${idx}`}>
-                            <td>{trade.entry_date}</td>
-                            <td>{trade.exit_date}</td>
-                            <td>{trade.direction}</td>
-                            <td style={{ color: trade.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>{trade.pnl.toFixed(2)}</td>
-                          </tr>
-                        ))}
-                        {!selectedResult.trades?.length ? <tr><td colSpan={4} style={{ textAlign: 'center' }}>No trades</td></tr> : null}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-                <div>
-                  <b>Result Logs</b>
-                  <div style={{ maxHeight: 130, overflow: 'auto', marginTop: 6, fontFamily: 'var(--font-mono)', fontSize: '0.76rem' }}>
-                    {(selectedResult.log_lines || []).length
-                      ? (selectedResult.log_lines || []).map((line, idx) => <div key={`${selectedResult.task_id}-log-${idx}`}>{line}</div>)
-                      : <span style={{ color: 'var(--text-muted)' }}>No logs</span>}
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : null}
         </div>
 
-        <div className="card">
+        <div className="card" style={{ height: WORKSPACE_PANEL_HEIGHT, minWidth: CONTROL_RAIL_MIN_WIDTH, display: 'flex', flexDirection: 'column' }}>
           <div className="card-header"><span className="card-title">Control Rail</span></div>
+          <div style={{ overflowY: 'auto', paddingRight: 6, minHeight: 0 }}>
 
           <details open>
             <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Data Selection</summary>
             <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
-              <select value={dataSourceFilter} onChange={(e) => setDataSourceFilter(e.target.value as DataSourceFilter)}>
-                <option value="all">All Sources</option>
-                <option value="historical">Historical</option>
-                <option value="live">Live</option>
-                <option value="mixed">Mixed</option>
+              <label className="stat-label">Source Mode</label>
+              <select value={dataSourceMode} onChange={(e) => setDataSourceMode(e.target.value as DataSourceMode)}>
+                <option value="mongodb">MongoDB</option>
+                <option value="zerodha_api">Zerodha API Data</option>
               </select>
-              <input className="input" placeholder="Search symbol/token" value={catalogQuery} onChange={(e) => setCatalogQuery(e.target.value)} />
 
-              {!catalog.length ? (
-                <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>
-                  Catalog is empty. Fetch historical data from Zerodha below to populate MongoDB first.
-                </div>
-              ) : null}
+              {dataSourceMode === 'mongodb' ? (
+                <>
+                  <label className="stat-label">Search Stored Datasets</label>
+                  <input
+                    className="input"
+                    placeholder="Search by symbol, token, timeframe, date range, source"
+                    value={catalogQuery}
+                    onChange={(e) => setCatalogQuery(e.target.value)}
+                  />
 
-              <div className="table-wrapper" style={{ maxHeight: 180, overflow: 'auto' }}>
-                <table>
-                  <thead><tr><th>Symbol</th><th>Token</th><th>TF</th><th>Range</th><th>Bars</th><th>Source</th></tr></thead>
-                  <tbody>
-                    {filteredCatalog.flatMap((entry) =>
-                      (entry.timeframes_available || []).map((tf) => (
-                        <tr
-                          key={`${entry.instrument_token}-${tf.timeframe}-${tf.date_from}-${tf.date_to}`}
-                          style={{ cursor: 'pointer', background: String(entry.instrument_token) === instrumentToken && tf.timeframe === timeframe ? 'rgba(37,99,235,0.08)' : undefined }}
-                          onClick={() => selectCatalogEntry(entry, tf)}
-                        >
-                          <td>{entry.tradingsymbol}</td>
-                          <td style={{ fontFamily: 'var(--font-mono)' }}>{entry.instrument_token}</td>
-                          <td>{tf.timeframe}</td>
-                          <td style={{ fontSize: '0.75rem' }}>{tf.date_from} to {tf.date_to}</td>
-                          <td style={{ fontFamily: 'var(--font-mono)' }}>{tf.total_bars.toLocaleString()}</td>
-                          <td>{tf.data_source || entrySource(entry)}</td>
-                        </tr>
-                      )),
-                    )}
-                    {!filteredCatalog.length ? <tr><td colSpan={6} style={{ textAlign: 'center' }}>No rows</td></tr> : null}
-                  </tbody>
-                </table>
-              </div>
-              <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
-                {timeframeOptions.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
-              </select>
-              <div className="grid grid-2" style={{ gap: 8 }}>
-                <input className="input" type="date" value={dateFrom} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateFrom(e.target.value)} />
-                <input className="input" type="date" value={dateTo} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateTo(e.target.value)} />
-              </div>
-            </div>
-          </details>
+                  {!catalog.length ? (
+                    <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+                      Catalog is empty. Switch to Zerodha API Data mode and fetch bars first.
+                    </div>
+                  ) : null}
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Fetch Historical Data from Zerodha</summary>
-            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
-              <input
-                className="input"
-                placeholder="Search symbol (e.g. RELIANCE)"
-                value={symbolQuery}
-                onChange={(e) => setSymbolQuery(e.target.value)}
-              />
-              {searchBusy ? <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>Searching instruments...</div> : null}
-              {searchWarning ? <div style={{ color: 'var(--amber)', fontSize: '0.8rem' }}>{searchWarning}</div> : null}
+                  {selectedMongoOption ? (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 8 }}>
+                      <b>Selected:</b> {selectedMongoOption.tradingsymbol} | token {selectedMongoOption.instrument_token} | {selectedMongoOption.timeframe} | {selectedMongoOption.date_from} to {selectedMongoOption.date_to} | {selectedMongoOption.source}
+                      <button className="btn btn-topnav btn-sm" style={{ marginLeft: 8 }} onClick={clearMongoSelection}>Clear</button>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                      No MongoDB dataset selected yet.
+                    </div>
+                  )}
 
-              <div className="table-wrapper" style={{ maxHeight: 150, overflow: 'auto' }}>
-                <table>
-                  <thead><tr><th>Symbol</th><th>Token</th><th>Type</th></tr></thead>
-                  <tbody>
-                    {searchResults.map((item) => (
-                      <tr
-                        key={`${item.instrument_token}-${item.tradingsymbol}`}
-                        style={{ cursor: 'pointer', background: selectedSearchInstrument?.instrument_token === item.instrument_token ? 'rgba(37,99,235,0.08)' : undefined }}
-                        onClick={() => setSelectedSearchInstrument(item)}
+                  <div style={{ maxHeight: 200, overflowY: 'auto', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 6, display: 'grid', gap: 6 }}>
+                    {mongoOptions.length ? mongoOptions.map((option) => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        className="btn btn-topnav btn-sm"
+                        style={{
+                          justifyContent: 'flex-start',
+                          textAlign: 'left',
+                          background: option.id === selectedMongoOptionId ? 'rgba(37,99,235,0.16)' : undefined,
+                        }}
+                        onMouseDown={() => {
+                          const entry = catalog.find((x) => x.instrument_token === option.instrument_token) ?? null;
+                          const tf = entry?.timeframes_available?.find((x) =>
+                            x.timeframe === option.timeframe && x.date_from === option.date_from && x.date_to === option.date_to);
+                          if (entry && tf) selectCatalogEntry(entry, tf);
+                        }}
                       >
-                        <td>{item.tradingsymbol}</td>
-                        <td style={{ fontFamily: 'var(--font-mono)' }}>{item.instrument_token}</td>
-                        <td>{item.instrument_type || '-'}</td>
-                      </tr>
-                    ))}
-                    {!searchResults.length ? <tr><td colSpan={3} style={{ textAlign: 'center' }}>No matches</td></tr> : null}
-                  </tbody>
-                </table>
-              </div>
+                        {option.tradingsymbol} | {option.instrument_token} | {option.timeframe} | {option.date_from} to {option.date_to} | bars {option.total_bars.toLocaleString()} | {option.source}
+                      </button>
+                    )) : (
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No matching datasets.</div>
+                    )}
+                  </div>
+                  <label className="stat-label">Timeframe</label>
+                  <select value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
+                    {timeframeOptions.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
+                  </select>
+                  <label className="stat-label">Date Range</label>
+                  <div className="grid grid-2" style={{ gap: 8 }}>
+                    <input className="input" type="date" value={dateFrom} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateFrom(e.target.value)} />
+                    <input className="input" type="date" value={dateTo} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateTo(e.target.value)} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                    Instrument search uses mapper files: <code>zerodha_instruments_latest.csv</code> + <code>zerodha_instruments_archive.csv</code>.
+                  </div>
+                  <label className="stat-label">Search Zerodha Instrument</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      className="input"
+                      style={{ flex: 1 }}
+                      placeholder="Search symbol (e.g. RELIANCE)"
+                      value={symbolQuery}
+                      onChange={(e) => setSymbolQuery(e.target.value)}
+                    />
+                    <button className="btn btn-topnav btn-sm" disabled={mapperUpdating} onClick={refreshInstrumentMapper}>
+                      {mapperUpdating ? 'Updating...' : 'Update Mapper'}
+                    </button>
+                  </div>
+                  {searchBusy ? <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>Searching instruments...</div> : null}
+                  {searchWarning ? <div style={{ color: 'var(--amber)', fontSize: '0.8rem' }}>{searchWarning}</div> : null}
 
-              <select value={ingestInterval} onChange={(e) => setIngestInterval(e.target.value)}>
-                {INGEST_INTERVALS.map((it) => <option key={it} value={it}>{it}</option>)}
-              </select>
-              <div className="grid grid-2" style={{ gap: 8 }}>
-                <input className="input" type="date" value={ingestFrom} onChange={(e) => setIngestFrom(e.target.value)} />
-                <input className="input" type="date" value={ingestTo} onChange={(e) => setIngestTo(e.target.value)} />
-              </div>
-              <button className="btn btn-primary btn-sm" disabled={ingestStarting} onClick={startIngest}>
-                {ingestStarting ? 'Starting...' : 'Fetch to MongoDB'}
-              </button>
-              {ingestJob ? (
-                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                  Job {ingestJob.job_id}: <b>{ingestJob.status}</b>
-                  {' | '}rows={ingestJob.rows ?? 0}
-                  {' | '}inserted={ingestJob.inserted ?? 0}
-                  {ingestJob.error_message ? ` | ${ingestJob.error_message}` : ''}
-                </div>
-              ) : null}
+                  {selectedSearchInstrument ? (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 8 }}>
+                      <b>Selected:</b> {selectedSearchInstrument.tradingsymbol} | token {selectedSearchInstrument.instrument_token} | {selectedSearchInstrument.exchange || '-'} | {selectedSearchInstrument.segment || '-'} | {selectedSearchInstrument.instrument_type || '-'} | {instrumentCategory(selectedSearchInstrument)}
+                      <button className="btn btn-topnav btn-sm" style={{ marginLeft: 8 }} onClick={() => setSelectedSearchInstrument(null)}>Clear</button>
+                      {instrumentCategory(selectedSearchInstrument) === 'INDEX' ? (
+                        <div style={{ marginTop: 6, color: 'var(--accent)', fontWeight: 600 }}>Index instrument selected</div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <div style={{ maxHeight: 170, overflowY: 'auto', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 6, display: 'grid', gap: 6 }}>
+                    {searchResults.length ? searchResults.map((item) => (
+                      <button
+                        key={`${item.instrument_token}-${item.tradingsymbol}-${item.segment || ''}-${item.expiry || ''}-${item.strike || ''}`}
+                        type="button"
+                        className="btn btn-topnav btn-sm"
+                        style={{
+                          justifyContent: 'flex-start',
+                          textAlign: 'left',
+                          background: selectedSearchInstrument?.instrument_token === item.instrument_token ? 'rgba(37,99,235,0.16)' : undefined,
+                        }}
+                        onMouseDown={() => {
+                          setSelectedSearchInstrument(item);
+                          if (!symbolQuery.trim()) setSymbolQuery(item.tradingsymbol);
+                        }}
+                      >
+                        {item.tradingsymbol} | {item.instrument_token} | {item.exchange || '-'} | {item.segment || '-'} | {item.instrument_type || '-'} | {instrumentCategory(item)} {item.expiry ? `| exp ${item.expiry}` : ''}
+                      </button>
+                    )) : (
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No matches</div>
+                    )}
+                  </div>
+
+                  <label className="stat-label">Interval</label>
+                  <select value={ingestInterval} onChange={(e) => setIngestInterval(e.target.value)}>
+                    {INGEST_INTERVALS.map((it) => <option key={it} value={it}>{it}</option>)}
+                  </select>
+                  <label className="stat-label">Fetch Date Range</label>
+                  <div className="grid grid-2" style={{ gap: 8 }}>
+                    <input className="input" type="date" value={ingestFrom} onChange={(e) => setIngestFrom(e.target.value)} />
+                    <input className="input" type="date" value={ingestTo} onChange={(e) => setIngestTo(e.target.value)} />
+                  </div>
+                  <button className="btn btn-topnav btn-sm" disabled={Boolean(ingestDisabledReason)} onClick={startIngest}>
+                    {ingestStarting ? 'Starting...' : 'Fetch to MongoDB'}
+                  </button>
+                  {ingestDisabledReason ? <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{ingestDisabledReason}</div> : null}
+                  {ingestJob ? (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      Job {ingestJob.job_id}: <b>{ingestJob.status}</b>
+                      {' | '}chunk={ingestJob.current_chunk ?? 0}/{ingestJob.total_chunks ?? 0}
+                      {' | '}rows={ingestJob.rows ?? 0}
+                      {' | '}inserted={ingestJob.inserted ?? 0}
+                      {ingestJob.error_message ? ` | ${ingestJob.error_message}` : ''}
+                    </div>
+                  ) : null}
+                </>
+              )}
             </div>
           </details>
 
           <details open>
             <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Strategy Selection</summary>
-            <div style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', marginBottom: 12 }}>
-              Strategy identity is path-stable via <code>strategy_id</code>, with class-level selection.
+            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+              <label className="stat-label">Selected Strategy ID</label>
+              <input className="input" value={selectedStrategyId || '-'} readOnly />
+              <label className="stat-label">Rename / Save Name</label>
+              <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} />
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                Saving uses safe rename rules and path-stable <code>strategy_id</code> resolution.
+              </div>
             </div>
           </details>
 
@@ -901,11 +1043,44 @@ export default function BacktestPage() {
           <details open>
             <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Execution Config</summary>
             <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
-              <input className="input" type="number" value={capital} onChange={(e) => setCapital(e.target.value)} placeholder="Initial Capital" />
-              <input className="input" type="number" step="0.0001" value={commission} onChange={(e) => setCommission(e.target.value)} placeholder="Commission" />
+              <label className="stat-label">Initial Cash</label>
+              <input className="input" type="number" min={1} value={capital} onChange={(e) => setCapital(e.target.value)} />
+              <label className="stat-label">Commission</label>
+              <input className="input" type="number" step="0.0001" min={0} value={commission} onChange={(e) => setCommission(e.target.value)} />
+              <label className="stat-label">Slippage</label>
+              <input className="input" type="number" step="0.0001" min={0} value={slippage} onChange={(e) => setSlippage(e.target.value)} />
               <div className="grid grid-2" style={{ gap: 8 }}>
-                <input className="input" type="number" min={0} value={maxRetries} onChange={(e) => setMaxRetries(e.target.value)} placeholder="Max Retries" />
-                <input className="input" type="number" min={10} value={taskTimeoutSeconds} onChange={(e) => setTaskTimeoutSeconds(e.target.value)} placeholder="Timeout (s)" />
+                <div>
+                  <label className="stat-label">Lot Size</label>
+                  <input className="input" type="number" min={1} value={lotSize} onChange={(e) => setLotSize(e.target.value)} />
+                </div>
+                <div>
+                  <label className="stat-label">Position Size</label>
+                  <input className="input" type="number" min={1} value={positionSize} onChange={(e) => setPositionSize(e.target.value)} />
+                </div>
+              </div>
+              <div className="grid grid-2" style={{ gap: 8 }}>
+                <div>
+                  <label className="stat-label">Max Positions</label>
+                  <input className="input" type="number" min={1} value={maxPositions} onChange={(e) => setMaxPositions(e.target.value)} />
+                </div>
+                <div>
+                  <label className="stat-label">Execution Mode</label>
+                  <select value={executionMode} onChange={(e) => setExecutionMode(e.target.value)}>
+                    <option value="market">market</option>
+                    <option value="close">close</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-2" style={{ gap: 8 }}>
+                <div>
+                  <label className="stat-label">Max Retries</label>
+                  <input className="input" type="number" min={0} value={maxRetries} onChange={(e) => setMaxRetries(e.target.value)} />
+                </div>
+                <div>
+                  <label className="stat-label">Task Timeout (s)</label>
+                  <input className="input" type="number" min={10} value={taskTimeoutSeconds} onChange={(e) => setTaskTimeoutSeconds(e.target.value)} />
+                </div>
               </div>
               <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
                 <input type="checkbox" checked={enforceMarketHours} onChange={(e) => setEnforceMarketHours(e.target.checked)} />
@@ -917,59 +1092,42 @@ export default function BacktestPage() {
           <details open>
             <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Execute Strategy</summary>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-              <button className="btn btn-ghost btn-sm" onClick={addSelectionToQueue}>Add to Queue</button>
-              <button className="btn btn-primary btn-sm" onClick={runNow} disabled={loading || !!runningTaskIds.length}>Run Now</button>
-              <button className="btn btn-primary btn-sm" onClick={handleRunQueue} disabled={queueSubmitting || !queueItems.length || !!runningTaskIds.length}>
+              <button className="btn btn-topnav btn-sm" onClick={addSelectionToQueue}>Add to Queue</button>
+              <button className="btn btn-topnav btn-sm" onClick={runNow} disabled={loading || !!runningTaskIds.length}>Run Now</button>
+              <button className="btn btn-topnav btn-sm" onClick={handleRunQueue} disabled={queueSubmitting || !queueItems.length || !!runningTaskIds.length}>
                 {queueSubmitting ? 'Running...' : `Run Queue (${queueItems.length})`}
+              </button>
+              <button className="btn btn-topnav btn-sm" onClick={() => setQueueItems([])} disabled={!queueItems.length || queueSubmitting}>
+                Clear Queue
               </button>
             </div>
             <div className="table-wrapper" style={{ maxHeight: 140, overflow: 'auto' }}>
               <table>
-                <thead><tr><th>Symbol</th><th>TF</th><th>Range</th></tr></thead>
+                <thead><tr><th>Symbol</th><th>TF</th><th>Range</th><th /></tr></thead>
                 <tbody>
                   {queueItems.map((item) => (
                     <tr key={item.id}>
                       <td>{item.tradingsymbol}</td>
                       <td>{item.timeframe}</td>
                       <td style={{ fontSize: '0.76rem' }}>{item.date_from} to {item.date_to}</td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          className="btn btn-topnav btn-sm"
+                          onClick={() => setQueueItems((prev) => prev.filter((x) => x.id !== item.id))}
+                          disabled={queueSubmitting}
+                        >
+                          Remove
+                        </button>
+                      </td>
                     </tr>
                   ))}
-                  {!queueItems.length ? <tr><td colSpan={3} style={{ textAlign: 'center' }}>Queue empty</td></tr> : null}
+                  {!queueItems.length ? <tr><td colSpan={4} style={{ textAlign: 'center' }}>Queue empty</td></tr> : null}
                 </tbody>
               </table>
             </div>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Create New Strategy</summary>
-            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
-              <input className="input" placeholder="Strategy name" value={newStrategyName} onChange={(e) => setNewStrategyName(e.target.value)} />
-              <button className="btn btn-ghost btn-sm" disabled={!newStrategyName.trim()} onClick={createNewStrategy}>Create</button>
-            </div>
-          </details>
-
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Strategy Result Loader</summary>
-            <div className="table-wrapper" style={{ maxHeight: 220, overflow: 'auto' }}>
-              <table>
-                <thead><tr><th>Status</th><th>Strategy</th><th>Value</th></tr></thead>
-                <tbody>
-                  {results.map((r) => (
-                    <tr
-                      key={r.task_id}
-                      style={{ cursor: 'pointer', background: selectedResultId === r.task_id ? 'rgba(37,99,235,0.08)' : undefined }}
-                      onClick={() => setSelectedResultId(r.task_id)}
-                    >
-                      <td>{r.status}</td>
-                      <td>{r.strategy_name}</td>
-                      <td style={{ fontFamily: 'var(--font-mono)' }}>{formatInr(r.final_value)}</td>
-                    </tr>
-                  ))}
-                  {!results.length ? <tr><td colSpan={3} style={{ textAlign: 'center' }}>No results</td></tr> : null}
-                </tbody>
-              </table>
-            </div>
-          </details>
+          </div>
         </div>
       </div>
 

@@ -48,18 +48,10 @@ Thumbs.db
 .agents/
 .claude/
 
-# Runtime/generated data (do not distribute)
+# Runtime/generated data only
 Data/live_market/daily/
 Data/live_market/snapshots/
 Data/live_market/collector_status.json
 Data/live_market/process_state.json
 Data/Logs/
 Data/testing_data/Data_files/Zerodha_data/
-Data/instrument_mapper_data/zerodha_instruments_latest.csv
-Data/instrument_mapper_data/zerodha_instruments_archive.csv
-
-# Local docs and reports
-CODEBASE.md
-Report.md
-system_map.md
-Audit.txt

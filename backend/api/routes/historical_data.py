@@ -77,6 +77,25 @@ async def search_instruments(
     return await instrument_repository.search_with_fallback(q.strip(), limit)
 
 
+@router.get("/instruments/mapper/search")
+async def search_instruments_mapper(
+    q: str = Query(default="", min_length=1),
+    limit: int = Query(default=20, ge=1, le=200),
+):
+    """Search mapper CSV files (latest + archive), preserving old tokens."""
+    return instrument_repository.search_mapper_files(q.strip(), limit)
+
+
+@router.post("/instruments/mapper/update")
+async def update_instruments_mapper():
+    """Refresh latest instrument file from Zerodha and merge into archive."""
+    try:
+        result = await asyncio.to_thread(instrument_repository.update_mapper_from_zerodha)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"Instrument mapper update failed: {exc}") from exc
+    return result
+
+
 @router.get("/historical/instruments/search")
 async def search_historical_instruments(
     q: str = Query(default="", min_length=1),
@@ -102,6 +121,8 @@ async def start_historical_ingest(request: HistoricalIngestRequest, background_t
         "request": request.model_dump(),
         "rows": 0,
         "inserted": 0,
+        "current_chunk": 0,
+        "total_chunks": 0,
         "error_message": None,
         "started_at": None,
         "completed_at": None,
@@ -128,6 +149,22 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
         {"$set": {"status": "RUNNING", "started_at": now_ist_iso(), "updated_at": now_ist_iso()}},
     )
     try:
+        from backend.database.sync_connection import get_sync_db
+
+        sync_db = get_sync_db()
+
+        def _progress_callback(progress: dict[str, Any]) -> None:
+            sync_db.historical_ingest_jobs.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "status": "RUNNING",
+                    "current_chunk": int(progress.get("current_chunk", 0)),
+                    "total_chunks": int(progress.get("total_chunks", 0)),
+                    "rows": int(progress.get("rows", 0)),
+                    "updated_at": now_ist_iso(),
+                }},
+            )
+
         result = await asyncio.to_thread(
             ingestion_manager.ingest,
             instrument_token=int(payload["instrument_token"]),
@@ -135,6 +172,7 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
             from_date=str(payload["from_date"]),
             to_date=str(payload["to_date"]),
             interval=str(payload["interval"]),
+            progress_callback=_progress_callback,
         )
         raw_status = str(result.get("status", "ok")).lower()
         if raw_status == "no_data":
@@ -148,6 +186,8 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
                 "status": status,
                 "rows": int(result.get("rows", 0)),
                 "inserted": int(result.get("inserted", 0)),
+                "current_chunk": int(result.get("current_chunk", 0)),
+                "total_chunks": int(result.get("total_chunks", 0)),
                 "error_message": None,
                 "completed_at": now_ist_iso(),
                 "updated_at": now_ist_iso(),

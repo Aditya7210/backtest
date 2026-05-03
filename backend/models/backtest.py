@@ -22,6 +22,11 @@ class BacktestRequest(BaseModel):
     date_to: str
     initial_capital: float = 100000
     commission: float = 0.0003
+    slippage: float = 0.0
+    lot_size: int = 1
+    position_size: int = 1
+    max_positions: int = 1
+    execution_mode: str = "market"
     max_retries: int = 0
     task_timeout_seconds: int = 300
     enforce_market_hours: bool = True

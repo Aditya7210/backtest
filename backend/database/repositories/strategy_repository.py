@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any
 
@@ -118,9 +119,14 @@ def save_source(
     safe_name = Path(name).name
     if "/" in safe_name or "\\" in safe_name or ".." in safe_name:
         return False, None
+    if not safe_name.strip():
+        return False, None
+    if not re.fullmatch(r"[A-Za-z0-9 _-]+", safe_name):
+        return False, None
 
     base_dir = get_strategies_dir()
     target: Path | None = None
+    original_path: Path | None = None
 
     if versioning_enabled:
         version_root = base_dir / "strategy_versioning"
@@ -139,12 +145,28 @@ def save_source(
         if strategy_id:
             path_by_id = get_strategy_path_by_id(strategy_id)
             if path_by_id is not None:
-                target = path_by_id
+                original_path = path_by_id
+                desired = path_by_id.with_name(f"{safe_name}.py")
+                desired_resolved = desired.resolve()
+                base_resolved = base_dir.resolve()
+                if base_resolved not in desired_resolved.parents:
+                    return False, None
+                # Rename intent when user changed save name.
+                if desired != path_by_id:
+                    if desired.exists() and desired != path_by_id:
+                        return False, None
+                    target = desired
+                else:
+                    target = path_by_id
         if target is None:
             target = base_dir / f"{safe_name}.py"
+            if target.exists() and strategy_id is None:
+                return False, None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(source, encoding="utf-8")
+    if original_path is not None and original_path != target and original_path.exists():
+        original_path.unlink()
     saved_id = str(target.relative_to(base_dir)).replace("\\", "/")
     return True, saved_id
 

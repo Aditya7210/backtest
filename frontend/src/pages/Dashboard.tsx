@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import LightweightCandlestickChart from '../components/LightweightCandlestickChart';
 import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
 import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
-import { computeIndicators, getBacktests, getCatalog, getHistoricalBars, getIndicators } from '../services/api';
+import { computeIndicators, getBacktest, getBacktests, getCatalog, getHistoricalBars, getIndicators } from '../services/api';
 import type { BacktestResult, CatalogEntry, Trade } from '../types/backtest';
 import type { IndicatorMetadata, IndicatorSelection, IndicatorSeries } from '../types/indicators';
 import type { OHLCVBar } from '../types/market';
@@ -37,6 +37,18 @@ interface DashboardModuleState {
   syncNonce: number;
 }
 
+interface DashboardKpis {
+  startingValue: number | null;
+  finalValue: number | null;
+  netPnl: number | null;
+  returnPct: number | null;
+  totalTrades: number | null;
+  winRate: number | null;
+  maxDrawdown: number | null;
+  sharpeRatio: number | null;
+  profitFactor: number | null;
+}
+
 const MAX_VISIBLE_CANDLES = 1400;
 
 function asObj(v: unknown): Record<string, unknown> {
@@ -50,6 +62,162 @@ function asNum(v: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
+}
+
+function pickFirstNumber(source: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    if (!(key in source)) continue;
+    const value = asNum(source[key]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
+function pickFirstText(source: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function normalizeDirection(value: unknown): string {
+  const raw = String(value ?? '').trim().toUpperCase();
+  if (raw === 'LONG' || raw === 'BUY') return 'BUY';
+  if (raw === 'SHORT' || raw === 'SELL') return 'SELL';
+  if (raw.includes('SELL')) return 'SELL';
+  if (raw.includes('BUY')) return 'BUY';
+  return raw || 'BUY';
+}
+
+function normalizeResultTrades(resultLike: unknown): Trade[] {
+  const root = asObj(resultLike);
+  const nestedResult = asObj(root.result);
+  const candidates: unknown[] = [
+    root.trades,
+    root.trade_log,
+    root.orders,
+    root.transactions,
+    nestedResult.trades,
+    nestedResult.trade_log,
+    nestedResult.orders,
+    nestedResult.transactions,
+  ];
+  const source = candidates.find((rows) => Array.isArray(rows));
+  if (!Array.isArray(source)) return [];
+
+  const normalized: Trade[] = [];
+  for (const row of source) {
+    const obj = asObj(row);
+    const entry_date = pickFirstText(obj, ['entry_date', 'Entry Date', 'entryDate', 'open_time', 'entry_time', 'timestamp']);
+    const exit_date = pickFirstText(obj, ['exit_date', 'Close Date', 'Exit Date', 'exitDate', 'close_time', 'exit_time']);
+    const direction = normalizeDirection(
+      pickFirstText(obj, ['direction', 'Direction', 'side', 'type']) || obj.direction || obj.Direction,
+    );
+    const entry_price = pickFirstNumber(obj, ['entry_price', 'Entry Price', 'entryPrice', 'price', 'buy_price']) ?? 0;
+    const exit_price = pickFirstNumber(obj, ['exit_price', 'Exit Price', 'close_price', 'sell_price']) ?? 0;
+    const pnl = pickFirstNumber(obj, ['pnl', 'Net P&L', 'net_pnl', 'profit', 'Gross P&L']) ?? 0;
+    const size = pickFirstNumber(obj, ['size', 'Qty', 'qty', 'quantity', 'volume']) ?? 0;
+    if (!entry_date && !exit_date) continue;
+    normalized.push({
+      entry_date,
+      exit_date,
+      direction,
+      entry_price,
+      exit_price,
+      pnl,
+      size,
+    });
+  }
+  return normalized;
+}
+
+function normalizeResultKpis(resultLike: unknown, trades: Trade[]): DashboardKpis {
+  const root = asObj(resultLike);
+  const metrics = asObj(root.metrics);
+  const summary = asObj(root.summary);
+  const performance = asObj(root.performance);
+  const analyzers = asObj(root.analyzers);
+  const nestedResult = asObj(root.result);
+  const nestedMetrics = asObj(nestedResult.metrics);
+  const nestedSummary = asObj(nestedResult.summary);
+  const tradeStats = asObj(metrics.trade_stats);
+  const tradeStatsTotal = asObj(asObj(tradeStats.total));
+  const tradeStatsWon = asObj(asObj(tradeStats.won));
+  const drawdownAnalyzer = asObj(analyzers.drawdown);
+  const sharpeAnalyzer = asObj(analyzers.sharpe);
+  const config = asObj(root.config);
+
+  const merged = {
+    ...nestedSummary,
+    ...nestedMetrics,
+    ...summary,
+    ...performance,
+    ...metrics,
+    ...root,
+  };
+
+  const startingValue =
+    pickFirstNumber(merged, ['starting_value', 'start_value', 'initial_capital', 'starting_capital'])
+    ?? asNum(config.initial_capital);
+  const finalValue =
+    pickFirstNumber(merged, ['final_value', 'ending_value', 'final_portfolio_value'])
+    ?? asNum(root.final_value);
+  const totalTrades =
+    pickFirstNumber(merged, ['total_trades', 'trade_count'])
+    ?? asNum(tradeStatsTotal.total)
+    ?? trades.length;
+  const winningTrades =
+    pickFirstNumber(merged, ['winning_trades', 'wins'])
+    ?? asNum(tradeStatsWon.total)
+    ?? trades.filter((t) => t.pnl > 0).length;
+  const winRate =
+    pickFirstNumber(merged, ['win_rate', 'win_rate_pct'])
+    ?? (totalTrades && totalTrades > 0 ? (winningTrades / totalTrades) * 100 : null);
+  const maxDrawdown =
+    pickFirstNumber(merged, ['max_drawdown', 'max_drawdown_pct', 'drawdown'])
+    ?? pickFirstNumber(drawdownAnalyzer, ['max_drawdown', 'drawdown', 'max'])
+    ?? pickFirstNumber(asObj(drawdownAnalyzer.max), ['drawdown']);
+  const sharpeRatio =
+    pickFirstNumber(merged, ['sharpe_ratio', 'sharpe'])
+    ?? pickFirstNumber(sharpeAnalyzer, ['sharpe', 'ratio']);
+  const profitFactor =
+    pickFirstNumber(merged, ['profit_factor'])
+    ?? (() => {
+      const gp = pickFirstNumber(merged, ['gross_profit', 'gross_pnl_positive']);
+      const gl = pickFirstNumber(merged, ['gross_loss', 'gross_pnl_negative']);
+      if (gp == null || gl == null || gl === 0) return null;
+      return Math.abs(gp / gl);
+    })();
+
+  const netPnl =
+    pickFirstNumber(merged, ['net_pnl', 'net_profit'])
+    ?? (startingValue != null && finalValue != null ? finalValue - startingValue : null);
+  const returnPct =
+    pickFirstNumber(merged, ['return_pct', 'returns_pct', 'return_percentage'])
+    ?? (startingValue != null && finalValue != null && startingValue !== 0
+      ? ((finalValue - startingValue) / startingValue) * 100
+      : null);
+
+  return {
+    startingValue,
+    finalValue,
+    netPnl,
+    returnPct,
+    totalTrades,
+    winRate,
+    maxDrawdown,
+    sharpeRatio,
+    profitFactor,
+  };
+}
+
+function formatMetricValue(value: number | null, kind: 'currency' | 'percent' | 'number' | 'ratio'): string {
+  if (value == null || !Number.isFinite(value)) return 'N/A';
+  if (kind === 'currency') return new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(value);
+  if (kind === 'percent') return `${value.toFixed(2)}%`;
+  if (kind === 'ratio') return value.toFixed(2);
+  return new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(value);
 }
 
 function toUnixSeconds(value: unknown): number | null {
@@ -327,6 +495,9 @@ function DashboardModule({
   const [bars, setBars] = useState<OHLCVBar[]>([]);
   const [loadingBars, setLoadingBars] = useState(false);
   const [barError, setBarError] = useState<string | null>(null);
+  const [resultLoading, setResultLoading] = useState(false);
+  const [resultError, setResultError] = useState<string | null>(null);
+  const [selectedResultDetail, setSelectedResultDetail] = useState<BacktestResult | null>(null);
   const [indicatorSeries, setIndicatorSeries] = useState<IndicatorSeries[]>([]);
   const [indicatorWarning, setIndicatorWarning] = useState<string | null>(null);
   const [loadingIndicators, setLoadingIndicators] = useState(false);
@@ -340,17 +511,68 @@ function DashboardModule({
     () => priceOptions.find((p) => p.id === module.priceId) ?? null,
     [priceOptions, module.priceId],
   );
-  const selectedResult = useMemo(
+  const selectedResultSummary = useMemo(
     () => results.find((r) => r.task_id === module.tradeTaskId) ?? null,
     [results, module.tradeTaskId],
   );
-  const selectedTrades: Trade[] = selectedResult?.trades || [];
+  const selectedResult = selectedResultDetail ?? selectedResultSummary;
+  const selectedTrades: Trade[] = useMemo(
+    () => normalizeResultTrades(selectedResult),
+    [selectedResult],
+  );
+  const selectedKpis = useMemo(
+    () => normalizeResultKpis(selectedResult, selectedTrades),
+    [selectedResult, selectedTrades],
+  );
 
   const indicatorMetaMap = useMemo(() => {
     const map = new Map<string, IndicatorMetadata>();
     for (const meta of indicatorMeta) map.set(meta.name, meta);
     return map;
   }, [indicatorMeta]);
+
+  useEffect(() => {
+    let active = true;
+    if (!module.tradeTaskId) {
+      setSelectedResultDetail(null);
+      setResultLoading(false);
+      setResultError(null);
+      return undefined;
+    }
+    const fetchDetail = async () => {
+      setResultLoading(true);
+      setResultError(null);
+      setSelectedResultDetail(null);
+      try {
+        const response = await getBacktest(module.tradeTaskId);
+        if (!active) return;
+        setSelectedResultDetail(response as BacktestResult);
+      } catch (e: unknown) {
+        if (!active) return;
+        setResultError(e instanceof Error ? e.message : 'Failed to load result detail');
+      } finally {
+        if (active) setResultLoading(false);
+      }
+    };
+    fetchDetail();
+    return () => {
+      active = false;
+    };
+  }, [module.tradeTaskId]);
+
+  useEffect(() => {
+    if (!selectedResult?.data_selection) return;
+    if (selectedPrice) return;
+    const ds = selectedResult.data_selection;
+    const match = findPriceOptionByTokenAndTimeframe(
+      priceOptions,
+      ds.instrument_token,
+      ds.timeframe,
+    );
+    if (match && match.id !== module.priceId) {
+      onUpdate(module.id, { priceId: match.id });
+    }
+  }, [selectedResult, selectedPrice, priceOptions, module.id, module.priceId, onUpdate]);
 
   useEffect(() => {
     let active = true;
@@ -701,6 +923,45 @@ function DashboardModule({
         ))}
       </div>
 
+      <div className="trd-kpi-row">
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Final Value</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.finalValue, 'currency')}</span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Net PnL</span>
+          <span className={`trd-kpi-value ${selectedKpis.netPnl != null && selectedKpis.netPnl < 0 ? 'neg' : 'pos'}`}>
+            {formatMetricValue(selectedKpis.netPnl, 'currency')}
+          </span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Return</span>
+          <span className={`trd-kpi-value ${selectedKpis.returnPct != null && selectedKpis.returnPct < 0 ? 'neg' : 'pos'}`}>
+            {formatMetricValue(selectedKpis.returnPct, 'percent')}
+          </span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Trades</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.totalTrades, 'number')}</span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Win Rate</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.winRate, 'percent')}</span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Max DD</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.maxDrawdown, 'percent')}</span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Sharpe</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.sharpeRatio, 'ratio')}</span>
+        </div>
+        <div className="trd-kpi-item">
+          <span className="trd-kpi-label">Profit Factor</span>
+          <span className="trd-kpi-value">{formatMetricValue(selectedKpis.profitFactor, 'ratio')}</span>
+        </div>
+      </div>
+
       {activeParamEditId ? (
         <div className="trd-param-panel">
           {module.selectedIndicators.filter((x) => x.id === activeParamEditId).map((selected) => {
@@ -739,6 +1000,8 @@ function DashboardModule({
       ) : null}
 
       {mismatchWarning ? <div className="trd-warning">{mismatchWarning}</div> : null}
+      {resultLoading ? <div className="trd-muted">Loading selected result output...</div> : null}
+      {resultError ? <div className="trd-error">{resultError}</div> : null}
       {barError ? (
         <div className="trd-error">
           {barError} | Try switching timeframe or refresh catalog data.
@@ -842,7 +1105,7 @@ function DashboardModule({
                 </tr>
               </thead>
               <tbody>
-                {(loadingBars || loadingIndicators) ? (
+                {(loadingBars || loadingIndicators || resultLoading) ? (
                   Array.from({ length: 8 }).map((_, idx) => (
                     <tr key={`${module.id}-skeleton-${idx}`}>
                       <td colSpan={6}><div className="trd-skeleton trd-skeleton-row" /></td>
@@ -864,7 +1127,7 @@ function DashboardModule({
                 ) : (
                   <tr>
                     <td colSpan={6} style={{ textAlign: 'center', color: '#64748b', padding: 14 }}>
-                      No trades selected
+                      {module.tradeTaskId ? 'No trades found in selected result' : 'No trades selected'}
                     </td>
                   </tr>
                 )}
@@ -1165,6 +1428,35 @@ export default function Dashboard() {
           cursor: pointer;
           padding: 0;
         }
+        .trd-kpi-row {
+          margin-top: 8px;
+          display: grid;
+          grid-template-columns: repeat(8, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .trd-kpi-item {
+          border: 1px solid #F1F5F9;
+          border-radius: 8px;
+          padding: 8px;
+          background: transparent;
+          display: grid;
+          gap: 4px;
+          min-height: 58px;
+        }
+        .trd-kpi-label {
+          font-size: 11px;
+          color: #64748b;
+          text-transform: uppercase;
+          letter-spacing: 0.02em;
+        }
+        .trd-kpi-value {
+          font-size: 13px;
+          color: #0f172a;
+          font-weight: 600;
+          font-family: var(--font-mono);
+        }
+        .trd-kpi-value.pos { color: #0f766e; }
+        .trd-kpi-value.neg { color: #b91c1c; }
         .trd-param-panel {
           margin-top: 8px;
           border: 1px solid #F1F5F9;
@@ -1333,6 +1625,7 @@ export default function Dashboard() {
           .trd-toolbar { grid-template-columns: 1fr; }
           .trd-main-grid { grid-template-columns: 1fr; }
           .trd-trade-pane { min-height: 300px; }
+          .trd-kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .trd-param-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         }
       `}</style>

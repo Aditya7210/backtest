@@ -486,6 +486,19 @@ body {
   font-size: 0.95rem;
 }
 
+.btn-topnav {
+  background: rgba(15, 23, 42, 0.9);
+  border-color: rgba(148, 163, 184, 0.28);
+  color: #e2e8f0;
+  border-radius: 999px;
+}
+
+.btn-topnav:hover:not(:disabled) {
+  color: #ffffff;
+  background: rgba(15, 23, 42, 0.98);
+  border-color: rgba(203, 213, 225, 0.45);
+}
+
 .grid {
   display: grid;
   gap: var(--space-lg);

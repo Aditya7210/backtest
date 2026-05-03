@@ -49,6 +49,8 @@ export default function ZerodhaAuthPage() {
   const [loginUrl, setLoginUrl] = useState<string>('');
   const [openingLogin, setOpeningLogin] = useState(false);
   const [generatingToken, setGeneratingToken] = useState(false);
+  const hudBg = '/photos/zerodha-hud-bg.png';
+  const brandLogo = '/photos/unlisted-edge-logo.png';
 
   const fetchAuth = useCallback(async () => {
     const authState = await getAuthStatus();
@@ -148,19 +150,22 @@ export default function ZerodhaAuthPage() {
     <div className="za-auth-shell">
       <style>{`
         .za-auth-shell {
-          width: 100vw;
-          height: 100%;
+          width: 100%;
+          height: calc(100vh - 56px);
           min-height: calc(100vh - 56px);
+          max-height: calc(100vh - 56px);
           display: grid;
           grid-template-columns: 42% 58%;
           background: #ffffff;
           color: #0f172a;
           font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          overflow: hidden;
         }
         .za-left {
           padding: 28px 36px 28px 40px;
           display: flex;
           flex-direction: column;
+          overflow: hidden;
         }
         .za-topbar {
           display: flex;
@@ -171,10 +176,20 @@ export default function ZerodhaAuthPage() {
           margin-bottom: 26px;
         }
         .za-logo {
-          width: 20px;
-          height: 20px;
-          border-radius: 5px;
-          background: linear-gradient(135deg, #4f46e5, #7c3aed);
+          width: 28px;
+          height: 28px;
+          border-radius: 999px;
+          border: 1px solid #dbe2f0;
+          overflow: hidden;
+          background: #ffffff;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .za-logo img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
         }
         .za-system {
           font-size: 13px;
@@ -380,67 +395,86 @@ export default function ZerodhaAuthPage() {
         .za-right {
           position: relative;
           overflow: hidden;
-          background:
-            radial-gradient(circle at 58% 45%, rgba(99, 102, 241, 0.09), rgba(255,255,255,0) 54%),
-            #ffffff;
+          background-position: center;
+          background-size: cover;
+          background-repeat: no-repeat;
         }
-        .za-ring {
+        .za-right-fade {
           position: absolute;
-          border-radius: 50%;
-          border: 1px solid rgba(100, 116, 139, 0.16);
+          inset: 0;
+          background: linear-gradient(90deg, rgba(255,255,255,0.72), rgba(255,255,255,0.26));
         }
-        .za-ring.r1 { width: 640px; height: 640px; right: 10%; top: 50%; transform: translateY(-50%); }
-        .za-ring.r2 { width: 520px; height: 520px; right: 16%; top: 50%; transform: translateY(-50%); border-style: dashed; }
-        .za-ring.r3 { width: 400px; height: 400px; right: 22%; top: 50%; transform: translateY(-50%); }
         .za-core {
           position: absolute;
-          width: 170px;
-          height: 170px;
+          width: 190px;
+          height: 190px;
           border-radius: 50%;
-          border: 1px solid rgba(100, 116, 139, 0.2);
-          right: 35.5%;
-          top: 50%;
-          transform: translateY(-50%);
+          left: 48%;
+          top: 57%;
+          transform: translate(-50%, -50%);
           display: flex;
+          flex-direction: column;
           align-items: center;
           justify-content: center;
-          color: #1d4ed8;
+          color: #2563eb;
           font-weight: 700;
-          font-size: 15px;
+          font-size: 14px;
           letter-spacing: 0.06em;
-          background: rgba(255,255,255,0.92);
+          background: rgba(255,255,255,0.95);
+          border: 1px solid rgba(100, 116, 139, 0.14);
+          box-shadow: 0 18px 34px rgba(15, 23, 42, 0.12);
+        }
+        .za-core-logo {
+          width: 350px;
+          height: 350px;
+          border-radius: 50%;
+          object-fit: cover;
+          border: 1px solid #dbe2f0;
+          background: #ffffff;
         }
         .za-lock {
           position: absolute;
-          width: 68px;
-          height: 68px;
+          width: 66px;
+          height: 66px;
           border-radius: 16px;
-          background: linear-gradient(135deg, #818cf8, #7c3aed);
+          background: linear-gradient(135deg, #a78bfa, #7c3aed);
           color: #ffffff;
           display: flex;
           align-items: center;
           justify-content: center;
-          font-size: 26px;
-          left: 16%;
-          top: 58%;
-          opacity: 0.9;
+          left: 17%;
+          top: 60%;
+          opacity: 0.92;
+          box-shadow: 0 12px 24px rgba(124, 58, 237, 0.25);
         }
-        .za-flowline {
+        .za-lock svg {
+          width: 28px;
+          height: 28px;
+        }
+        .za-right-foot {
           position: absolute;
-          height: 1px;
-          background: linear-gradient(90deg, rgba(79,70,229,0), rgba(79,70,229,0.24), rgba(79,70,229,0));
-          opacity: 0.65;
+          left: 50%;
+          bottom: 40px;
+          transform: translateX(-50%);
+          display: inline-flex;
+          align-items: center;
+          gap: 18px;
+          color: #8ea0bd;
+          font-size: 13px;
+          font-weight: 500;
         }
-        .za-flowline.l1 { width: 300px; left: 22%; top: 55%; }
-        .za-flowline.l2 { width: 220px; left: 28%; top: 61%; }
-        .za-candle {
-          position: absolute;
-          right: 8%;
-          bottom: 14%;
-          width: 36%;
-          opacity: 0.17;
+        .za-right-foot-item {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
         }
-        .za-candle svg { width: 100%; height: auto; }
+        .za-right-foot-item span {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #9fb2d6;
+          display: inline-block;
+        }
 
         @keyframes zaPulse {
           0% { transform: scale(0.86); opacity: 0.72; }
@@ -453,23 +487,23 @@ export default function ZerodhaAuthPage() {
         @media (max-width: 1100px) {
           .za-auth-shell {
             grid-template-columns: 1fr;
-            min-height: auto;
+            height: calc(100vh - 56px);
+            min-height: calc(100vh - 56px);
+            max-height: calc(100vh - 56px);
           }
           .za-left { padding: 20px; }
-          .za-right { min-height: 320px; }
-          .za-ring.r1 { width: 400px; height: 400px; right: 50%; transform: translate(50%, -50%); }
-          .za-ring.r2 { width: 320px; height: 320px; right: 50%; transform: translate(50%, -50%); }
-          .za-ring.r3 { width: 240px; height: 240px; right: 50%; transform: translate(50%, -50%); }
-          .za-core { right: 50%; transform: translate(50%, -50%); }
-          .za-lock { left: 22%; top: 64%; }
-          .za-flowline.l1, .za-flowline.l2 { display: none; }
-          .za-candle { width: 62%; right: 19%; bottom: 10%; }
+          .za-right { min-height: 0; }
+          .za-core { left: 50%; transform: translate(-50%, -50%); }
+          .za-lock { left: 16%; top: 66%; }
+          .za-right-foot { bottom: 18px; gap: 12px; font-size: 12px; }
         }
       `}</style>
 
       <section className="za-left">
         <div className="za-topbar">
-          <div className="za-logo" />
+          <div className="za-logo">
+            <img src={brandLogo} alt="Unlisted Edge" />
+          </div>
           <div className="za-system">Algo Trading System</div>
         </div>
 
@@ -548,19 +582,21 @@ export default function ZerodhaAuthPage() {
         </div>
       </section>
 
-      <section className="za-right" aria-hidden="true">
-        <div className="za-ring r1" />
-        <div className="za-ring r2" />
-        <div className="za-ring r3" />
-        <div className="za-core">ZERODHA</div>
-        <div className="za-lock">🔒</div>
-        <div className="za-flowline l1" />
-        <div className="za-flowline l2" />
-        <div className="za-candle">
-          <svg viewBox="0 0 260 180" xmlns="http://www.w3.org/2000/svg" fill="none">
-            <path d="M6 168h248" stroke="#cdd5e8" />
-            <path d="M24 154v-25m20 20v-33m20 16V86m20 21V79m20 30V74m20 16V60m20 34V64m20 18V50m20 39V60m20 15V52" stroke="#8f9bd6" strokeWidth="3" strokeLinecap="round" />
+      <section className="za-right" aria-hidden="true" style={{ backgroundImage: `url(${hudBg})` }}>
+        <div className="za-right-fade" />
+        <div className="za-core">
+          <img className="za-core-logo" src={brandLogo} alt="Unlisted Edge" />
+        </div>
+        <div className="za-lock">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M7.5 10V8.5a4.5 4.5 0 1 1 9 0V10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+            <rect x="5" y="10" width="14" height="10" rx="2.5" stroke="currentColor" strokeWidth="1.8" />
           </svg>
+        </div>
+        <div className="za-right-foot">
+          <div className="za-right-foot-item"><span />Secure</div>
+          <div className="za-right-foot-item"><span />Encrypted</div>
+          <div className="za-right-foot-item"><span />Real-time</div>
         </div>
       </section>
     </div>

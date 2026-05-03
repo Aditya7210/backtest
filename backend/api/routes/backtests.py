@@ -15,6 +15,73 @@ from backend.models.backtest import BacktestRequest
 router = APIRouter(tags=["backtests"])
 
 
+def _to_float(value: Any) -> float | None:
+    try:
+        num = float(value)
+    except Exception:
+        return None
+    return num
+
+
+def _normalize_trade_rows(raw_rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        direction = str(
+            row.get("direction")
+            or row.get("Direction")
+            or row.get("side")
+            or "BUY",
+        ).upper()
+        normalized.append({
+            "entry_date": str(row.get("entry_date") or row.get("Entry Date") or row.get("entryDate") or ""),
+            "exit_date": str(row.get("exit_date") or row.get("Close Date") or row.get("Exit Date") or ""),
+            "direction": "SELL" if "SELL" in direction or "SHORT" in direction else "BUY",
+            "entry_price": _to_float(row.get("entry_price") or row.get("Entry Price") or row.get("entryPrice")) or 0.0,
+            "exit_price": _to_float(row.get("exit_price") or row.get("Exit Price") or row.get("exitPrice")) or 0.0,
+            "pnl": _to_float(row.get("pnl") or row.get("Net P&L") or row.get("net_pnl") or row.get("Gross P&L")) or 0.0,
+            "size": _to_float(row.get("size") or row.get("Qty") or row.get("qty") or row.get("quantity")) or 0.0,
+        })
+    return normalized
+
+
+def _build_metrics(
+    *,
+    runtime_metrics: Any,
+    config: dict[str, Any],
+    final_value: float | None,
+    trades: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metrics = dict(runtime_metrics) if isinstance(runtime_metrics, dict) else {}
+    initial_capital = _to_float(config.get("initial_capital")) or 0.0
+    if final_value is not None:
+        metrics.setdefault("final_value", float(final_value))
+    metrics.setdefault("starting_value", float(initial_capital) if initial_capital else None)
+
+    if initial_capital and final_value is not None:
+        net_pnl = float(final_value) - float(initial_capital)
+        return_pct = (net_pnl / float(initial_capital)) * 100.0
+        metrics.setdefault("net_pnl", net_pnl)
+        metrics.setdefault("return_pct", return_pct)
+
+    if trades:
+        total = len(trades)
+        wins = sum(1 for trade in trades if _to_float(trade.get("pnl")) and float(trade.get("pnl", 0)) > 0)
+        losses = sum(1 for trade in trades if _to_float(trade.get("pnl")) and float(trade.get("pnl", 0)) < 0)
+        gross_profit = sum(float(trade.get("pnl", 0)) for trade in trades if float(trade.get("pnl", 0)) > 0)
+        gross_loss = abs(sum(float(trade.get("pnl", 0)) for trade in trades if float(trade.get("pnl", 0)) < 0))
+        metrics.setdefault("total_trades", total)
+        metrics.setdefault("winning_trades", wins)
+        metrics.setdefault("losing_trades", losses)
+        metrics.setdefault("win_rate", (wins / total * 100.0) if total else 0.0)
+        if gross_loss > 0:
+            metrics.setdefault("profit_factor", gross_profit / gross_loss)
+    return metrics
+
+
 @router.post("/backtests/run")
 async def run_backtest(
     request: BacktestRequest,
@@ -54,6 +121,11 @@ async def run_backtest(
         "data_selection": data_selection,
         "initial_capital": request.initial_capital,
         "commission": request.commission,
+        "slippage": request.slippage,
+        "lot_size": request.lot_size,
+        "position_size": request.position_size,
+        "max_positions": request.max_positions,
+        "execution_mode": request.execution_mode,
         "max_retries": max(0, int(request.max_retries)),
         "task_timeout_seconds": max(10, int(request.task_timeout_seconds)),
         "enforce_market_hours": request.enforce_market_hours,
@@ -180,6 +252,11 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
         runtime_config = extract_runtime_config({
             "initial_capital": config.get("initial_capital", 100000),
             "commission": config.get("commission", 0.0003),
+            "slippage": config.get("slippage", 0.0),
+            "lot_size": config.get("lot_size", 1),
+            "position_size": config.get("position_size", 1),
+            "max_positions": config.get("max_positions", 1),
+            "execution_mode": config.get("execution_mode", "market"),
             "enforce_market_hours": config.get("enforce_market_hours", True),
         })
 
@@ -205,11 +282,24 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
                 )
                 result = await asyncio.wait_for(_execute_once(), timeout=timeout_seconds)
                 await backtest_repository.append_log(task_id, "Backtest completed successfully.", "SUCCESS")
+                final_value = _to_float(result.get("final_value"))
+                normalized_trades = _normalize_trade_rows(
+                    result.get("trades")
+                    or result.get("closed_trades")
+                    or result.get("trade_log")
+                    or [],
+                )
+                metrics = _build_metrics(
+                    runtime_metrics=result.get("metrics"),
+                    config=config,
+                    final_value=final_value,
+                    trades=normalized_trades,
+                )
                 await backtest_repository.update_result(task_id, {
                     "status": "COMPLETED",
-                    "final_value": result.get("final_value"),
-                    "metrics": result.get("metrics", {}),
-                    "trades": result.get("trades", []),
+                    "final_value": final_value,
+                    "metrics": metrics,
+                    "trades": normalized_trades,
                 })
                 return
             except asyncio.TimeoutError as exc:

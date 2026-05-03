@@ -9,6 +9,11 @@ export interface BacktestRequest {
   date_to: string;
   initial_capital: number;
   commission: number;
+  slippage?: number;
+  lot_size?: number;
+  position_size?: number;
+  max_positions?: number;
+  execution_mode?: string;
   max_retries?: number;
   task_timeout_seconds?: number;
   enforce_market_hours: boolean;
@@ -76,6 +81,8 @@ export interface HistoricalIngestJob {
   };
   rows?: number;
   inserted?: number;
+  current_chunk?: number;
+  total_chunks?: number;
   error_message?: string | null;
   started_at?: string | null;
   completed_at?: string | null;

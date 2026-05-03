@@ -148,6 +148,39 @@ wait_for_docker() {
   return 1
 }
 
+http_status_code() {
+  local url="$1"
+  curl -L -sS -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || echo "000"
+}
+
+http_is_ready() {
+  local url="$1"
+  local code
+  code="$(http_status_code "$url")"
+  if [[ "$code" =~ ^[0-9]{3}$ ]]; then
+    # Treat any non-5xx response as a reachable service endpoint.
+    [[ "$code" -ge 200 && "$code" -lt 500 ]] && return 0
+  fi
+  return 1
+}
+
+wait_for_any_url() {
+  local timeout_seconds="$1"
+  shift
+  local attempt
+  local url
+  for attempt in $(seq 1 "$timeout_seconds"); do
+    for url in "$@"; do
+      if http_is_ready "$url"; then
+        echo "$url"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+  return 1
+}
+
 start_docker_flow() {
   local mode="${1:-start}"
   local force_build="${2:-no}"
@@ -183,27 +216,44 @@ start_docker_flow() {
   fi
 
   echo
-  if [[ "$mode" == "update" ]]; then
-    echo "[4/5] Waiting for Backend API health..."
-  else
-    echo "[3/3] Waiting for Backend API health..."
-  fi
-  local health_url="http://localhost:8000/api/health"
-  for _ in $(seq 1 180); do
-    if curl -fsS --max-time 3 "$health_url" >/dev/null 2>&1; then
-      if [[ "$mode" == "update" ]]; then
-        echo "[5/5] Backend API is healthy."
-      else
-        echo "Backend API is healthy."
-      fi
-      open "http://localhost:3000" >/dev/null 2>&1 || true
-      show_info "App is running at http://localhost:3000"
-      return
-    fi
-    sleep 1
-  done
+  local frontend_url=""
+  local backend_url=""
 
-  show_error "Backend API health check timed out. Run: docker compose logs -f" "Startup Timeout"
+  echo
+  if [[ "$mode" == "update" ]]; then
+    echo "[4/5] Waiting for Frontend (localhost:3000)..."
+  else
+    echo "[3/3] Waiting for Frontend (localhost:3000)..."
+  fi
+  if frontend_url="$(wait_for_any_url 180 \
+    "http://localhost:3000/" \
+    "http://127.0.0.1:3000/" \
+    "http://localhost:3000/index.html" \
+    "http://127.0.0.1:3000/index.html")"; then
+    echo "Frontend is reachable at: $frontend_url"
+  else
+    show_error "Frontend did not become reachable at localhost:3000 within 3 minutes. Run: docker compose logs -f frontend" "Startup Timeout"
+    return
+  fi
+
+  echo
+  if [[ "$mode" == "update" ]]; then
+    echo "[5/5] Verifying Backend API health..."
+  else
+    echo "Verifying Backend API health..."
+  fi
+  if backend_url="$(wait_for_any_url 90 \
+    "http://localhost:8000/api/health" \
+    "http://127.0.0.1:8000/api/health" \
+    "http://localhost:8000/docs" \
+    "http://127.0.0.1:8000/docs")"; then
+    echo "Backend API is reachable at: $backend_url"
+    open "http://localhost:3000" >/dev/null 2>&1 || true
+    show_info "App is running at http://localhost:3000"
+  else
+    open "http://localhost:3000" >/dev/null 2>&1 || true
+    show_info $'Frontend is running at http://localhost:3000\nBackend health could not be confirmed yet.\nYou can check backend logs with: docker compose logs -f backend' "Partial Startup"
+  fi
 }
 
 start_app_flow() {

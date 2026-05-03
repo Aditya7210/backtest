@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from backend.database.sync_connection import get_sync_db
@@ -28,15 +28,29 @@ def ingest(
     from_date: str,
     to_date: str,
     interval: str = "5minute",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Fetch historical data from Zerodha and store in MongoDB."""
     from pymongo import UpdateOne
 
     kite = build_kite_client()
-    candles = fetch_historical(kite, instrument_token, from_date, to_date, interval)
+    candles, chunk_meta = fetch_historical(
+        kite,
+        instrument_token,
+        from_date,
+        to_date,
+        interval,
+        progress_callback=progress_callback,
+    )
 
     if not candles:
-        return {"status": "no_data", "rows": 0}
+        return {
+            "status": "no_data",
+            "rows": 0,
+            "inserted": 0,
+            "current_chunk": int(chunk_meta.get("current_chunk", 0)),
+            "total_chunks": int(chunk_meta.get("total_chunks", 0)),
+        }
 
     timeframe = _INTERVAL_TO_TIMEFRAME.get(interval, interval)
     db = get_sync_db()
@@ -86,4 +100,10 @@ def ingest(
     else:
         inserted = 0
 
-    return {"status": "ok", "rows": len(candles), "inserted": inserted}
+    return {
+        "status": "ok",
+        "rows": len(candles),
+        "inserted": inserted,
+        "current_chunk": int(chunk_meta.get("current_chunk", 0)),
+        "total_chunks": int(chunk_meta.get("total_chunks", 0)),
+    }

@@ -36,6 +36,16 @@ export const searchInstruments = (query: string, limit = 20) =>
     `/instruments/search?q=${encodeURIComponent(query)}&limit=${limit}`,
   );
 
+export const searchMapperInstruments = (query: string, limit = 20) =>
+  request<{ items: unknown[]; source: string; warning?: string | null }>(
+    `/instruments/mapper/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+  );
+
+export const updateMapperInstruments = () =>
+  request<{ status: string; rows_latest: number; rows_archive: number }>('/instruments/mapper/update', {
+    method: 'POST',
+  });
+
 export const startHistoricalIngest = (body: unknown) =>
   request<{ job_id: string; status: string }>('/historical/ingest', {
     method: 'POST',
