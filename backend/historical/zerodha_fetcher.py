@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from kiteconnect import KiteConnect
 
@@ -52,6 +52,81 @@ def _build_chunks(from_date: str, to_date: str, interval: str) -> list[tuple[dat
     return chunks
 
 
+def _fetch_chunk_with_retry(
+    kite: KiteConnect,
+    instrument_token: int,
+    chunk_from: datetime,
+    chunk_to: datetime,
+    interval: str,
+    *,
+    retries: int = 2,
+) -> list[dict[str, Any]]:
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            part = kite.historical_data(
+                instrument_token=instrument_token,
+                from_date=chunk_from,
+                to_date=chunk_to,
+                interval=interval,
+            )
+            # Explicitly clear stale retry state on success.
+            last_error = None
+            return part or []
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= retries:
+                break
+            time.sleep(0.8 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+def iter_historical_chunks(
+    kite: KiteConnect,
+    instrument_token: int,
+    from_date: str,
+    to_date: str,
+    interval: str = "5minute",
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield fetched candles chunk-by-chunk, with retry handling per chunk."""
+    chunks = _build_chunks(from_date, to_date, interval)
+    total = len(chunks)
+    rows_fetched = 0
+
+    for idx, (chunk_from, chunk_to) in enumerate(chunks, start=1):
+        rows = _fetch_chunk_with_retry(
+            kite,
+            instrument_token=instrument_token,
+            chunk_from=chunk_from,
+            chunk_to=chunk_to,
+            interval=interval,
+        )
+        rows_fetched += len(rows)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "FETCHING",
+                    "current_chunk": idx,
+                    "total_chunks": total,
+                    "rows": rows_fetched,
+                    "rows_fetched": rows_fetched,
+                    "fetched_in_chunk": len(rows),
+                }
+            )
+        yield {
+            "current_chunk": idx,
+            "total_chunks": total,
+            "chunk_from": chunk_from,
+            "chunk_to": chunk_to,
+            "rows": rows,
+            "rows_fetched": rows_fetched,
+        }
+
+
 def fetch_historical(
     kite: KiteConnect,
     instrument_token: int,
@@ -62,38 +137,20 @@ def fetch_historical(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Fetch historical candles using interval-aware chunking."""
-    chunks = _build_chunks(from_date, to_date, interval)
     all_rows: list[dict[str, Any]] = []
-    total = len(chunks)
-
-    for idx, (chunk_from, chunk_to) in enumerate(chunks, start=1):
-        retries = 2
-        last_error: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                part = kite.historical_data(
-                    instrument_token=instrument_token,
-                    from_date=chunk_from,
-                    to_date=chunk_to,
-                    interval=interval,
-                )
-                all_rows.extend(part or [])
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if attempt >= retries:
-                    raise
-                time.sleep(0.8 * (attempt + 1))
-        if progress_callback:
-            progress_callback(
-                {
-                    "current_chunk": idx,
-                    "total_chunks": total,
-                    "rows": len(all_rows),
-                }
-            )
-        if last_error is not None and idx == total:
-            raise last_error
+    current_chunk = 0
+    total_chunks = 0
+    for chunk in iter_historical_chunks(
+        kite,
+        instrument_token,
+        from_date,
+        to_date,
+        interval,
+        progress_callback=progress_callback,
+    ):
+        current_chunk = int(chunk.get("current_chunk", 0))
+        total_chunks = int(chunk.get("total_chunks", 0))
+        all_rows.extend(chunk.get("rows") or [])
 
     # De-duplicate on candle timestamp while preserving last seen row.
     by_ts: dict[str, dict[str, Any]] = {}
@@ -102,4 +159,4 @@ def fetch_historical(
         key = str(ts)
         by_ts[key] = row
     ordered = sorted(by_ts.values(), key=lambda x: str(x.get("date")))
-    return ordered, {"current_chunk": total, "total_chunks": total}
+    return ordered, {"current_chunk": current_chunk, "total_chunks": total_chunks}

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeEditor from '../components/CodeEditor';
-import PageMetaBar from '../components/PageMetaBar';
 import {
   getBacktest,
   getBacktests,
@@ -27,6 +26,13 @@ import type {
 } from '../types/backtest';
 
 type DataSourceMode = 'mongodb' | 'zerodha_api';
+type ControlSectionKey =
+  | 'strategy_setup'
+  | 'parameters'
+  | 'risk_management'
+  | 'ai_refiner'
+  | 'execution_controls'
+  | 'execute_strategy';
 
 interface QueueItem {
   id: string;
@@ -145,6 +151,42 @@ function normalizeStrategyNameInput(value: string): string {
   return flattened.replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
+function isoToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function parseIsoDate(value: string | undefined): Date | null {
+  if (!value) return null;
+  const dt = new Date(`${value}T00:00:00`);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function deriveIngestDateBounds(item: InstrumentSearchResult | null): { min: string; max: string } {
+  const globalMin = '2015-02-01';
+  const today = isoToday();
+  if (!item) return { min: globalMin, max: today };
+
+  const givenMin = item.available_from || '';
+  const givenMax = item.available_to || '';
+  if (givenMin && givenMax) {
+    return { min: givenMin, max: givenMax < globalMin ? globalMin : givenMax };
+  }
+
+  const expiry = parseIsoDate(item.expiry);
+  const todayDate = parseIsoDate(today)!;
+  let maxDate = todayDate;
+  if (expiry && expiry < maxDate) maxDate = expiry;
+  const max = maxDate.toISOString().slice(0, 10);
+  return { min: globalMin, max: max < globalMin ? globalMin : max };
+}
+
+function clampDate(value: string, min: string, max: string): string {
+  if (!value) return '';
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
 export default function BacktestPage() {
   const { strategies, catalog, setResults, setStrategies, setCatalog, updateResult } = useBacktestStore();
 
@@ -195,11 +237,25 @@ export default function BacktestPage() {
   const [ingestTo, setIngestTo] = useState('');
   const [ingestJob, setIngestJob] = useState<HistoricalIngestJob | null>(null);
   const [ingestStarting, setIngestStarting] = useState(false);
+  const [ingestPollError, setIngestPollError] = useState<string | null>(null);
+  const [ingestStaleWarning, setIngestStaleWarning] = useState<string | null>(null);
   const [mapperUpdating, setMapperUpdating] = useState(false);
+  const [controlSectionsOpen, setControlSectionsOpen] = useState<Record<ControlSectionKey, boolean>>({
+    strategy_setup: true,
+    parameters: true,
+    risk_management: true,
+    ai_refiner: true,
+    execution_controls: true,
+    execute_strategy: true,
+  });
 
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const logCursor = useRef<Record<string, number>>({});
   const ingestChunkCursor = useRef<Record<string, number>>({});
+  const ingestSavedRowsCursor = useRef<Record<string, number>>({});
+  const ingestNoProgressPolls = useRef<Record<string, number>>({});
+  const ingestProgressSignature = useRef<Record<string, string>>({});
+  const ingestPollErrorCount = useRef<Record<string, number>>({});
 
   const appendTerminal = (line: string) => {
     setExecutionLog((prev) => [...prev.slice(-1000), line]);
@@ -266,6 +322,11 @@ export default function BacktestPage() {
     if (ingestFrom > ingestTo) return 'From date cannot be after To date.';
     return null;
   }, [ingestStarting, selectedSearchInstrument, ingestFrom, ingestTo]);
+
+  const ingestDateBounds = useMemo(
+    () => deriveIngestDateBounds(selectedSearchInstrument),
+    [selectedSearchInstrument],
+  );
 
   const connectTaskSocket = (taskId: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -465,6 +526,21 @@ export default function BacktestPage() {
   }, [symbolQuery, dataSourceMode]);
 
   useEffect(() => {
+    if (dataSourceMode !== 'zerodha_api') return;
+    const { min, max } = ingestDateBounds;
+    setIngestFrom((prev) => {
+      const next = clampDate(prev, min, max);
+      if (!next) return min;
+      return next;
+    });
+    setIngestTo((prev) => {
+      const next = clampDate(prev, min, max);
+      if (!next) return max;
+      return next;
+    });
+  }, [ingestDateBounds, dataSourceMode]);
+
+  useEffect(() => {
     if (!ingestJob?.job_id) return undefined;
     if (ingestJob.status !== 'PENDING' && ingestJob.status !== 'RUNNING') return undefined;
     let active = true;
@@ -473,19 +549,60 @@ export default function BacktestPage() {
         const doc = await getHistoricalIngestJob(ingestJob.job_id);
         if (!active) return;
         const job = doc as unknown as HistoricalIngestJob;
+        setIngestPollError(null);
+        ingestPollErrorCount.current[job.job_id] = 0;
+
+        const signature = [
+          job.status,
+          job.phase || '',
+          String(job.current_chunk ?? 0),
+          String(job.rows_fetched ?? job.rows ?? 0),
+          String(job.saved_rows ?? 0),
+          String(job.inserted ?? 0),
+        ].join('|');
+        const prevSignature = ingestProgressSignature.current[job.job_id];
+        if (prevSignature === signature) {
+          ingestNoProgressPolls.current[job.job_id] = (ingestNoProgressPolls.current[job.job_id] ?? 0) + 1;
+        } else {
+          ingestProgressSignature.current[job.job_id] = signature;
+          ingestNoProgressPolls.current[job.job_id] = 0;
+          setIngestStaleWarning(null);
+        }
+
         const chunkSeen = ingestChunkCursor.current[job.job_id] ?? 0;
         const chunkNow = Number(job.current_chunk ?? 0);
         const totalChunks = Number(job.total_chunks ?? 0);
         if (chunkNow > chunkSeen && totalChunks > 0) {
           ingestChunkCursor.current[job.job_id] = chunkNow;
           appendTerminal(
-            `[${formatIst(new Date().toISOString())}] [INFO] Ingest ${job.job_id}: chunk ${chunkNow}/${totalChunks}, rows=${job.rows ?? 0}.`,
+            `[${formatIst(new Date().toISOString())}] [INFO] Ingest ${job.job_id}: ${job.phase || 'RUNNING'} chunk ${chunkNow}/${totalChunks}, fetched=${job.rows_fetched ?? job.rows ?? 0}, saved=${job.saved_rows ?? 0}.`,
           );
         }
+        const savedSeen = ingestSavedRowsCursor.current[job.job_id] ?? 0;
+        const savedNow = Number(job.saved_rows ?? 0);
+        if (savedNow > savedSeen) {
+          ingestSavedRowsCursor.current[job.job_id] = savedNow;
+          appendTerminal(
+            `[${formatIst(new Date().toISOString())}] [INFO] Ingest ${job.job_id}: saved ${savedNow} rows (inserted ${job.inserted ?? 0}, modified ${job.modified ?? 0}).`,
+          );
+        }
+
+        const noProgressCount = ingestNoProgressPolls.current[job.job_id] ?? 0;
+        if ((job.status === 'RUNNING' || job.status === 'PENDING') && noProgressCount >= 5) {
+          const warning = 'Ingest is still running but no progress has been reported recently.';
+          setIngestStaleWarning(warning);
+          if (noProgressCount === 5) {
+            appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] ${warning}`);
+          }
+        }
+
         setIngestJob(job);
         if (job.status === 'COMPLETED' || job.status === 'NO_DATA' || job.status === 'FAILED') {
+          setIngestStaleWarning(null);
           if (job.status === 'COMPLETED') {
-            appendTerminal(`[${formatIst(new Date().toISOString())}] [SUCCESS] Historical ingest completed (${job.inserted ?? 0} rows).`);
+            appendTerminal(
+              `[${formatIst(new Date().toISOString())}] [SUCCESS] Historical ingest completed (fetched=${job.rows_fetched ?? job.rows ?? 0}, saved=${job.saved_rows ?? 0}, inserted=${job.inserted ?? 0}, modified=${job.modified ?? 0}).`,
+            );
             const nextCatalog = await reloadCatalog();
             const request = job.request;
             if (request) {
@@ -501,8 +618,15 @@ export default function BacktestPage() {
             appendTerminal(`[${formatIst(new Date().toISOString())}] [ERROR] Historical ingest failed: ${job.error_message || 'Unknown error'}`);
           }
         }
-      } catch {
+      } catch (e: unknown) {
         if (!active) return;
+        const message = e instanceof Error ? e.message : 'Failed to poll ingest job status';
+        setIngestPollError(message);
+        const nextCount = (ingestPollErrorCount.current[ingestJob.job_id] ?? 0) + 1;
+        ingestPollErrorCount.current[ingestJob.job_id] = nextCount;
+        if (nextCount === 1 || nextCount % 3 === 0) {
+          appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Ingest polling issue: ${message}`);
+        }
       }
     }, 2000);
 
@@ -697,6 +821,8 @@ export default function BacktestPage() {
 
   const startIngest = async () => {
     setPageError(null);
+    setIngestPollError(null);
+    setIngestStaleWarning(null);
     if (ingestDisabledReason) {
       setPageError(ingestDisabledReason);
       return;
@@ -715,6 +841,14 @@ export default function BacktestPage() {
       setIngestJob({
         job_id: resp.job_id,
         status: resp.status as HistoricalIngestJob['status'],
+        phase: 'PENDING',
+        rows: 0,
+        rows_fetched: 0,
+        saved_rows: 0,
+        inserted: 0,
+        modified: 0,
+        current_chunk: 0,
+        total_chunks: 0,
         request: {
           instrument_token: selectedSearchInstrument.instrument_token,
           tradingsymbol: selectedSearchInstrument.tradingsymbol,
@@ -724,6 +858,10 @@ export default function BacktestPage() {
         },
       });
       ingestChunkCursor.current[resp.job_id] = 0;
+      ingestSavedRowsCursor.current[resp.job_id] = 0;
+      ingestNoProgressPolls.current[resp.job_id] = 0;
+      ingestProgressSignature.current[resp.job_id] = 'PENDING';
+      ingestPollErrorCount.current[resp.job_id] = 0;
       appendTerminal(`[${formatIst(new Date().toISOString())}] [INFO] Started historical ingest job ${resp.job_id}.`);
     } catch (e: unknown) {
       setPageError(e instanceof Error ? e.message : 'Failed to start historical ingest');
@@ -771,31 +909,32 @@ export default function BacktestPage() {
     setDateTo('');
   };
 
-  return (
-    <div className="animate-in">
-      <div className="page-header">
-        <h1 className="page-title">Backtests</h1>
-        <p className="page-subtitle">Legacy workspace flow on FastAPI + Mongo + WebSocket</p>
-        <PageMetaBar
-          items={['Editor Left', 'Control Rail Right', 'Terminal Bottom']}
-          rightText="WebSocket-first execution stream"
-        />
-      </div>
+  const setAllControlSections = (open: boolean) => {
+    setControlSectionsOpen({
+      strategy_setup: open,
+      parameters: open,
+      risk_management: open,
+      ai_refiner: open,
+      execution_controls: open,
+      execute_strategy: open,
+    });
+  };
 
+  return (
+    <div className="animate-in backtest-page">
       {pageError ? (
         <div className="card" style={{ marginBottom: 'var(--space-lg)', borderColor: 'var(--red-dim)', color: 'var(--red)' }}>
           {pageError}
         </div>
       ) : null}
 
-      <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 2.1fr) minmax(320px, 1fr)', marginBottom: 'var(--space-lg)' }}>
-        <div className="card" style={{ height: WORKSPACE_PANEL_HEIGHT, display: 'flex', flexDirection: 'column' }}>
-          <div className="card-header">
+      <div className="backtest-workspace-grid">
+        <div className="card backtest-panel backtest-editor-card" style={{ height: WORKSPACE_PANEL_HEIGHT, display: 'flex', flexDirection: 'column' }}>
+          <div className="card-header backtest-panel-header">
             <span className="card-title">Strategy Workspace</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="backtest-editor-actions">
               <input
-                className="input"
-                style={{ width: 190 }}
+                className="input backtest-inline-input"
                 placeholder="new_strategy_name"
                 value={newStrategyName}
                 onChange={(e) => setNewStrategyName(e.target.value)}
@@ -811,8 +950,8 @@ export default function BacktestPage() {
             </div>
           </div>
 
-          <div className="grid grid-2" style={{ gap: 'var(--space-sm)', marginBottom: 'var(--space-sm)' }}>
-            <div>
+          <div className="grid grid-2 backtest-form-grid">
+            <div className="backtest-field">
               <label className="stat-label">Strategy File</label>
               <select
                 value={selectedStrategyId}
@@ -831,7 +970,7 @@ export default function BacktestPage() {
                 })}
               </select>
             </div>
-            <div>
+            <div className="backtest-field">
               <label className="stat-label">Strategy Class</label>
               <select value={strategyClassName} onChange={(e) => setStrategyClassName(e.target.value)}>
                 <option value="">Select class...</option>
@@ -842,28 +981,34 @@ export default function BacktestPage() {
             </div>
           </div>
 
-          <div style={{ marginBottom: 'var(--space-sm)' }}>
+          <div className="backtest-field backtest-save-name">
             <label className="stat-label">Save Name</label>
             <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} />
           </div>
 
-          <div style={{ flex: 1, minHeight: 0 }}>
+          <div className="backtest-editor-host" style={{ flex: 1, minHeight: 0 }}>
             {editorLoading ? (
               <div style={{ color: 'var(--text-muted)' }}>Loading strategy source...</div>
             ) : (
-              <CodeEditor value={strategySource} onChange={setStrategySource} height={560} />
+              <CodeEditor value={strategySource} onChange={setStrategySource} height="100%" />
             )}
           </div>
 
         </div>
 
-        <div className="card" style={{ height: WORKSPACE_PANEL_HEIGHT, minWidth: CONTROL_RAIL_MIN_WIDTH, display: 'flex', flexDirection: 'column' }}>
-          <div className="card-header"><span className="card-title">Control Rail</span></div>
-          <div style={{ overflowY: 'auto', paddingRight: 6, minHeight: 0 }}>
+        <div className="card backtest-panel backtest-control-card" style={{ height: WORKSPACE_PANEL_HEIGHT, minWidth: CONTROL_RAIL_MIN_WIDTH, display: 'flex', flexDirection: 'column' }}>
+          <div className="card-header backtest-panel-header backtest-control-header">
+            <span className="card-title">Control Rail</span>
+            <div className="backtest-control-header-actions">
+              <button type="button" className="btn btn-topnav btn-sm" onClick={() => setAllControlSections(true)}>Expand All</button>
+              <button type="button" className="btn btn-topnav btn-sm" onClick={() => setAllControlSections(false)}>Collapse All</button>
+            </div>
+          </div>
+          <div className="backtest-control-scroll">
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Data Selection</summary>
-            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <details open={controlSectionsOpen.strategy_setup} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, strategy_setup: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">Strategy Setup</summary>
+            <div className="backtest-section-body">
               <label className="stat-label">Source Mode</label>
               <select value={dataSourceMode} onChange={(e) => setDataSourceMode(e.target.value as DataSourceMode)}>
                 <option value="mongodb">MongoDB</option>
@@ -926,7 +1071,7 @@ export default function BacktestPage() {
                     {timeframeOptions.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
                   </select>
                   <label className="stat-label">Date Range</label>
-                  <div className="grid grid-2" style={{ gap: 8 }}>
+                  <div className="grid grid-2 backtest-form-grid">
                     <input className="input" type="date" value={dateFrom} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateFrom(e.target.value)} />
                     <input className="input" type="date" value={dateTo} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateTo(e.target.value)} />
                   </div>
@@ -937,10 +1082,9 @@ export default function BacktestPage() {
                     Instrument search uses mapper files: <code>zerodha_instruments_latest.csv</code> + <code>zerodha_instruments_archive.csv</code>.
                   </div>
                   <label className="stat-label">Search Zerodha Instrument</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
+                  <div className="backtest-inline-row">
                     <input
                       className="input"
-                      style={{ flex: 1 }}
                       placeholder="Search symbol (e.g. RELIANCE)"
                       value={symbolQuery}
                       onChange={(e) => setSymbolQuery(e.target.value)}
@@ -990,9 +1134,26 @@ export default function BacktestPage() {
                     {INGEST_INTERVALS.map((it) => <option key={it} value={it}>{it}</option>)}
                   </select>
                   <label className="stat-label">Fetch Date Range</label>
-                  <div className="grid grid-2" style={{ gap: 8 }}>
-                    <input className="input" type="date" value={ingestFrom} onChange={(e) => setIngestFrom(e.target.value)} />
-                    <input className="input" type="date" value={ingestTo} onChange={(e) => setIngestTo(e.target.value)} />
+                  <div className="grid grid-2 backtest-form-grid">
+                    <input
+                      className="input"
+                      type="date"
+                      min={ingestDateBounds.min}
+                      max={ingestDateBounds.max}
+                      value={ingestFrom}
+                      onChange={(e) => setIngestFrom(e.target.value)}
+                    />
+                    <input
+                      className="input"
+                      type="date"
+                      min={ingestDateBounds.min}
+                      max={ingestDateBounds.max}
+                      value={ingestTo}
+                      onChange={(e) => setIngestTo(e.target.value)}
+                    />
+                  </div>
+                  <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>
+                    Available range for selected instrument: {ingestDateBounds.min} to {ingestDateBounds.max}
                   </div>
                   <button className="btn btn-topnav btn-sm" disabled={Boolean(ingestDisabledReason)} onClick={startIngest}>
                     {ingestStarting ? 'Starting...' : 'Fetch to MongoDB'}
@@ -1000,21 +1161,29 @@ export default function BacktestPage() {
                   {ingestDisabledReason ? <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{ingestDisabledReason}</div> : null}
                   {ingestJob ? (
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                      Job {ingestJob.job_id}: <b>{ingestJob.status}</b>
+                      Job {ingestJob.job_id}: <b>{ingestJob.status}</b> ({ingestJob.phase || 'RUNNING'})
                       {' | '}chunk={ingestJob.current_chunk ?? 0}/{ingestJob.total_chunks ?? 0}
-                      {' | '}rows={ingestJob.rows ?? 0}
+                      {' | '}fetched={ingestJob.rows_fetched ?? ingestJob.rows ?? 0}
+                      {' | '}saved={ingestJob.saved_rows ?? 0}
                       {' | '}inserted={ingestJob.inserted ?? 0}
+                      {' | '}modified={ingestJob.modified ?? 0}
                       {ingestJob.error_message ? ` | ${ingestJob.error_message}` : ''}
                     </div>
+                  ) : null}
+                  {ingestStaleWarning ? (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--amber)' }}>{ingestStaleWarning}</div>
+                  ) : null}
+                  {ingestPollError ? (
+                    <div style={{ fontSize: '0.78rem', color: '#ef4444' }}>Polling issue: {ingestPollError}</div>
                   ) : null}
                 </>
               )}
             </div>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Strategy Selection</summary>
-            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <details open={controlSectionsOpen.parameters} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, parameters: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">Parameters</summary>
+            <div className="backtest-section-body">
               <label className="stat-label">Selected Strategy ID</label>
               <input className="input" value={selectedStrategyId || '-'} readOnly />
               <label className="stat-label">Rename / Save Name</label>
@@ -1025,31 +1194,31 @@ export default function BacktestPage() {
             </div>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Versioning</summary>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <details open={controlSectionsOpen.risk_management} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, risk_management: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">Risk Management</summary>
+            <label className="backtest-check">
               <input type="checkbox" checked={versioningEnabled} onChange={(e) => setVersioningEnabled(e.target.checked)} />
               Save as versioned file (backend-driven)
             </label>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>AI Powered Strategy Refiner</summary>
+          <details open={controlSectionsOpen.ai_refiner} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, ai_refiner: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">AI Powered Strategy Refiner</summary>
             <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginBottom: 12 }}>
               Placeholder section kept for old workspace parity. Hook your refiner endpoint here.
             </div>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Execution Config</summary>
-            <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <details open={controlSectionsOpen.execution_controls} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, execution_controls: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">Execution Controls</summary>
+            <div className="backtest-section-body">
               <label className="stat-label">Initial Cash</label>
               <input className="input" type="number" min={1} value={capital} onChange={(e) => setCapital(e.target.value)} />
               <label className="stat-label">Commission</label>
               <input className="input" type="number" step="0.0001" min={0} value={commission} onChange={(e) => setCommission(e.target.value)} />
               <label className="stat-label">Slippage</label>
               <input className="input" type="number" step="0.0001" min={0} value={slippage} onChange={(e) => setSlippage(e.target.value)} />
-              <div className="grid grid-2" style={{ gap: 8 }}>
+              <div className="grid grid-2 backtest-form-grid">
                 <div>
                   <label className="stat-label">Lot Size</label>
                   <input className="input" type="number" min={1} value={lotSize} onChange={(e) => setLotSize(e.target.value)} />
@@ -1059,7 +1228,7 @@ export default function BacktestPage() {
                   <input className="input" type="number" min={1} value={positionSize} onChange={(e) => setPositionSize(e.target.value)} />
                 </div>
               </div>
-              <div className="grid grid-2" style={{ gap: 8 }}>
+              <div className="grid grid-2 backtest-form-grid">
                 <div>
                   <label className="stat-label">Max Positions</label>
                   <input className="input" type="number" min={1} value={maxPositions} onChange={(e) => setMaxPositions(e.target.value)} />
@@ -1072,7 +1241,7 @@ export default function BacktestPage() {
                   </select>
                 </div>
               </div>
-              <div className="grid grid-2" style={{ gap: 8 }}>
+              <div className="grid grid-2 backtest-form-grid">
                 <div>
                   <label className="stat-label">Max Retries</label>
                   <input className="input" type="number" min={0} value={maxRetries} onChange={(e) => setMaxRetries(e.target.value)} />
@@ -1082,16 +1251,16 @@ export default function BacktestPage() {
                   <input className="input" type="number" min={10} value={taskTimeoutSeconds} onChange={(e) => setTaskTimeoutSeconds(e.target.value)} />
                 </div>
               </div>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              <label className="backtest-check">
                 <input type="checkbox" checked={enforceMarketHours} onChange={(e) => setEnforceMarketHours(e.target.checked)} />
                 Enforce market hours
               </label>
             </div>
           </details>
 
-          <details open>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 8 }}>Execute Strategy</summary>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+          <details open={controlSectionsOpen.execute_strategy} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, execute_strategy: e.currentTarget.open }))} className="backtest-section">
+            <summary className="backtest-section-title backtest-section-title-nav">Execute Strategy</summary>
+            <div className="backtest-button-row">
               <button className="btn btn-topnav btn-sm" onClick={addSelectionToQueue}>Add to Queue</button>
               <button className="btn btn-topnav btn-sm" onClick={runNow} disabled={loading || !!runningTaskIds.length}>Run Now</button>
               <button className="btn btn-topnav btn-sm" onClick={handleRunQueue} disabled={queueSubmitting || !queueItems.length || !!runningTaskIds.length}>
@@ -1101,7 +1270,7 @@ export default function BacktestPage() {
                 Clear Queue
               </button>
             </div>
-            <div className="table-wrapper" style={{ maxHeight: 140, overflow: 'auto' }}>
+            <div className="table-wrapper backtest-queue-table">
               <table>
                 <thead><tr><th>Symbol</th><th>TF</th><th>Range</th><th /></tr></thead>
                 <tbody>
@@ -1131,19 +1300,29 @@ export default function BacktestPage() {
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 'var(--space-xl)' }}>
+      <div className="backtest-primary-actions">
+        <button className="btn btn-primary" disabled={loading || !!runningTaskIds.length} onClick={runNow}>Run Backtest</button>
+        <button className="btn btn-topnav" disabled={!editorDirty || editorSaving} onClick={saveCurrentStrategy}>
+          {editorSaving ? 'Saving...' : 'Save Strategy'}
+        </button>
+        <button className="btn btn-ghost" disabled={!editorDirty || editorSaving} onClick={() => setStrategySource(savedSource)}>
+          Reset
+        </button>
+      </div>
+
+      <div className="card backtest-terminal-card" style={{ marginBottom: 'var(--space-xl)' }}>
         <div className="card-header">
           <span className="card-title">Execution Terminal</span>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="backtest-inline-row">
             <span className={`badge ${runningTaskIds.length ? 'badge-warning' : 'badge-success'}`}>
               {runningTaskIds.length ? `Running ${runningTaskIds.length}` : 'Idle'}
             </span>
             <button className="btn btn-ghost btn-sm" onClick={() => setExecutionLog([])}>Clear</button>
           </div>
         </div>
-        <div style={{ maxHeight: 280, overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+        <div className="backtest-terminal-body">
           {executionLog.length ? executionLog.slice().reverse().map((line, idx) => (
-            <div key={`${line}-${idx}`} style={{ padding: '4px 0', borderBottom: '1px dashed var(--border-subtle)' }}>{line}</div>
+            <div key={`${line}-${idx}`} className="backtest-terminal-line">{line}</div>
           )) : (
             <div style={{ color: 'var(--text-muted)' }}>
               {loading ? 'Loading workspace...' : 'No execution logs yet.'}

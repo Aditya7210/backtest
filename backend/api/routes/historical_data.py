@@ -1,8 +1,9 @@
-"""Historical data REST routes - catalog, instrument search, ingestion jobs."""
+"""Historical data REST routes: catalog, mapper search, ingestion jobs."""
 from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
@@ -11,11 +12,12 @@ from pydantic import BaseModel, Field
 from backend.database.connection import get_db
 from backend.database.repositories import bar_repository, instrument_repository
 from backend.historical import ingestion_manager
-from backend.utils.time_utils import now_ist_iso
+from backend.utils.time_utils import now_ist, now_ist_iso
 
 router = APIRouter(tags=["historical-data"])
 
 _ALLOWED_INTERVALS = {"minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute", "day"}
+_STALE_JOB_TIMEOUT_MINUTES = 20
 
 
 class HistoricalIngestRequest(BaseModel):
@@ -34,6 +36,50 @@ def _map_ingest_error(exc: Exception) -> str:
     if "permission" in low or "forbidden" in low:
         return "Zerodha rejected this request. Verify API access and instrument permissions."
     return message
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _maybe_mark_stale_job(doc: dict[str, Any]) -> dict[str, Any]:
+    status = str(doc.get("status") or "").upper()
+    if status not in {"PENDING", "RUNNING"}:
+        return doc
+    updated_at = _parse_iso(doc.get("updated_at"))
+    if updated_at is None:
+        return doc
+    if now_ist() - updated_at < timedelta(minutes=_STALE_JOB_TIMEOUT_MINUTES):
+        return doc
+
+    db = get_db()
+    stale_msg = "Ingest interrupted before completion (stale RUNNING/PENDING job)."
+    now_iso = now_ist_iso()
+    await db.historical_ingest_jobs.update_one(
+        {"job_id": doc["job_id"]},
+        {"$set": {
+            "status": "FAILED",
+            "phase": "STALE",
+            "error_message": stale_msg,
+            "completed_at": now_iso,
+            "updated_at": now_iso,
+        }},
+    )
+    doc.update(
+        {
+            "status": "FAILED",
+            "phase": "STALE",
+            "error_message": stale_msg,
+            "completed_at": now_iso,
+            "updated_at": now_iso,
+        }
+    )
+    return doc
 
 
 @router.get("/historical/catalog")
@@ -62,6 +108,7 @@ async def get_historical_bars(
         ts = bar.get("timestamp")
         if ts:
             import calendar
+
             bar["time"] = int(calendar.timegm(ts.timetuple()))
     return {"bars": bars, "total": len(bars)}
 
@@ -115,19 +162,26 @@ async def start_historical_ingest(request: HistoricalIngestRequest, background_t
 
     job_id = str(uuid.uuid4())
     db = get_db()
-    await db.historical_ingest_jobs.insert_one({
-        "job_id": job_id,
-        "status": "PENDING",
-        "request": request.model_dump(),
-        "rows": 0,
-        "inserted": 0,
-        "current_chunk": 0,
-        "total_chunks": 0,
-        "error_message": None,
-        "started_at": None,
-        "completed_at": None,
-        "updated_at": now_ist_iso(),
-    })
+    now_iso = now_ist_iso()
+    await db.historical_ingest_jobs.insert_one(
+        {
+            "job_id": job_id,
+            "status": "PENDING",
+            "phase": "PENDING",
+            "request": request.model_dump(),
+            "rows": 0,
+            "rows_fetched": 0,
+            "saved_rows": 0,
+            "inserted": 0,
+            "modified": 0,
+            "current_chunk": 0,
+            "total_chunks": 0,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now_iso,
+        }
+    )
     background_tasks.add_task(_run_ingest_job, job_id, request.model_dump())
     return {"job_id": job_id, "status": "PENDING"}
 
@@ -138,15 +192,17 @@ async def get_historical_ingest_job(job_id: str):
     doc = await db.historical_ingest_jobs.find_one({"job_id": job_id})
     if doc is None:
         raise HTTPException(status_code=404, detail="Historical ingest job not found")
+    doc = await _maybe_mark_stale_job(doc)
     doc.pop("_id", None)
     return doc
 
 
 async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
     db = get_db()
+    started_iso = now_ist_iso()
     await db.historical_ingest_jobs.update_one(
         {"job_id": job_id},
-        {"$set": {"status": "RUNNING", "started_at": now_ist_iso(), "updated_at": now_ist_iso()}},
+        {"$set": {"status": "RUNNING", "phase": "FETCHING", "started_at": started_iso, "updated_at": started_iso}},
     )
     try:
         from backend.database.sync_connection import get_sync_db
@@ -158,9 +214,14 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
                 {"job_id": job_id},
                 {"$set": {
                     "status": "RUNNING",
+                    "phase": str(progress.get("phase", "RUNNING")),
                     "current_chunk": int(progress.get("current_chunk", 0)),
                     "total_chunks": int(progress.get("total_chunks", 0)),
                     "rows": int(progress.get("rows", 0)),
+                    "rows_fetched": int(progress.get("rows_fetched", progress.get("rows", 0))),
+                    "saved_rows": int(progress.get("saved_rows", 0)),
+                    "inserted": int(progress.get("inserted", 0)),
+                    "modified": int(progress.get("modified", 0)),
                     "updated_at": now_ist_iso(),
                 }},
             )
@@ -174,32 +235,36 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
             interval=str(payload["interval"]),
             progress_callback=_progress_callback,
         )
-        raw_status = str(result.get("status", "ok")).lower()
-        if raw_status == "no_data":
-            status = "NO_DATA"
-        else:
-            status = "COMPLETED"
 
+        raw_status = str(result.get("status", "ok")).lower()
+        status = "NO_DATA" if raw_status == "no_data" else "COMPLETED"
+        completed_iso = now_ist_iso()
         await db.historical_ingest_jobs.update_one(
             {"job_id": job_id},
             {"$set": {
                 "status": status,
+                "phase": status,
                 "rows": int(result.get("rows", 0)),
+                "rows_fetched": int(result.get("rows_fetched", result.get("rows", 0))),
+                "saved_rows": int(result.get("saved_rows", 0)),
                 "inserted": int(result.get("inserted", 0)),
+                "modified": int(result.get("modified", 0)),
                 "current_chunk": int(result.get("current_chunk", 0)),
                 "total_chunks": int(result.get("total_chunks", 0)),
                 "error_message": None,
-                "completed_at": now_ist_iso(),
-                "updated_at": now_ist_iso(),
+                "completed_at": completed_iso,
+                "updated_at": completed_iso,
             }},
         )
     except Exception as exc:  # noqa: BLE001
+        failed_iso = now_ist_iso()
         await db.historical_ingest_jobs.update_one(
             {"job_id": job_id},
             {"$set": {
                 "status": "FAILED",
+                "phase": "FAILED",
                 "error_message": _map_ingest_error(exc),
-                "completed_at": now_ist_iso(),
-                "updated_at": now_ist_iso(),
+                "completed_at": failed_iso,
+                "updated_at": failed_iso,
             }},
         )

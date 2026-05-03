@@ -1,12 +1,14 @@
-"""Historical data ingestion manager — fetch + store in MongoDB."""
+"""Historical data ingestion manager: fetch chunk-by-chunk and store in MongoDB."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from pymongo import UpdateOne
+
 from backend.database.sync_connection import get_sync_db
-from backend.historical.zerodha_fetcher import build_kite_client, fetch_historical
+from backend.historical.zerodha_fetcher import build_kite_client, iter_historical_chunks
 
 
 _INTERVAL_TO_TIMEFRAME = {
@@ -20,6 +22,59 @@ _INTERVAL_TO_TIMEFRAME = {
     "day": "1day",
 }
 IST_TZ = ZoneInfo("Asia/Kolkata")
+WRITE_BATCH_SIZE = 1000
+
+
+def _infer_instrument_type(tradingsymbol: str) -> str:
+    symbol = str(tradingsymbol or "").upper()
+    if "ETF" in symbol:
+        return "etf"
+    if "NIFTY" in symbol or "VIX" in symbol or "SENSEX" in symbol or "BANKEX" in symbol:
+        return "index"
+    return "equity"
+
+
+def _build_operation(
+    *,
+    candle: dict[str, Any],
+    instrument_token: int,
+    tradingsymbol: str,
+    timeframe: str,
+    instrument_type: str,
+) -> UpdateOne | None:
+    ts = candle.get("date")
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is None:
+        # Zerodha historical candles represent Indian market sessions.
+        ts = ts.replace(tzinfo=IST_TZ)
+    ts_ist = ts.astimezone(IST_TZ)
+    ts_utc = ts_ist.astimezone(timezone.utc)
+    trading_date = ts_ist.strftime("%Y-%m-%d")
+
+    doc = {
+        "timestamp": ts_utc,
+        "trading_date": trading_date,
+        "timeframe": timeframe,
+        "instrument_type": instrument_type,
+        "instrument_token": instrument_token,
+        "tradingsymbol": tradingsymbol,
+        "open": float(candle.get("open", 0)),
+        "high": float(candle.get("high", 0)),
+        "low": float(candle.get("low", 0)),
+        "close": float(candle.get("close", 0)),
+        "volume": float(candle.get("volume", 0)),
+    }
+    filt = {
+        "instrument_token": instrument_token,
+        "timeframe": timeframe,
+        "timestamp": ts_utc,
+    }
+    return UpdateOne(
+        filt,
+        {"$set": doc, "$setOnInsert": {"data_source": "historical"}},
+        upsert=True,
+    )
 
 
 def ingest(
@@ -30,80 +85,114 @@ def ingest(
     interval: str = "5minute",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Fetch historical data from Zerodha and store in MongoDB."""
-    from pymongo import UpdateOne
-
+    """Fetch historical data from Zerodha and persist incrementally in MongoDB."""
     kite = build_kite_client()
-    candles, chunk_meta = fetch_historical(
+    timeframe = _INTERVAL_TO_TIMEFRAME.get(interval, interval)
+    instrument_type = _infer_instrument_type(tradingsymbol)
+    db = get_sync_db()
+
+    rows_fetched = 0
+    rows_saved = 0
+    inserted = 0
+    modified = 0
+    current_chunk = 0
+    total_chunks = 0
+
+    for chunk in iter_historical_chunks(
         kite,
         instrument_token,
         from_date,
         to_date,
         interval,
-        progress_callback=progress_callback,
-    )
+    ):
+        current_chunk = int(chunk.get("current_chunk", 0))
+        total_chunks = int(chunk.get("total_chunks", 0))
+        candles = chunk.get("rows") or []
+        rows_fetched += len(candles)
 
-    if not candles:
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "FETCHING",
+                    "current_chunk": current_chunk,
+                    "total_chunks": total_chunks,
+                    "rows": rows_fetched,
+                    "rows_fetched": rows_fetched,
+                    "saved_rows": rows_saved,
+                    "inserted": inserted,
+                    "modified": modified,
+                }
+            )
+
+        deduped_by_ts: dict[str, UpdateOne] = {}
+        for candle in candles:
+            operation = _build_operation(
+                candle=candle,
+                instrument_token=instrument_token,
+                tradingsymbol=tradingsymbol,
+                timeframe=timeframe,
+                instrument_type=instrument_type,
+            )
+            if operation is None:
+                continue
+            deduped_by_ts[str(candle.get("date"))] = operation
+
+        operations = list(deduped_by_ts.values())
+        if not operations:
+            continue
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "SAVING",
+                    "current_chunk": current_chunk,
+                    "total_chunks": total_chunks,
+                    "rows": rows_fetched,
+                    "rows_fetched": rows_fetched,
+                    "saved_rows": rows_saved,
+                    "inserted": inserted,
+                    "modified": modified,
+                }
+            )
+
+        for offset in range(0, len(operations), WRITE_BATCH_SIZE):
+            batch = operations[offset: offset + WRITE_BATCH_SIZE]
+            result = db.bars.bulk_write(batch, ordered=False)
+            inserted += int(result.upserted_count)
+            modified += int(result.modified_count)
+            rows_saved += len(batch)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "SAVING",
+                        "current_chunk": current_chunk,
+                        "total_chunks": total_chunks,
+                        "rows": rows_fetched,
+                        "rows_fetched": rows_fetched,
+                        "saved_rows": rows_saved,
+                        "inserted": inserted,
+                        "modified": modified,
+                    }
+                )
+
+    if rows_fetched == 0:
         return {
             "status": "no_data",
             "rows": 0,
+            "rows_fetched": 0,
+            "saved_rows": 0,
             "inserted": 0,
-            "current_chunk": int(chunk_meta.get("current_chunk", 0)),
-            "total_chunks": int(chunk_meta.get("total_chunks", 0)),
+            "modified": 0,
+            "current_chunk": current_chunk,
+            "total_chunks": total_chunks,
         }
-
-    timeframe = _INTERVAL_TO_TIMEFRAME.get(interval, interval)
-    db = get_sync_db()
-    operations = []
-
-    for candle in candles:
-        ts = candle.get("date")
-        if isinstance(ts, datetime):
-            if ts.tzinfo is None:
-                # Zerodha historical candles represent Indian market sessions.
-                ts = ts.replace(tzinfo=IST_TZ)
-            ts_ist = ts.astimezone(IST_TZ)
-            ts_utc = ts_ist.astimezone(timezone.utc)
-        else:
-            continue
-
-        trading_date = ts_ist.strftime("%Y-%m-%d")
-
-        doc = {
-            "timestamp": ts_utc,
-            "trading_date": trading_date,
-            "timeframe": timeframe,
-            "instrument_type": "equity",
-            "instrument_token": instrument_token,
-            "tradingsymbol": tradingsymbol,
-            "open": float(candle.get("open", 0)),
-            "high": float(candle.get("high", 0)),
-            "low": float(candle.get("low", 0)),
-            "close": float(candle.get("close", 0)),
-            "volume": float(candle.get("volume", 0)),
-        }
-
-        filt = {
-            "instrument_token": instrument_token,
-            "timeframe": timeframe,
-            "timestamp": ts_utc,
-        }
-        operations.append(UpdateOne(
-            filt,
-            {"$set": doc, "$setOnInsert": {"data_source": "historical"}},
-            upsert=True,
-        ))
-
-    if operations:
-        result = db.bars.bulk_write(operations, ordered=False)
-        inserted = result.upserted_count + result.modified_count
-    else:
-        inserted = 0
-
     return {
         "status": "ok",
-        "rows": len(candles),
+        "rows": rows_fetched,
+        "rows_fetched": rows_fetched,
+        "saved_rows": rows_saved,
         "inserted": inserted,
-        "current_chunk": int(chunk_meta.get("current_chunk", 0)),
-        "total_chunks": int(chunk_meta.get("total_chunks", 0)),
+        "modified": modified,
+        "current_chunk": current_chunk,
+        "total_chunks": total_chunks,
     }

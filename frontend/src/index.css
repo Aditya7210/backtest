@@ -818,3 +818,277 @@ textarea:focus {
   border: 1px solid var(--border-subtle);
   background: #ffffff;
 }
+
+/* Backtest UI refinement (layout-only) */
+.backtest-page {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  background: #ffffff;
+}
+
+.backtest-workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 65fr) minmax(320px, 35fr);
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.backtest-panel {
+  border-radius: 8px;
+  box-shadow: none;
+  border: 0;
+  background: #ffffff;
+}
+
+.backtest-panel-header {
+  margin-bottom: 12px;
+}
+
+.backtest-control-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.backtest-control-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backtest-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.backtest-inline-input {
+  width: 190px;
+}
+
+.backtest-inline-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backtest-form-grid {
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.backtest-field {
+  margin-bottom: 0;
+}
+
+.backtest-save-name {
+  margin-bottom: 16px;
+}
+
+.backtest-control-card {
+  min-width: 320px;
+}
+
+.backtest-control-scroll {
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 6px;
+}
+
+.backtest-section {
+  margin-bottom: 16px;
+  border-bottom: 1px solid #f8fafc;
+  padding-bottom: 12px;
+}
+
+.backtest-section[open] summary {
+  margin-bottom: 10px;
+}
+
+.backtest-section-title {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  list-style: none;
+}
+
+.backtest-section-title-nav {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.9);
+  color: #e2e8f0;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.backtest-section-title-nav:hover {
+  background: rgba(15, 23, 42, 0.98);
+  border-color: rgba(203, 213, 225, 0.45);
+  color: #ffffff;
+}
+
+.backtest-section[open] .backtest-section-title-nav {
+  background: rgba(15, 23, 42, 0.98);
+  border-color: rgba(203, 213, 225, 0.45);
+  color: #ffffff;
+}
+
+.backtest-section-title::-webkit-details-marker {
+  display: none;
+}
+
+.backtest-section-title::before {
+  content: '▾';
+  margin-right: 6px;
+  color: #94a3b8;
+}
+
+.backtest-section:not([open]) .backtest-section-title::before {
+  content: '▸';
+}
+
+.backtest-section-body {
+  display: grid;
+  gap: 16px;
+}
+
+.backtest-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+}
+
+.backtest-button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.backtest-queue-table {
+  max-height: 160px;
+  overflow: auto;
+}
+
+.backtest-primary-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.backtest-terminal-card {
+  box-shadow: none;
+  border: 0;
+  background: #ffffff;
+}
+
+.backtest-terminal-body {
+  max-height: 280px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.backtest-terminal-line {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border-subtle);
+}
+
+.backtest-page .stat-label {
+  display: block;
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: #6b7280;
+  text-transform: none;
+}
+
+.backtest-page .input,
+.backtest-page select,
+.backtest-page textarea {
+  height: 40px;
+  min-height: 40px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #ffffff;
+}
+
+.backtest-page textarea {
+  height: auto;
+  min-height: 80px;
+  padding: 12px;
+}
+
+.backtest-page .input:focus,
+.backtest-page select:focus,
+.backtest-page textarea:focus {
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
+
+.backtest-editor-card .card-header,
+.backtest-control-card .card-header,
+.backtest-terminal-card .card-header {
+  border-bottom: 1px solid #f8fafc;
+  padding-bottom: 8px;
+}
+
+.backtest-editor-host {
+  min-height: 0;
+  height: 100%;
+  background: #ffffff;
+}
+
+.backtest-editor-host > div {
+  height: 100%;
+}
+
+.backtest-editor-host .monaco-editor,
+.backtest-editor-host .monaco-editor-background,
+.backtest-editor-host .margin,
+.backtest-editor-host .monaco-editor .inputarea.ime-input {
+  background: #ffffff !important;
+  border: 0 !important;
+}
+
+.backtest-editor-host .monaco-editor {
+  outline: none !important;
+}
+
+.backtest-editor-host .monaco-editor .overflow-guard {
+  border: 0 !important;
+}
+
+.backtest-editor-fallback {
+  border: 0 !important;
+  box-shadow: none !important;
+  background: #ffffff !important;
+  resize: none !important;
+}
+
+@media (max-width: 1080px) {
+  .backtest-workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .backtest-control-card {
+    min-width: 0;
+  }
+
+  .backtest-primary-actions {
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+}

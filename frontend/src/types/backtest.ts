@@ -67,11 +67,14 @@ export interface InstrumentSearchResult {
   instrument_type?: string;
   expiry?: string;
   strike?: string;
+  available_from?: string;
+  available_to?: string;
 }
 
 export interface HistoricalIngestJob {
   job_id: string;
   status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'NO_DATA';
+  phase?: 'PENDING' | 'FETCHING' | 'SAVING' | 'COMPLETED' | 'FAILED' | 'NO_DATA' | 'STALE' | string;
   request?: {
     instrument_token: number;
     tradingsymbol: string;
@@ -80,7 +83,10 @@ export interface HistoricalIngestJob {
     interval: string;
   };
   rows?: number;
+  rows_fetched?: number;
+  saved_rows?: number;
   inserted?: number;
+  modified?: number;
   current_chunk?: number;
   total_chunks?: number;
   error_message?: string | null;

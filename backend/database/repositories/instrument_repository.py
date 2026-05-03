@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ _INDEX_ALIAS_MAP: dict[str, list[str]] = {
 }
 
 _INDEX_QUERY_KEYS = set(_INDEX_ALIAS_MAP.keys())
+_ZERODHA_DEFAULT_HISTORY_START = date(2015, 2, 1)
 
 
 def _project_root() -> Path:
@@ -180,6 +181,42 @@ def _is_derivative_row(item: dict[str, Any]) -> bool:
     segment = str(item.get("segment", "")).upper()
     instrument_type = str(item.get("instrument_type", "")).upper()
     return segment.startswith("NFO") or instrument_type in {"CE", "PE", "FUT"}
+
+
+def _parse_iso_date(value: str) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _availability_window(item: dict[str, Any]) -> tuple[str, str]:
+    today = date.today()
+    expiry = _parse_iso_date(str(item.get("expiry", "")))
+    max_date = min(expiry, today) if expiry else today
+    if max_date < _ZERODHA_DEFAULT_HISTORY_START:
+        max_date = _ZERODHA_DEFAULT_HISTORY_START
+
+    instrument_type = str(item.get("instrument_type", "")).upper()
+    derivative = _is_derivative_row(item)
+    if derivative and expiry:
+        if instrument_type == "FUT":
+            min_date = max_date - timedelta(days=365)
+        elif instrument_type in {"CE", "PE"}:
+            min_date = max_date - timedelta(days=180)
+        else:
+            min_date = max_date - timedelta(days=270)
+    else:
+        min_date = _ZERODHA_DEFAULT_HISTORY_START
+
+    if min_date < _ZERODHA_DEFAULT_HISTORY_START:
+        min_date = _ZERODHA_DEFAULT_HISTORY_START
+    if min_date > max_date:
+        min_date = max_date
+    return min_date.isoformat(), max_date.isoformat()
 
 
 def _alias_targets_list(normalized_query: str) -> list[str]:
@@ -345,7 +382,14 @@ def search_mapper_files(query: str, limit: int = 50) -> dict[str, Any]:
         )
     ]
     filtered.sort(key=lambda row: _search_rank(row, q, normalized_query))
-    return {"items": filtered[:limit], "source": "mapper_csv", "warning": None}
+    items: list[dict[str, Any]] = []
+    for row in filtered[:limit]:
+        available_from, available_to = _availability_window(row)
+        item = dict(row)
+        item["available_from"] = available_from
+        item["available_to"] = available_to
+        items.append(item)
+    return {"items": items, "source": "mapper_csv", "warning": None}
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
