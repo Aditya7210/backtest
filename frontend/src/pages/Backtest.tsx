@@ -55,6 +55,10 @@ interface CatalogSelectionOption {
   source: string;
 }
 
+interface UnknownRecord {
+  [key: string]: unknown;
+}
+
 const INTERVAL_TO_TIMEFRAME: Record<string, string> = {
   minute: '1min',
   '3minute': '3min',
@@ -185,6 +189,44 @@ function clampDate(value: string, min: string, max: string): string {
   if (value < min) return min;
   if (value > max) return max;
   return value;
+}
+
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
+function normalizeCatalog(value: unknown): CatalogEntry[] {
+  return asArray<UnknownRecord>(value).map((entry) => {
+    const tokenValue = Number(entry.instrument_token);
+    const instrument_token = Number.isFinite(tokenValue) ? tokenValue : 0;
+    const tradingsymbolRaw = typeof entry.tradingsymbol === 'string' ? entry.tradingsymbol : '';
+    const timeframesRaw = asArray<UnknownRecord>(entry.timeframes_available);
+    const timeframes_available = timeframesRaw.map((tf) => ({
+      timeframe: typeof tf.timeframe === 'string' ? tf.timeframe : '1day',
+      date_from: typeof tf.date_from === 'string' ? tf.date_from : '',
+      date_to: typeof tf.date_to === 'string' ? tf.date_to : '',
+      total_bars: Number.isFinite(Number(tf.total_bars)) ? Number(tf.total_bars) : 0,
+      data_source: typeof tf.data_source === 'string' ? tf.data_source : undefined,
+    }));
+    return {
+      instrument_token,
+      tradingsymbol: tradingsymbolRaw || String(instrument_token || ''),
+      timeframes_available,
+    };
+  }).filter((entry) => Number.isFinite(entry.instrument_token));
+}
+
+function normalizeStrategies(value: unknown): Strategy[] {
+  return asArray<UnknownRecord>(value).map((item) => ({
+    name: typeof item.name === 'string' ? item.name : '',
+    filename: typeof item.filename === 'string' ? item.filename : '',
+    relative_path: typeof item.relative_path === 'string' ? item.relative_path : undefined,
+    size_bytes: Number.isFinite(Number(item.size_bytes)) ? Number(item.size_bytes) : 0,
+  })).filter((s) => Boolean(s.name));
+}
+
+function normalizeResults(value: unknown): BacktestResult[] {
+  return asArray<BacktestResult>(value);
 }
 
 export default function BacktestPage() {
@@ -376,7 +418,7 @@ export default function BacktestPage() {
 
   const reloadCatalog = async () => {
     const fresh = await getCatalog();
-    const nextCatalog = fresh.catalog as CatalogEntry[];
+    const nextCatalog = normalizeCatalog(fresh.catalog);
     setCatalog(nextCatalog);
     return nextCatalog;
   };
@@ -397,9 +439,9 @@ export default function BacktestPage() {
       try {
         const [r, c, s] = await Promise.all([getBacktests(), getCatalog(), getStrategies()]);
         if (!mounted) return;
-        const nextResults = r.results as BacktestResult[];
-        const nextCatalog = c.catalog as CatalogEntry[];
-        const nextStrategies = s.strategies as Strategy[];
+        const nextResults = normalizeResults(r.results);
+        const nextCatalog = normalizeCatalog(c.catalog);
+        const nextStrategies = normalizeStrategies(s.strategies);
 
         setResults(nextResults);
         setCatalog(nextCatalog);
@@ -509,7 +551,7 @@ export default function BacktestPage() {
       try {
         const data = await searchMapperInstruments(symbolQuery.trim(), 40);
         if (!active) return;
-        const items = (data.items || []) as InstrumentSearchResult[];
+        const items = asArray<InstrumentSearchResult>(data.items);
         setSearchResults(items);
         setSearchWarning((data.warning as string | null) || null);
       } catch (e: unknown) {
@@ -642,7 +684,7 @@ export default function BacktestPage() {
     const timer = window.setInterval(async () => {
       try {
         const refreshed = await getBacktests();
-        const next = refreshed.results as BacktestResult[];
+        const next = normalizeResults(refreshed.results);
         setResults(next);
         const active = new Set(
           next.filter((r) => r.status === 'RUNNING' || r.status === 'PENDING').map((r) => r.task_id),
@@ -667,7 +709,7 @@ export default function BacktestPage() {
       });
       setSavedSource(strategySource);
       const refreshed = await getStrategies();
-      const next = refreshed.strategies as Strategy[];
+      const next = normalizeStrategies(refreshed.strategies);
       setStrategies(next);
 
       const savedId = resp.strategy_id;
@@ -695,7 +737,7 @@ export default function BacktestPage() {
         versioning_enabled: false,
       });
       const refreshed = await getStrategies();
-      const next = refreshed.strategies as Strategy[];
+      const next = normalizeStrategies(refreshed.strategies);
       setStrategies(next);
       if (resp.strategy_id) setSelectedStrategyId(resp.strategy_id);
       setStrategyName(name);
@@ -781,7 +823,7 @@ export default function BacktestPage() {
     try {
       await submitRun(selection);
       const refreshed = await getBacktests();
-      setResults(refreshed.results as BacktestResult[]);
+      setResults(normalizeResults(refreshed.results));
     } catch (e: unknown) {
       setPageError(e instanceof Error ? e.message : 'Backtest submit failed');
     }
@@ -811,7 +853,7 @@ export default function BacktestPage() {
       await Promise.all(workers);
       setQueueItems([]);
       const refreshed = await getBacktests();
-      setResults(refreshed.results as BacktestResult[]);
+      setResults(normalizeResults(refreshed.results));
     } catch (e: unknown) {
       setPageError(e instanceof Error ? e.message : 'Queue submission failed');
     } finally {
@@ -880,7 +922,7 @@ export default function BacktestPage() {
       );
       if (symbolQuery.trim().length >= 2) {
         const data = await searchMapperInstruments(symbolQuery.trim(), 40);
-        setSearchResults((data.items || []) as InstrumentSearchResult[]);
+        setSearchResults(asArray<InstrumentSearchResult>(data.items));
         setSearchWarning((data.warning as string | null) || null);
       }
     } catch (e: unknown) {
@@ -918,6 +960,10 @@ export default function BacktestPage() {
       execution_controls: open,
       execute_strategy: open,
     });
+  };
+
+  const handleControlSectionToggle = (key: ControlSectionKey, open: boolean) => {
+    setControlSectionsOpen((prev) => ({ ...prev, [key]: open }));
   };
 
   return (
@@ -1006,7 +1052,14 @@ export default function BacktestPage() {
           </div>
           <div className="backtest-control-scroll">
 
-          <details open={controlSectionsOpen.strategy_setup} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, strategy_setup: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.strategy_setup}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('strategy_setup', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">Strategy Setup</summary>
             <div className="backtest-section-body">
               <label className="stat-label">Source Mode</label>
@@ -1060,7 +1113,7 @@ export default function BacktestPage() {
                           if (entry && tf) selectCatalogEntry(entry, tf);
                         }}
                       >
-                        {option.tradingsymbol} | {option.instrument_token} | {option.timeframe} | {option.date_from} to {option.date_to} | bars {option.total_bars.toLocaleString()} | {option.source}
+                        {option.tradingsymbol} | {option.instrument_token} | {option.timeframe} | {option.date_from} to {option.date_to} | bars {Number(option.total_bars || 0).toLocaleString()} | {option.source}
                       </button>
                     )) : (
                       <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No matching datasets.</div>
@@ -1181,7 +1234,14 @@ export default function BacktestPage() {
             </div>
           </details>
 
-          <details open={controlSectionsOpen.parameters} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, parameters: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.parameters}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('parameters', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">Parameters</summary>
             <div className="backtest-section-body">
               <label className="stat-label">Selected Strategy ID</label>
@@ -1194,7 +1254,14 @@ export default function BacktestPage() {
             </div>
           </details>
 
-          <details open={controlSectionsOpen.risk_management} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, risk_management: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.risk_management}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('risk_management', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">Risk Management</summary>
             <label className="backtest-check">
               <input type="checkbox" checked={versioningEnabled} onChange={(e) => setVersioningEnabled(e.target.checked)} />
@@ -1202,14 +1269,28 @@ export default function BacktestPage() {
             </label>
           </details>
 
-          <details open={controlSectionsOpen.ai_refiner} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, ai_refiner: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.ai_refiner}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('ai_refiner', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">AI Powered Strategy Refiner</summary>
             <div style={{ color: 'var(--text-muted)', fontSize: '0.82rem', marginBottom: 12 }}>
               Placeholder section kept for old workspace parity. Hook your refiner endpoint here.
             </div>
           </details>
 
-          <details open={controlSectionsOpen.execution_controls} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, execution_controls: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.execution_controls}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('execution_controls', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">Execution Controls</summary>
             <div className="backtest-section-body">
               <label className="stat-label">Initial Cash</label>
@@ -1258,7 +1339,14 @@ export default function BacktestPage() {
             </div>
           </details>
 
-          <details open={controlSectionsOpen.execute_strategy} onToggle={(e) => setControlSectionsOpen((prev) => ({ ...prev, execute_strategy: e.currentTarget.open }))} className="backtest-section">
+          <details
+            open={controlSectionsOpen.execute_strategy}
+            onToggle={(e) => {
+              const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+              handleControlSectionToggle('execute_strategy', isOpen);
+            }}
+            className="backtest-section"
+          >
             <summary className="backtest-section-title backtest-section-title-nav">Execute Strategy</summary>
             <div className="backtest-button-row">
               <button className="btn btn-topnav btn-sm" onClick={addSelectionToQueue}>Add to Queue</button>

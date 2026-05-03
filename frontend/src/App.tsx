@@ -7,6 +7,7 @@ import SettingsPage from './pages/Settings';
 import MarketPulsePage from './pages/MarketPulse';
 import ZerodhaAuthPage from './pages/ZerodhaAuth';
 import { APP_ROUTES } from './config/routes';
+import ErrorBoundary from './components/ErrorBoundary';
 
 function TopNav() {
   const primaryItems = APP_ROUTES.filter((route) => route.inTopNav);
@@ -57,7 +58,14 @@ export default function App() {
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/market-pulse" element={<MarketPulsePage />} />
               <Route path="/live" element={<LiveMarket />} />
-              <Route path="/backtest" element={<BacktestPage />} />
+              <Route
+                path="/backtest"
+                element={(
+                  <ErrorBoundary title="Backtest Page Crashed">
+                    <BacktestPage />
+                  </ErrorBoundary>
+                )}
+              />
               <Route path="/strategies" element={<StrategiesPage />} />
               <Route path="/settings" element={<SettingsPage />} />
             </Routes>

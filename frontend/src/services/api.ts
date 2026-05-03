@@ -8,10 +8,25 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    const text = await res.text().catch(() => '');
+    let detail = `${res.status} ${res.statusText}`;
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as { detail?: string };
+        detail = parsed.detail || detail;
+      } catch {
+        detail = text.slice(0, 500);
+      }
+    }
+    throw new Error(`[${path}] ${detail}`);
   }
-  return res.json();
+  const bodyText = await res.text();
+  if (!bodyText) return {} as T;
+  try {
+    return JSON.parse(bodyText) as T;
+  } catch {
+    throw new Error(`[${path}] Invalid JSON response`);
+  }
 }
 
 /* Market Data */
