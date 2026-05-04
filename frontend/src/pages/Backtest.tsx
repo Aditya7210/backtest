@@ -255,6 +255,7 @@ function normalizeStrategies(value: unknown): Strategy[] {
     filename: typeof item.filename === 'string' ? item.filename : '',
     relative_path: typeof item.relative_path === 'string' ? item.relative_path : undefined,
     size_bytes: Number.isFinite(Number(item.size_bytes)) ? Number(item.size_bytes) : 0,
+    immutable: Boolean(item.immutable),
   })).filter((s) => Boolean(s.name));
 }
 
@@ -388,6 +389,11 @@ export default function BacktestPage() {
   }, [selectedCatalog]);
 
   const editorDirty = normalizeSource(strategySource) !== normalizeSource(savedSource);
+  const selectedStrategy = useMemo(
+    () => strategies.find((s) => (s.relative_path || s.name) === selectedStrategyId) ?? null,
+    [strategies, selectedStrategyId],
+  );
+  const selectedStrategyImmutable = Boolean(selectedStrategy?.immutable);
 
   const ingestDisabledReason = useMemo(() => {
     if (ingestStarting) return 'Ingestion already in progress.';
@@ -712,6 +718,10 @@ export default function BacktestPage() {
   }, [ingestJob?.job_id, ingestJob?.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const saveCurrentStrategy = async () => {
+    if (selectedStrategyImmutable) {
+      setPageError('Tutorial strategy is immutable. Create a new strategy file to edit and save.');
+      return;
+    }
     const normalizedName = normalizeStrategyNameInput(strategyName);
     if (!normalizedName) return;
     setEditorSaving(true);
@@ -1002,9 +1012,12 @@ export default function BacktestPage() {
               <button className="btn btn-topnav btn-sm" disabled={!normalizeStrategyNameInput(newStrategyName)} onClick={createNewStrategy}>
                 Create Strategy
               </button>
+              {selectedStrategyImmutable ? (
+                <span className="badge badge-neutral">Immutable Tutorial</span>
+              ) : null}
               <span className={`badge ${editorDirty ? 'badge-warning' : 'badge-success'}`}>{editorDirty ? 'Dirty' : 'Saved'}</span>
-              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving} onClick={() => setStrategySource(savedSource)}>Revert</button>
-              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving} onClick={saveCurrentStrategy}>
+              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving || selectedStrategyImmutable} onClick={() => setStrategySource(savedSource)}>Revert</button>
+              <button className="btn btn-topnav btn-sm" disabled={!editorDirty || editorSaving || selectedStrategyImmutable} onClick={saveCurrentStrategy}>
                 {editorSaving ? 'Saving...' : 'Save'}
               </button>
             </div>
@@ -1024,7 +1037,7 @@ export default function BacktestPage() {
                   const id = s.relative_path || s.name;
                   return (
                     <option key={id} value={id}>
-                      {s.name} ({id})
+                      {s.name}{s.immutable ? ' [IMMUTABLE]' : ''} ({id})
                     </option>
                   );
                 })}
@@ -1043,14 +1056,19 @@ export default function BacktestPage() {
 
           <div className="backtest-field backtest-save-name">
             <label className="stat-label">Save Name</label>
-            <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} />
+            <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} disabled={selectedStrategyImmutable} />
+            {selectedStrategyImmutable ? (
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: 6 }}>
+                This tutorial strategy is read-only. Duplicate it to create your own editable strategy.
+              </div>
+            ) : null}
           </div>
 
           <div className="backtest-editor-host" style={{ flex: 1, minHeight: 0 }}>
             {editorLoading ? (
               <div style={{ color: 'var(--text-muted)' }}>Loading strategy source...</div>
             ) : (
-              <CodeEditor value={strategySource} onChange={setStrategySource} height="100%" />
+              <CodeEditor value={strategySource} onChange={setStrategySource} height="100%" readOnly={selectedStrategyImmutable} />
             )}
           </div>
 
@@ -1261,7 +1279,7 @@ export default function BacktestPage() {
               <label className="stat-label">Selected Strategy ID</label>
               <input className="input" value={selectedStrategyId || '-'} readOnly />
               <label className="stat-label">Rename / Save Name</label>
-              <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} />
+              <input className="input" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} disabled={selectedStrategyImmutable} />
               <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
                 Saving uses safe rename rules and path-stable <code>strategy_id</code> resolution.
               </div>
@@ -1404,10 +1422,10 @@ export default function BacktestPage() {
 
       <div className="backtest-primary-actions">
         <button className="btn btn-primary" disabled={loading || !!runningTaskIds.length} onClick={runNow}>Run Backtest</button>
-        <button className="btn btn-topnav" disabled={!editorDirty || editorSaving} onClick={saveCurrentStrategy}>
+        <button className="btn btn-topnav" disabled={!editorDirty || editorSaving || selectedStrategyImmutable} onClick={saveCurrentStrategy}>
           {editorSaving ? 'Saving...' : 'Save Strategy'}
         </button>
-        <button className="btn btn-ghost" disabled={!editorDirty || editorSaving} onClick={() => setStrategySource(savedSource)}>
+        <button className="btn btn-ghost" disabled={!editorDirty || editorSaving || selectedStrategyImmutable} onClick={() => setStrategySource(savedSource)}>
           Reset
         </button>
       </div>

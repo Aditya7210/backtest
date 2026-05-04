@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import LightweightCandlestickChart from '../components/LightweightCandlestickChart';
 import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
 import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
-import Tooltip from '../components/Tooltip';
+import TooltipLabel from '../components/TooltipLabel';
 import {
   computeIndicators,
   getCollectorStatus,
@@ -721,35 +721,29 @@ export default function LiveMarket() {
             </select>
           </div>
           <div>
-            <Tooltip
-              delayMs={2000}
+            <TooltipLabel
+              label="Primary Timeframe"
               content="Primary timeframe drives the main candles and indicator calculations. Changing it switches aggregation source and can affect signal sensitivity."
-            >
-              <label className="stat-label">Primary Timeframe</label>
-            </Tooltip>
+            />
             <select value={primaryTimeframe} onChange={(e) => setPrimaryTimeframe(e.target.value as LiveTimeframe)}>
               {LIVE_TIMEFRAMES.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
             </select>
           </div>
           <div>
-            <Tooltip
-              delayMs={2000}
+            <TooltipLabel
+              label="Tick Visual Updates"
               content="Tick updates only modify the in-progress candle visually. Persisted bars remain candle-based in backend storage."
-            >
-              <label className="stat-label">Tick Visual Updates</label>
-            </Tooltip>
+            />
             <select value={tickUpdatesEnabled ? 'on' : 'off'} onChange={(e) => setTickUpdatesEnabled(e.target.value === 'on')}>
               <option value="on">On</option>
               <option value="off">Off</option>
             </select>
           </div>
           <div>
-            <Tooltip
-              delayMs={2000}
+            <TooltipLabel
+              label="Auto Scroll"
               content="Auto-scroll keeps the chart pinned to latest bars when new tick/candle updates arrive."
-            >
-              <label className="stat-label">Auto Scroll</label>
-            </Tooltip>
+            />
             <select value={autoScrollEnabled ? 'on' : 'off'} onChange={(e) => setAutoScrollEnabled(e.target.value === 'on')}>
               <option value="on">On</option>
               <option value="off">Off</option>
@@ -778,12 +772,11 @@ export default function LiveMarket() {
           </div>
         </div>
         <div style={{ marginTop: 10 }}>
-          <Tooltip
-            delayMs={2000}
+          <TooltipLabel
+            label="Overlay Timeframes"
             content="Overlay additional timeframes on the same chart for context. Overlays are derived on demand from 1min base data and increase API/chart load."
-          >
-            <div className="stat-label" style={{ marginBottom: 6 }}>Overlay Timeframes</div>
-          </Tooltip>
+            className="tooltip-overlay-label"
+          />
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
             {LIVE_TIMEFRAMES.filter((tf) => tf !== primaryTimeframe).map((tf) => (
               <label key={`overlay-${tf}`} className="badge badge-neutral" style={{ cursor: 'pointer', gap: 6, padding: '4px 10px' }}>

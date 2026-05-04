@@ -11,7 +11,7 @@ interface TooltipProps {
 export default function Tooltip({
   content,
   children,
-  delayMs = 2000,
+  delayMs = 500,
   disabled = false,
   placement = 'top',
 }: TooltipProps) {

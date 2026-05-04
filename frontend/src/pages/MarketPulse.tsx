@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getCollectorStatus, getMarketView, getSnapshot, startCalculator, startCollector, stopCalculator, stopCollector } from '../services/api';
 import { basisFromSpotAndFuture, parseMarketViewPayload, type MarketViewPayload } from '../features/live-market/marketView';
 import Tooltip from '../components/Tooltip';
+import TooltipLabel from '../components/TooltipLabel';
 
 type Snapshot = Record<string, unknown>;
 
@@ -192,7 +193,7 @@ export default function MarketPulsePage() {
             disabled={collectorLive || actionBusy !== null}
             onClick={() => runAction('start-collector', startCollector)}
           >
-            <Tooltip delayMs={2000} content="Starts live WebSocket collection. This enables incoming ticks and 1-minute bar persistence, increasing live write load.">
+            <Tooltip content="Starts live WebSocket collection. This enables incoming ticks and 1-minute bar persistence, increasing live write load.">
               <span>{actionBusy === 'start-collector' ? 'Starting...' : 'Start Collector'}</span>
             </Tooltip>
           </button>
@@ -201,7 +202,7 @@ export default function MarketPulsePage() {
             disabled={!collectorLive || actionBusy !== null}
             onClick={() => runAction('stop-collector', stopCollector)}
           >
-            <Tooltip delayMs={2000} content="Stops live data ingestion. No new ticks/bars will arrive until restarted.">
+            <Tooltip content="Stops live data ingestion. No new ticks/bars will arrive until restarted.">
               <span>{actionBusy === 'stop-collector' ? 'Stopping...' : 'Stop Collector'}</span>
             </Tooltip>
           </button>
@@ -210,7 +211,7 @@ export default function MarketPulsePage() {
             disabled={calculatorLive || actionBusy !== null}
             onClick={() => runAction('start-calc', startCalculator)}
           >
-            <Tooltip delayMs={2000} content="Starts snapshot calculations (PCR, ATM OI, VIX) and keeps live market-view lens fresh for pulse monitoring.">
+            <Tooltip content="Starts snapshot calculations (PCR, ATM OI, VIX) and keeps live market-view lens fresh for pulse monitoring.">
               <span>{actionBusy === 'start-calc' ? 'Starting...' : 'Start Calc'}</span>
             </Tooltip>
           </button>
@@ -219,7 +220,7 @@ export default function MarketPulsePage() {
             disabled={!calculatorLive || actionBusy !== null}
             onClick={() => runAction('stop-calc', stopCalculator)}
           >
-            <Tooltip delayMs={2000} content="Stops snapshot calculations. Existing snapshots remain visible but freshness will degrade over time.">
+            <Tooltip content="Stops snapshot calculations. Existing snapshots remain visible but freshness will degrade over time.">
               <span>{actionBusy === 'stop-calc' ? 'Stopping...' : 'Stop Calc'}</span>
             </Tooltip>
           </button>
@@ -245,12 +246,16 @@ export default function MarketPulsePage() {
       <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
         <div className="card-header">
           <span className="card-title">Market View</span>
-          <Tooltip delayMs={2000} content="Switches universe focus for market-view lens and option chain. This does not change collector subscriptions.">
+          <div style={{ display: 'grid', gap: 4 }}>
+            <TooltipLabel
+              label="Underlying Lens"
+              content="Switches universe focus for market-view lens and option chain. This does not change collector subscriptions."
+            />
             <select style={{ width: 180 }} value={underlying} onChange={(e) => setUnderlying(e.target.value as 'NIFTY' | 'BANKNIFTY')}>
               <option value="NIFTY">NIFTY 50</option>
               <option value="BANKNIFTY">BANKNIFTY</option>
             </select>
-          </Tooltip>
+          </div>
         </div>
         {(['NIFTY', 'BANKNIFTY'] as const).map((name) => {
           const side = marketView.market_view[name];
@@ -317,14 +322,18 @@ export default function MarketPulsePage() {
         <div className="card-header">
           <span className="card-title">Option Chain ({underlying})</span>
           <div style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
-            <Tooltip delayMs={2000} content="Filters option-chain rows by expiry. Narrowing expiry improves readability and can reveal expiry-specific OI structure.">
+            <div style={{ display: 'grid', gap: 4 }}>
+              <TooltipLabel
+                label="Expiry Filter"
+                content="Filters option-chain rows by expiry. Narrowing expiry improves readability and can reveal expiry-specific OI structure."
+              />
               <select value={selectedExpiry} onChange={(e) => setSelectedExpiry(e.target.value)} style={{ width: 160 }}>
                 <option value="ALL">All Expiries</option>
                 {chainExpiries.map((x) => (
                   <option key={x} value={x}>{x}</option>
                 ))}
               </select>
-            </Tooltip>
+            </div>
             <span className="badge badge-info">{visibleRows.length} strikes</span>
           </div>
         </div>

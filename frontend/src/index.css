@@ -835,6 +835,33 @@ textarea:focus {
   align-items: center;
 }
 
+.tooltip-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tooltip-help-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: help;
+  user-select: none;
+}
+
+.tooltip-help-icon:hover,
+.tooltip-help-icon:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .tooltip-popover {
   position: absolute;
   min-width: 220px;
@@ -1127,7 +1154,7 @@ textarea:focus {
   opacity: 1;
   visibility: visible;
   transform: translateY(0);
-  transition-delay: 2s, 2s, 2s;
+  transition-delay: 0.5s, 0.5s, 0.5s;
 }
 
 .backtest-page .input,

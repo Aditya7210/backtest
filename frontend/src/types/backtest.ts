@@ -89,6 +89,7 @@ export interface Strategy {
   filename: string;
   relative_path?: string;
   size_bytes: number;
+  immutable?: boolean;
 }
 
 export interface InstrumentSearchResult {

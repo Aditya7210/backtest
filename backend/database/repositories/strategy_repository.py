@@ -6,6 +6,32 @@ import re
 from pathlib import Path
 from typing import Any
 
+IMMUTABLE_STRATEGY_IDS = {
+    "Tutorial_Backtrader_Strategies.py",
+}
+
+
+def _normalized_rel(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def _is_immutable_relative(relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/")
+    return normalized in IMMUTABLE_STRATEGY_IDS
+
+
+def is_immutable_strategy(*, strategy_id: str | None = None, path: Path | None = None) -> bool:
+    if strategy_id:
+        return _is_immutable_relative(strategy_id)
+    if path is not None:
+        try:
+            rel = _normalized_rel(path.relative_to(get_strategies_dir()))
+        except Exception:
+            return False
+        return _is_immutable_relative(rel)
+    return False
+
+
 def _find_project_root() -> Path:
     """Resolve project root by walking upward until Strategies/Strategy_codes exists.
 
@@ -89,11 +115,13 @@ def list_strategies() -> list[dict[str, Any]]:
         if "__pycache__" in f.parts:
             continue
         rel = f.relative_to(strategies_dir)
+        relative_path = _normalized_rel(rel)
         strategies.append({
             "name": f.stem,
             "filename": f.name,
-            "relative_path": str(rel).replace("\\", "/"),
+            "relative_path": relative_path,
             "size_bytes": f.stat().st_size,
+            "immutable": _is_immutable_relative(relative_path),
         })
     return strategies
 
@@ -145,6 +173,8 @@ def save_source(
         if strategy_id:
             path_by_id = get_strategy_path_by_id(strategy_id)
             if path_by_id is not None:
+                if is_immutable_strategy(path=path_by_id):
+                    return False, None
                 original_path = path_by_id
                 desired = path_by_id.with_name(f"{safe_name}.py")
                 desired_resolved = desired.resolve()
@@ -162,6 +192,10 @@ def save_source(
             target = base_dir / f"{safe_name}.py"
             if target.exists() and strategy_id is None:
                 return False, None
+
+    target_rel = _normalized_rel(target.relative_to(base_dir))
+    if _is_immutable_relative(target_rel):
+        return False, None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(source, encoding="utf-8")

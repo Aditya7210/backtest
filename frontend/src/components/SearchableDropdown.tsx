@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import Tooltip from './Tooltip';
+import TooltipLabel from './TooltipLabel';
 
 export interface SearchableOption {
   id: string;
@@ -58,9 +58,7 @@ export default function SearchableDropdown({
   return (
     <div ref={rootRef} style={{ position: 'relative' }}>
       {tooltipContent ? (
-        <Tooltip delayMs={2000} content={tooltipContent}>
-          <label className="stat-label">{label}</label>
-        </Tooltip>
+        <TooltipLabel label={label} content={tooltipContent} />
       ) : (
         <label className="stat-label">{label}</label>
       )}

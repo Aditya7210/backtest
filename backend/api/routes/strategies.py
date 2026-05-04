@@ -65,6 +65,10 @@ def get_strategy_classes_legacy(name: str):
 @router.post("/strategies")
 def save_strategy(request: StrategySaveRequest):
     """Save or update a strategy."""
+    safe_name = request.name.strip().replace("\\", "/").split("/")[-1]
+    target_id = f"{safe_name.removesuffix('.py')}.py"
+    if strategy_repository.is_immutable_strategy(strategy_id=request.strategy_id) or strategy_repository.is_immutable_strategy(strategy_id=target_id):
+        raise HTTPException(status_code=403, detail="This strategy file is immutable and cannot be modified.")
     ok, saved_id = strategy_repository.save_source(
         request.name,
         request.source,
