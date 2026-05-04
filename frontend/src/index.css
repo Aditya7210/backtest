@@ -499,6 +499,33 @@ body {
   border-color: rgba(203, 213, 225, 0.45);
 }
 
+.btn-dropdown {
+  background: rgba(15, 23, 42, 0.08);
+  border-color: rgba(148, 163, 184, 0.42);
+  color: #0f172a;
+}
+
+.btn-dropdown:hover:not(:disabled),
+.btn-dropdown:focus-visible:not(:disabled),
+.btn-dropdown:active:not(:disabled) {
+  background: rgba(15, 23, 42, 0.12);
+  border-color: rgba(100, 116, 139, 0.55);
+  color: #0f172a;
+}
+
+.dropdown-trigger,
+.dropdown-trigger:hover:not(:disabled),
+.dropdown-trigger:focus-visible:not(:disabled),
+.dropdown-trigger:active:not(:disabled) {
+  color: #0f172a;
+}
+
+.dropdown-trigger:disabled {
+  color: #334155;
+  -webkit-text-fill-color: #334155;
+  opacity: 0.8;
+}
+
 .grid {
   display: grid;
   gap: var(--space-lg);

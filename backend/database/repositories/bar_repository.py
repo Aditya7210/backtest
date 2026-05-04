@@ -174,6 +174,13 @@ async def delete_bars(
     return result.deleted_count
 
 
+async def delete_bars_by_ingest_job(ingest_job_id: str) -> int:
+    """Delete bars linked to a specific historical ingest job lineage id."""
+    db = get_db()
+    result = await db.bars.delete_many({"ingest_job_id": ingest_job_id})
+    return result.deleted_count
+
+
 def _coerce_int(value: Any) -> int | None:
     try:
         return int(value)
@@ -204,6 +211,109 @@ def _utc_seconds_from_datetime(value: Any) -> int | None:
         return None
     dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     return int(dt.timestamp())
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+async def _build_live_tick_inventory_items(
+    *,
+    db: Any,
+    now_utc: datetime,
+    search: str,
+    instrument_type: str,
+    universe: str,
+    underlying: str,
+    expiry: str,
+    timeframe: str,
+    trading_date: str,
+    stale_threshold_seconds: int,
+    active_only: bool,
+) -> list[dict[str, Any]]:
+    tick_match: dict[str, Any] = {}
+    if instrument_type and instrument_type != "all":
+        tick_match["instrument_type"] = instrument_type
+    if underlying and underlying != "all":
+        tick_match["underlying"] = underlying.upper()
+    if expiry and expiry != "all":
+        tick_match["expiry"] = expiry
+
+    tick_docs = await db.live_ticks.find(tick_match, {"_id": 0}).to_list(length=None)
+    fallback_items: list[dict[str, Any]] = []
+    for row in tick_docs:
+        token_int = _coerce_int(row.get("instrument_token"))
+        if token_int is None:
+            continue
+        symbol = str(row.get("tradingsymbol") or token_int).strip()
+        if search:
+            q = search.lower().strip()
+            hay = f"{symbol} {token_int} {row.get('instrument_type') or ''} {row.get('underlying') or ''} {row.get('expiry') or ''}".lower()
+            if q not in hay:
+                continue
+
+        ts = row.get("timestamp")
+        last_dt = ts if isinstance(ts, datetime) else None
+        stale_seconds = None
+        if last_dt is not None:
+            dt = last_dt if last_dt.tzinfo is not None else last_dt.replace(tzinfo=timezone.utc)
+            stale_seconds = int((now_utc - dt).total_seconds())
+        is_active = stale_seconds is not None and stale_seconds <= stale_threshold_seconds
+        if active_only and not is_active:
+            continue
+
+        inferred_underlying = str(row.get("underlying") or "").strip().upper()
+        if not inferred_underlying and str(row.get("instrument_type") or "") == "option":
+            inferred_underlying = _infer_underlying(symbol)
+        inferred_option_type = str(row.get("option_type") or "").strip().upper()
+        if not inferred_option_type and str(row.get("instrument_type") or "") == "option":
+            inferred_option_type = _infer_option_type(symbol)
+
+        candidate = {
+            "instrument_token": token_int,
+            "tradingsymbol": symbol,
+            "instrument_type": str(row.get("instrument_type") or "unknown"),
+            "data_source": "live",
+            "timeframe": timeframe,
+            "trading_date": trading_date,
+            "first_bar_at": None,
+            "last_bar_at": last_dt.isoformat() if isinstance(last_dt, datetime) else None,
+            "first_bar_time": None,
+            "last_bar_time": _utc_seconds_from_datetime(last_dt),
+            "total_bars": 0,
+            "last_close": _coerce_float(row.get("last_price")),
+            "exchange": str(row.get("exchange") or ""),
+            "segment": str(row.get("segment") or ""),
+            "underlying": inferred_underlying,
+            "expiry": str(row.get("expiry") or ""),
+            "strike": float(row.get("strike")) if row.get("strike") is not None else None,
+            "option_type": inferred_option_type,
+            "is_active": bool(is_active),
+            "stale_seconds": stale_seconds,
+        }
+        u = universe.upper().strip()
+        usym = candidate["tradingsymbol"].upper()
+        if u == "NIFTY 50":
+            if usym not in {"NIFTY 50", "NIFTY"}:
+                continue
+        elif u == "NIFTY BANK":
+            if usym not in {"NIFTY BANK", "BANKNIFTY"}:
+                continue
+        elif u == "NIFTY OPTIONS":
+            if not (candidate["instrument_type"] == "option" and candidate["underlying"] == "NIFTY"):
+                continue
+        elif u == "BANKNIFTY OPTIONS":
+            if not (candidate["instrument_type"] == "option" and candidate["underlying"] == "BANKNIFTY"):
+                continue
+        fallback_items.append(candidate)
+
+    fallback_items.sort(key=lambda x: (str(x.get("tradingsymbol") or ""), str(x.get("instrument_type") or "")))
+    return fallback_items
 
 
 async def get_live_instruments_inventory(
@@ -343,6 +453,21 @@ async def get_live_instruments_inventory(
             if not (candidate["instrument_type"] == "option" and candidate["underlying"] == "BANKNIFTY"):
                 continue
         items.append(candidate)
+
+    if not items:
+        items = await _build_live_tick_inventory_items(
+            db=db,
+            now_utc=now_utc,
+            search=search,
+            instrument_type=instrument_type,
+            universe=universe,
+            underlying=underlying,
+            expiry=expiry,
+            timeframe=str(timeframe or "1min"),
+            trading_date=effective_trading_date,
+            stale_threshold_seconds=stale_threshold_seconds,
+            active_only=active_only,
+        )
 
     instrument_types = sorted({str(x.get("instrument_type") or "") for x in items if x.get("instrument_type")})
     underlyings = sorted({str(x.get("underlying") or "") for x in items if x.get("underlying")})

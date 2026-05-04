@@ -3,11 +3,11 @@ import LightweightCandlestickChart from '../components/LightweightCandlestickCha
 import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
 import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
 import TooltipLabel from '../components/TooltipLabel';
+import { useWebSocket } from '../hooks/useWebSocket';
 import {
   computeIndicators,
   getCollectorStatus,
   getIndicators,
-  getLatestMarketTick,
   getLiveInstruments,
   getMarketView,
   getMarketBars,
@@ -297,6 +297,33 @@ export default function LiveMarket() {
   const [indicatorWarnings, setIndicatorWarnings] = useState<string[]>([]);
   const [indicatorLoading, setIndicatorLoading] = useState(false);
 
+  const collector = useMemo(() => asObj(collectorStatus.collector), [collectorStatus]);
+  const collectorLastBarFromStream = asText(collector.last_bar_at);
+
+  const { connected: liveStreamConnected } = useWebSocket({
+    url: '/ws/live',
+    onMessage: (raw) => {
+      const payload = asObj(raw);
+      if (payload.type !== 'live_update') return;
+      setCollectorStatus({
+        collector: asObj(payload.collector),
+        calculator: asObj(payload.calculator),
+        collector_file_status: asObj(payload.collector_file_status),
+        collector_status_health: asObj(payload.collector_status_health),
+        snapshot_health: asObj(payload.snapshot_health),
+      });
+      setMarketView({
+        generated_at: typeof payload.generated_at === 'string' ? payload.generated_at : null,
+        market_view: parseMarketViewPayload({ market_view: payload.market_view }).market_view,
+      });
+      setPcrData(getSnapshotData(payload.pcr).data);
+      setVixData(getSnapshotData(payload.vix).data);
+      setAtmData(getSnapshotData(payload.atm_oi).data);
+      setLastUpdate(new Date().toISOString());
+      setError(null);
+    },
+  });
+
   const selectedInstrument = useMemo(
     () => inventory.find((x) => `${x.instrument_token}|${x.timeframe}|${x.trading_date}` === selectedInstrumentKey) ?? null,
     [inventory, selectedInstrumentKey],
@@ -309,6 +336,17 @@ export default function LiveMarket() {
     () => (tickUpdatesEnabled ? applyLiveTickToBars(primaryBars, liveTick, primaryTimeframe) : primaryBars),
     [primaryBars, liveTick, primaryTimeframe, tickUpdatesEnabled],
   );
+
+  useWebSocket({
+    url: selectedInstrument ? `/ws/market/tick/${selectedInstrument.instrument_token}` : '',
+    enabled: Boolean(selectedInstrument && tickUpdatesEnabled),
+    onMessage: (raw) => {
+      const payload = asObj(raw);
+      if (payload.type !== 'tick_update') return;
+      const parsed = parseLiveTick(payload.tick);
+      setLiveTick(parsed);
+    },
+  });
 
   const effectiveUnderlying = useMemo<'NIFTY' | 'BANKNIFTY'>(() => {
     if (underlyingMode === 'NIFTY') return 'NIFTY';
@@ -421,7 +459,6 @@ export default function LiveMarket() {
 
   useEffect(() => {
     let active = true;
-    let timer: number | null = null;
     const fetchInventory = async () => {
       try {
         const resp = await getLiveInstruments({
@@ -442,7 +479,7 @@ export default function LiveMarket() {
         setSelectedInstrumentKey((prev) => {
           if (parsed.some((x) => `${x.instrument_token}|${x.timeframe}|${x.trading_date}` === prev)) return prev;
           if (!parsed.length) return '';
-          const pick = parsed[0];
+          const pick = parsed.find((x) => x.is_active) ?? parsed[0];
           return `${pick.instrument_token}|${pick.timeframe}|${pick.trading_date}`;
         });
         setLastUpdate(new Date().toISOString());
@@ -452,29 +489,23 @@ export default function LiveMarket() {
       }
     };
     fetchInventory();
-    timer = window.setInterval(fetchInventory, 10000);
     return () => {
       active = false;
-      if (timer != null) window.clearInterval(timer);
     };
-  }, [filters]);
+  }, [filters, collectorLastBarFromStream]);
 
   useEffect(() => {
     if (!selectedInstrument) return;
     let active = true;
-    let timer: number | null = null;
-    const fetchBarsAndStatus = async () => {
+    const fetchBars = async () => {
       setLoadingBars(true);
       try {
         const requestedFrames = Array.from(new Set<LiveTimeframe>([primaryTimeframe, ...overlayTimeframes]));
-        const [barsResponses, statusResp] = await Promise.all([
-          Promise.all(
-            requestedFrames.map((tf) =>
-              getMarketBars(selectedInstrument.instrument_token, tf, selectedInstrument.trading_date),
-            ),
+        const barsResponses = await Promise.all(
+          requestedFrames.map((tf) =>
+            getMarketBars(selectedInstrument.instrument_token, tf, selectedInstrument.trading_date),
           ),
-          getCollectorStatus(),
-        ]);
+        );
         if (!active) return;
         const nextBars: Record<string, OHLCVBar[]> = {};
         for (let i = 0; i < requestedFrames.length; i += 1) {
@@ -483,7 +514,6 @@ export default function LiveMarket() {
           nextBars[tf] = parseBars(barsResp.bars);
         }
         setBarsByTimeframe(nextBars);
-        setCollectorStatus(asObj(statusResp));
         setLastUpdate(new Date().toISOString());
         setError(null);
       } catch (e: unknown) {
@@ -493,26 +523,25 @@ export default function LiveMarket() {
         if (active) setLoadingBars(false);
       }
     };
-    fetchBarsAndStatus();
-    timer = window.setInterval(fetchBarsAndStatus, 5000);
+    fetchBars();
     return () => {
       active = false;
-      if (timer != null) window.clearInterval(timer);
     };
-  }, [overlayTimeframes, primaryTimeframe, selectedInstrument]);
+  }, [overlayTimeframes, primaryTimeframe, selectedInstrument, collectorLastBarFromStream]);
 
   useEffect(() => {
     let active = true;
-    let timer: number | null = null;
     const fetchSnapshots = async () => {
       try {
-        const [marketViewResp, pcrResp, vixResp, atmResp] = await Promise.all([
+        const [marketViewResp, pcrResp, vixResp, atmResp, statusResp] = await Promise.all([
           getMarketView(),
           getSnapshot('pcr'),
           getSnapshot('vix'),
           getSnapshot('atm_oi'),
+          getCollectorStatus(),
         ]);
         if (!active) return;
+        setCollectorStatus(asObj(statusResp));
         setMarketView(parseMarketViewPayload(marketViewResp));
         setPcrData(getSnapshotData(pcrResp).data);
         setVixData(getSnapshotData(vixResp).data);
@@ -523,36 +552,13 @@ export default function LiveMarket() {
       }
     };
     fetchSnapshots();
-    timer = window.setInterval(fetchSnapshots, 5000);
     return () => {
       active = false;
-      if (timer != null) window.clearInterval(timer);
     };
   }, []);
 
   useEffect(() => {
-    if (!selectedInstrument || !tickUpdatesEnabled) {
-      setLiveTick(null);
-      return;
-    }
-    let active = true;
-    let timer: number | null = null;
-    const fetchTick = async () => {
-      try {
-        const payload = await getLatestMarketTick(selectedInstrument.instrument_token);
-        if (!active) return;
-        const parsed = parseLiveTick(payload.tick);
-        setLiveTick(parsed);
-      } catch {
-        if (!active) return;
-      }
-    };
-    fetchTick();
-    timer = window.setInterval(fetchTick, 1000);
-    return () => {
-      active = false;
-      if (timer != null) window.clearInterval(timer);
-    };
+    if (!selectedInstrument || !tickUpdatesEnabled) setLiveTick(null);
   }, [selectedInstrument, tickUpdatesEnabled]);
 
   useEffect(() => {
@@ -634,7 +640,6 @@ export default function LiveMarket() {
     setSelectedIndicators((prev) => prev.filter((x) => x.id !== id));
   };
 
-  const collector = asObj(collectorStatus.collector);
   const calculator = asObj(collectorStatus.calculator);
   const currentVix = asNum(vixData.vix);
   const currentPcr = effectiveUnderlying === 'NIFTY' ? asNum(pcrData.nifty_pcr) : asNum(pcrData.banknifty_pcr);
@@ -673,6 +678,11 @@ export default function LiveMarket() {
   return (
     <div className="animate-in continuous-page">
       <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
+        {!liveStreamConnected ? (
+          <div style={{ marginBottom: 8, fontSize: '0.8rem', color: '#92400e' }}>
+            Live stream disconnected. Reconnecting.
+          </div>
+        ) : null}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 'var(--space-sm)' }}>
           <div>
             <label className="stat-label">Search Symbol/Token</label>

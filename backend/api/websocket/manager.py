@@ -1,19 +1,20 @@
-"""WebSocket manager for live data and backtest streaming (E-05 compliant)."""
+"""WebSocket manager for live data and backtest streaming."""
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from backend.api.websocket.live_stream_payload import build_live_stream_payload
 from backend.database.connection import get_db
+from backend.database.repositories.live_tick_repository import get_latest_tick
 
 
 class ConnectionManager:
     """Track active WebSocket connections by channel (e.g. 'live', task_id)."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._connections: dict[str, list[WebSocket]] = {}
         self._lock = asyncio.Lock()
 
@@ -50,26 +51,13 @@ manager = ConnectionManager()
 
 
 async def ws_live_endpoint(ws: WebSocket) -> None:
-    """Live market data WebSocket — polls snapshots every second and sends updates."""
+    """Live market socket: status + market view + snapshot updates."""
     await manager.connect("live", ws)
     try:
         while True:
             try:
                 db = get_db()
-                # Fetch latest snapshots and broadcast
-                snapshot_types = ["vwap", "ad", "pcr", "atm_oi", "vix"]
-                payload: dict[str, Any] = {"type": "snapshot_update"}
-                for st in snapshot_types:
-                    doc = await db.snapshots.find_one(
-                        {"snapshot_type": st},
-                        sort=[("trading_date", -1)],
-                    )
-                    if doc:
-                        doc.pop("_id", None)
-                        payload[st] = doc.get("data", {})
-                    else:
-                        payload[st] = {}
-
+                payload = await build_live_stream_payload(db)
                 await ws.send_json(payload)
             except WebSocketDisconnect:
                 break
@@ -83,7 +71,7 @@ async def ws_live_endpoint(ws: WebSocket) -> None:
 
 
 async def ws_backtest_endpoint(ws: WebSocket, task_id: str) -> None:
-    """Backtest progress streaming WebSocket (E-05: long-running)."""
+    """Backtest progress streaming WebSocket."""
     channel = f"backtest_{task_id}"
     await manager.connect(channel, ws)
     try:
@@ -102,6 +90,36 @@ async def ws_backtest_endpoint(ws: WebSocket, task_id: str) -> None:
             except Exception:
                 pass
             await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await manager.disconnect(channel, ws)
+
+
+async def ws_market_tick_endpoint(ws: WebSocket, instrument_token: int) -> None:
+    """Token-scoped tick streaming endpoint for live chart updates."""
+    channel = f"tick_{int(instrument_token)}"
+    await manager.connect(channel, ws)
+    try:
+        while True:
+            try:
+                tick = await get_latest_tick(int(instrument_token))
+                if tick:
+                    ts = tick.get("timestamp")
+                    if ts:
+                        tick["time"] = int(ts.timestamp())
+                    await ws.send_json(
+                        {
+                            "type": "tick_update",
+                            "instrument_token": int(instrument_token),
+                            "tick": tick,
+                        }
+                    )
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         pass
     finally:

@@ -10,11 +10,17 @@ interface UseWebSocketOptions {
 
 export function useWebSocket({ url, onMessage, enabled = true, reconnectMs = 3000 }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
+  const onMessageRef = useRef<UseWebSocketOptions['onMessage']>(onMessage);
+  const shouldReconnectRef = useRef(false);
   const [connected, setConnected] = useState(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
+
   const connect = useCallback(() => {
-    if (!enabled) return;
+    if (!enabled || !url || !shouldReconnectRef.current) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const fullUrl = `${protocol}//${window.location.host}${url}`;
@@ -23,7 +29,7 @@ export function useWebSocket({ url, onMessage, enabled = true, reconnectMs = 300
     ws.onopen = () => setConnected(true);
     ws.onclose = () => {
       setConnected(false);
-      if (enabled) {
+      if (shouldReconnectRef.current) {
         reconnectTimer.current = setTimeout(connect, reconnectMs);
       }
     };
@@ -31,20 +37,33 @@ export function useWebSocket({ url, onMessage, enabled = true, reconnectMs = 300
     ws.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
-        onMessage?.(data);
+        onMessageRef.current?.(data);
       } catch { /* ignore non-JSON */ }
     };
 
     wsRef.current = ws;
-  }, [url, onMessage, enabled, reconnectMs]);
+  }, [url, enabled, reconnectMs]);
 
   useEffect(() => {
-    connect();
-    return () => {
+    shouldReconnectRef.current = Boolean(enabled);
+    if (!enabled || !url) {
+      setConnected(false);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
+      wsRef.current = null;
+      return () => {
+        shouldReconnectRef.current = false;
+      };
+    }
+
+    connect();
+    return () => {
+      shouldReconnectRef.current = false;
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      wsRef.current?.close();
+      wsRef.current = null;
     };
-  }, [connect]);
+  }, [connect, enabled, url]);
 
   return { connected };
 }

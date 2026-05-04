@@ -70,10 +70,15 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(indicators.router, prefix="/api")
 
 # Mount WebSocket endpoints
-from backend.api.websocket.manager import ws_live_endpoint, ws_backtest_endpoint
+from backend.api.websocket.manager import (
+    ws_backtest_endpoint,
+    ws_live_endpoint,
+    ws_market_tick_endpoint,
+)
 
 app.add_api_websocket_route("/ws/live", ws_live_endpoint)
 app.add_api_websocket_route("/ws/backtest/{task_id}", ws_backtest_endpoint)
+app.add_api_websocket_route("/ws/market/tick/{instrument_token}", ws_market_tick_endpoint)
 
 
 @app.get("/api/health")

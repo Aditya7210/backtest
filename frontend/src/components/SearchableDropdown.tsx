@@ -64,7 +64,7 @@ export default function SearchableDropdown({
       )}
       <button
         type="button"
-        className="input"
+        className="input dropdown-trigger"
         onClick={() => !disabled && setOpen((prev) => !prev)}
         disabled={disabled}
         style={{ textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
@@ -100,7 +100,7 @@ export default function SearchableDropdown({
           <div style={{ maxHeight: 260, overflowY: 'auto', marginTop: 8, display: 'grid', gap: 4 }}>
             <button
               type="button"
-              className="btn btn-ghost btn-sm"
+              className="btn btn-dropdown btn-sm"
               onClick={() => {
                 onChange('');
                 setOpen(false);
@@ -114,7 +114,7 @@ export default function SearchableDropdown({
                 <button
                   key={opt.id}
                   type="button"
-                  className="btn btn-ghost btn-sm"
+                  className="btn btn-dropdown btn-sm"
                   onClick={() => {
                     onChange(opt.id);
                     setOpen(false);
@@ -123,7 +123,6 @@ export default function SearchableDropdown({
                   style={{
                     justifyContent: 'flex-start',
                     background: opt.id === value ? 'var(--accent-soft)' : undefined,
-                    color: opt.id === value ? 'var(--accent)' : undefined,
                   }}
                 >
                   {opt.label}

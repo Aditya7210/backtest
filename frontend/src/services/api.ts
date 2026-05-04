@@ -136,6 +136,11 @@ export const startHistoricalIngest = (body: unknown) =>
 export const getHistoricalIngestJob = (jobId: string) =>
   request<Record<string, unknown>>(`/historical/ingest/${jobId}`);
 
+export const cancelHistoricalIngest = (jobId: string) =>
+  request<Record<string, unknown>>(`/historical/ingest/${jobId}/cancel`, {
+    method: 'POST',
+  });
+
 /* Indicators */
 export const getIndicators = () =>
   request<{ indicators: unknown[] }>('/indicators');

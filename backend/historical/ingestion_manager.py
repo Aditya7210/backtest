@@ -25,6 +25,14 @@ IST_TZ = ZoneInfo("Asia/Kolkata")
 WRITE_BATCH_SIZE = 1000
 
 
+class IngestCancelled(RuntimeError):
+    """Raised when a historical ingest job is cancelled."""
+
+    def __init__(self, message: str, *, stats: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.stats = stats or {}
+
+
 def _infer_instrument_type(tradingsymbol: str) -> str:
     symbol = str(tradingsymbol or "").upper()
     if "ETF" in symbol:
@@ -41,6 +49,7 @@ def _build_operation(
     tradingsymbol: str,
     timeframe: str,
     instrument_type: str,
+    job_id: str | None,
 ) -> UpdateOne | None:
     ts = candle.get("date")
     if not isinstance(ts, datetime):
@@ -64,6 +73,8 @@ def _build_operation(
         "low": float(candle.get("low", 0)),
         "close": float(candle.get("close", 0)),
         "volume": float(candle.get("volume", 0)),
+        "ingest_job_id": job_id,
+        "ingest_status": "pending" if job_id else "committed",
     }
     filt = {
         "instrument_token": instrument_token,
@@ -84,6 +95,9 @@ def ingest(
     to_date: str,
     interval: str = "5minute",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    event_callback: Callable[[str], None] | None = None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Fetch historical data from Zerodha and persist incrementally in MongoDB."""
     kite = build_kite_client()
@@ -104,6 +118,32 @@ def ingest(
     current_chunk = 0
     total_chunks = 0
 
+    def _emit(message: str) -> None:
+        if event_callback:
+            event_callback(message)
+
+    def _stats_snapshot() -> dict[str, Any]:
+        return {
+            "rows": rows_fetched,
+            "rows_fetched": rows_fetched,
+            "saved_rows": rows_saved,
+            "inserted": inserted,
+            "modified": modified,
+            "current_chunk": current_chunk,
+            "total_chunks": total_chunks,
+            "requested_from_date": from_date,
+            "requested_to_date": to_date,
+            "first_saved_trading_date": first_saved_trading_date,
+            "last_saved_trading_date": last_saved_trading_date,
+        }
+
+    def _raise_if_cancelled(checkpoint: str) -> None:
+        if should_cancel and should_cancel():
+            _emit(f"Cancellation detected at {checkpoint}.")
+            raise IngestCancelled("Cancellation requested", stats=_stats_snapshot())
+
+    _raise_if_cancelled("start")
+
     for chunk in iter_historical_chunks(
         kite,
         instrument_token,
@@ -111,6 +151,7 @@ def ingest(
         to_date,
         interval,
     ):
+        _raise_if_cancelled("before_chunk")
         current_chunk = int(chunk.get("current_chunk", 0))
         total_chunks = int(chunk.get("total_chunks", 0))
         candles = chunk.get("rows") or []
@@ -154,6 +195,7 @@ def ingest(
                 tradingsymbol=tradingsymbol,
                 timeframe=timeframe,
                 instrument_type=instrument_type,
+                job_id=job_id,
             )
             if operation is None:
                 continue
@@ -178,11 +220,13 @@ def ingest(
             )
 
         for offset in range(0, len(operations), WRITE_BATCH_SIZE):
+            _raise_if_cancelled("before_write_batch")
             batch = operations[offset: offset + WRITE_BATCH_SIZE]
             result = db.bars.bulk_write(batch, ordered=False)
             inserted += int(result.upserted_count)
             modified += int(result.modified_count)
             rows_saved += len(batch)
+            _raise_if_cancelled("after_write_batch")
             if progress_callback:
                 progress_callback(
                     {
@@ -196,6 +240,8 @@ def ingest(
                         "modified": modified,
                     }
                 )
+
+    _raise_if_cancelled("after_all_chunks")
 
     if rows_fetched == 0:
         return {

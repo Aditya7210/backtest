@@ -107,8 +107,8 @@ export interface InstrumentSearchResult {
 
 export interface HistoricalIngestJob {
   job_id: string;
-  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'NO_DATA';
-  phase?: 'PENDING' | 'FETCHING' | 'SAVING' | 'COMPLETED' | 'FAILED' | 'NO_DATA' | 'STALE' | string;
+  status: 'PENDING' | 'RUNNING' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'FAILED' | 'NO_DATA';
+  phase?: 'PENDING' | 'FETCHING' | 'SAVING' | 'CLEANUP' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'FAILED' | 'NO_DATA' | 'STALE' | string;
   request?: {
     instrument_token: number;
     tradingsymbol: string;
@@ -127,6 +127,12 @@ export interface HistoricalIngestJob {
   started_at?: string | null;
   completed_at?: string | null;
   updated_at?: string | null;
+  cancel_requested_at?: string | null;
+  cleanup_started_at?: string | null;
+  cleanup_completed_at?: string | null;
+  estimated_finish_at?: string | null;
+  ingest_job_id?: string | null;
+  log_lines?: string[];
 }
 
 export interface CatalogEntry {

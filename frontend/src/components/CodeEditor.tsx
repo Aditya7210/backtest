@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import type { ComponentType } from 'react';
 
 interface CodeEditorProps {
   value: string;
@@ -7,7 +8,7 @@ interface CodeEditorProps {
   readOnly?: boolean;
 }
 
-type MonacoEditorType = (props: {
+type MonacoEditorType = ComponentType<{
   value: string;
   onChange: (value: string | undefined) => void;
   language?: string;
@@ -15,24 +16,25 @@ type MonacoEditorType = (props: {
   theme?: string;
   beforeMount?: (monaco: any) => void; // eslint-disable-line @typescript-eslint/no-explicit-any
   options?: Record<string, unknown>;
-}) => JSX.Element;
+}>;
 
 export default function CodeEditor({ value, onChange, height = 640, readOnly = false }: CodeEditorProps) {
   const [MonacoEditor, setMonacoEditor] = useState<MonacoEditorType | null>(null);
   const [monacoTried, setMonacoTried] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     const load = async () => {
       try {
-        // Runtime-only import so build remains valid even when Monaco dependency is unavailable.
-        const dynamicImport = Function('m', 'return import(m)') as (m: string) => Promise<{ default: MonacoEditorType }>;
-        const mod = await dynamicImport('@monaco-editor/react');
+        const mod = await import('@monaco-editor/react');
         if (!active) return;
-        setMonacoEditor(() => mod.default);
-      } catch {
+        setMonacoEditor(mod.default as MonacoEditorType);
+        setLoadError(null);
+      } catch (error: unknown) {
         if (!active) return;
         setMonacoEditor(null);
+        setLoadError(error instanceof Error ? error.message : 'Monaco failed to load.');
       } finally {
         if (active) setMonacoTried(true);
       }
@@ -110,7 +112,7 @@ export default function CodeEditor({ value, onChange, height = 640, readOnly = f
         </div>
       ) : (
         <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: 6 }}>
-          Monaco unavailable. Using fallback editor.
+          Monaco unavailable{loadError ? ` (${loadError})` : ''}. Using fallback editor.
         </div>
       )}
       <textarea

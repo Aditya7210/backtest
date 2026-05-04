@@ -46,6 +46,16 @@ interface Props {
   autoScroll?: boolean;
 }
 
+const EMPTY_OVERLAYS: OverlaySeries[] = [];
+const EMPTY_CANDLE_OVERLAYS: CandleOverlaySeries[] = [];
+const EMPTY_MARKERS: Array<{
+  time: number;
+  position: 'aboveBar' | 'belowBar' | 'inBar';
+  color: string;
+  shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square';
+  text?: string;
+}> = [];
+
 function toSeriesData(bars: OHLCVBar[]): CandlestickData<Time>[] {
   const sorted = [...bars].sort((a, b) => a.time - b.time);
   return sorted.map((bar) => ({
@@ -60,9 +70,9 @@ function toSeriesData(bars: OHLCVBar[]): CandlestickData<Time>[] {
 export default function LightweightCandlestickChart({
   bars,
   symbol,
-  overlays = [],
-  candleOverlays = [],
-  markers = [],
+  overlays,
+  candleOverlays,
+  markers,
   onCrosshairTime,
   autoScroll = true,
 }: Props) {
@@ -71,7 +81,15 @@ export default function LightweightCandlestickChart({
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const overlayRefs = useRef<Array<{ key: string; series: ISeriesApi<'Line'> }>>([]);
   const candleOverlayRefs = useRef<Array<{ key: string; series: ISeriesApi<'Candlestick'> }>>([]);
+  const crosshairCbRef = useRef<Props['onCrosshairTime']>(onCrosshairTime);
+  const overlaysSafe = overlays ?? EMPTY_OVERLAYS;
+  const candleOverlaysSafe = candleOverlays ?? EMPTY_CANDLE_OVERLAYS;
+  const markersSafe = markers ?? EMPTY_MARKERS;
   const data = useMemo(() => toSeriesData(bars), [bars]);
+
+  useEffect(() => {
+    crosshairCbRef.current = onCrosshairTime;
+  }, [onCrosshairTime]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -123,13 +141,11 @@ export default function LightweightCandlestickChart({
     seriesRef.current = series;
 
     chart.subscribeCrosshairMove((param: MouseEventParams<Time>) => {
-      if (!onCrosshairTime) return;
+      const callback = crosshairCbRef.current;
+      if (!callback) return;
       const t = param.time;
-      if (typeof t === 'number') {
-        onCrosshairTime(t);
-      } else {
-        onCrosshairTime(null);
-      }
+      if (typeof t === 'number') callback(t);
+      else callback(null);
     });
 
     const ro = new ResizeObserver(() => {
@@ -146,25 +162,25 @@ export default function LightweightCandlestickChart({
       overlayRefs.current = [];
       candleOverlayRefs.current = [];
     };
-  }, [onCrosshairTime]);
+  }, []);
 
   useEffect(() => {
     if (!seriesRef.current) return;
     if (!data.length) {
       seriesRef.current.setData([]);
       const markerApi = seriesRef.current as unknown as {
-        setMarkers?: (markers: Array<Record<string, unknown>>) => void;
+        setMarkers?: (nextMarkers: Array<Record<string, unknown>>) => void;
       };
       markerApi.setMarkers?.([]);
       return;
     }
     seriesRef.current.setData(data);
     const markerApi = seriesRef.current as unknown as {
-      setMarkers?: (markers: Array<Record<string, unknown>>) => void;
+      setMarkers?: (nextMarkers: Array<Record<string, unknown>>) => void;
     };
-    if (markers.length) {
+    if (markersSafe.length) {
       markerApi.setMarkers?.(
-        markers.map((m) => ({
+        markersSafe.map((m) => ({
           time: m.time as Time,
           position: m.position,
           color: m.color,
@@ -178,7 +194,7 @@ export default function LightweightCandlestickChart({
     if (chartRef.current && autoScroll) {
       chartRef.current.timeScale().scrollToRealTime();
     }
-  }, [data, markers]);
+  }, [autoScroll, data, markersSafe]);
 
   useEffect(() => {
     const chart = chartRef.current;
@@ -189,7 +205,7 @@ export default function LightweightCandlestickChart({
     }
     candleOverlayRefs.current = [];
 
-    for (const overlay of candleOverlays) {
+    for (const overlay of candleOverlaysSafe) {
       const candleSeries = chart.addCandlestickSeries({
         upColor: overlay.upColor ?? 'rgba(59,130,246,0.32)',
         downColor: overlay.downColor ?? 'rgba(239,68,68,0.28)',
@@ -209,7 +225,7 @@ export default function LightweightCandlestickChart({
     }
     overlayRefs.current = [];
 
-    for (const overlay of overlays) {
+    for (const overlay of overlaysSafe) {
       const lineSeries = chart.addLineSeries({
         color: overlay.color,
         lineWidth: 2,
@@ -227,7 +243,7 @@ export default function LightweightCandlestickChart({
     }
 
     chart.timeScale().fitContent();
-  }, [candleOverlays, overlays]);
+  }, [candleOverlaysSafe, overlaysSafe]);
 
   return (
     <div>

@@ -3,6 +3,7 @@ import { getCollectorStatus, getMarketView, getSnapshot, startCalculator, startC
 import { basisFromSpotAndFuture, parseMarketViewPayload, type MarketViewPayload } from '../features/live-market/marketView';
 import Tooltip from '../components/Tooltip';
 import TooltipLabel from '../components/TooltipLabel';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 type Snapshot = Record<string, unknown>;
 
@@ -63,35 +64,28 @@ export default function MarketPulsePage() {
     void fetchAll();
   }, [fetchAll]);
 
-  useEffect(() => {
-    let mounted = true;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
-
-    socket.onmessage = (event) => {
-      if (!mounted) return;
-      try {
-        const payload = asObj(JSON.parse(event.data) as unknown);
-        if (payload.type !== 'snapshot_update') return;
-        setPcrSnapshot(parseSnapshot(payload.pcr));
-        setVixSnapshot(parseSnapshot(payload.vix));
-        setAtmSnapshot(parseSnapshot(payload.atm_oi));
-      } catch {
-        // Ignore malformed payloads.
-      }
-    };
-    socket.onerror = () => {
-      if (mounted) setError((prev) => prev ?? 'Live stream connection issue. Showing latest loaded snapshot data.');
-    };
-    socket.onclose = () => {
-      if (mounted) setError((prev) => prev ?? 'Live stream disconnected. Reload page to reconnect.');
-    };
-
-    return () => {
-      mounted = false;
-      socket.close();
-    };
-  }, []);
+  const { connected: liveStreamConnected } = useWebSocket({
+    url: '/ws/live',
+    onMessage: (raw) => {
+      const payload = asObj(raw);
+      if (payload.type !== 'live_update') return;
+      setCollectorStatus({
+        collector: asObj(payload.collector),
+        calculator: asObj(payload.calculator),
+        collector_file_status: asObj(payload.collector_file_status),
+        collector_status_health: asObj(payload.collector_status_health),
+        snapshot_health: asObj(payload.snapshot_health),
+      });
+      setMarketView({
+        generated_at: typeof payload.generated_at === 'string' ? payload.generated_at : null,
+        market_view: parseMarketViewPayload({ market_view: payload.market_view }).market_view,
+      });
+      setPcrSnapshot(parseSnapshot(payload.pcr));
+      setVixSnapshot(parseSnapshot(payload.vix));
+      setAtmSnapshot(parseSnapshot(payload.atm_oi));
+      setError(null);
+    },
+  });
 
   const collector = asObj(collectorStatus.collector);
   const calculator = asObj(collectorStatus.calculator);
@@ -228,6 +222,11 @@ export default function MarketPulsePage() {
       </div>
 
       {error ? <div className="card" style={{ marginBottom: 'var(--space-lg)', color: 'var(--red)' }}>{error}</div> : null}
+      {!liveStreamConnected ? (
+        <div className="card" style={{ marginBottom: 'var(--space-lg)', color: '#92400e' }}>
+          Live stream disconnected. Trying to reconnect.
+        </div>
+      ) : null}
       {staleWarnings.length || atmWarning ? (
         <div className="card" style={{ marginBottom: 'var(--space-lg)', color: '#92400e' }}>
           {[...staleWarnings, atmWarning].filter(Boolean).map((msg, idx) => (

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import CodeEditor from '../components/CodeEditor';
 import {
+  cancelHistoricalIngest,
   getBacktest,
   getBacktests,
   getCatalog,
@@ -59,6 +60,39 @@ interface UnknownRecord {
   [key: string]: unknown;
 }
 
+interface BacktestSessionV2 {
+  version: number;
+  selectedStrategyId: string;
+  strategyClassName: string;
+  dataSourceMode: DataSourceMode;
+  selectedMongoOptionId: string;
+  instrumentToken: string;
+  timeframe: string;
+  dateFrom: string;
+  dateTo: string;
+  catalogQuery: string;
+  symbolQuery: string;
+  selectedSearchInstrument: InstrumentSearchResult | null;
+  ingestInterval: string;
+  ingestFrom: string;
+  ingestTo: string;
+  queueItems: QueueItem[];
+  capital: string;
+  commission: string;
+  slippage: string;
+  lotSize: string;
+  positionSize: string;
+  maxPositions: string;
+  executionMode: string;
+  maxRetries: string;
+  taskTimeoutSeconds: string;
+  enforceMarketHours: boolean;
+  controlSectionsOpen: Record<ControlSectionKey, boolean>;
+  activeIngestJobId: string;
+  lastCompletedIngestSelectionId: string;
+  executionLog: string[];
+}
+
 const INTERVAL_TO_TIMEFRAME: Record<string, string> = {
   minute: '1min',
   '3minute': '3min',
@@ -74,6 +108,9 @@ const INGEST_INTERVALS = ['minute', '3minute', '5minute', '10minute', '15minute'
 const WORKSPACE_PANEL_HEIGHT = 760;
 const CONTROL_RAIL_MIN_WIDTH = 340;
 const QUEUE_SUBMIT_CONCURRENCY = 3;
+const BACKTEST_SESSION_KEY = 'backtest-session-v2';
+const BACKTEST_SESSION_VERSION = 2;
+const TERMINAL_LOG_CAP = 500;
 const EXECUTION_FIELD_HINTS: Record<string, string> = {
   initial_cash: 'Starting portfolio capital used by the backtest engine before the first order.',
   commission: 'Per-trade brokerage/fee rate applied to executed orders (for example 0.0003 = 0.03%).',
@@ -84,6 +121,14 @@ const EXECUTION_FIELD_HINTS: Record<string, string> = {
   execution_mode: 'Order fill assumption: market fills on signal execution, close fills at bar close.',
   max_retries: 'How many times the backend retries a failed run attempt before marking the task failed.',
   task_timeout: 'Maximum allowed runtime in seconds for one backtest task before timeout.',
+};
+const DEFAULT_CONTROL_SECTIONS: Record<ControlSectionKey, boolean> = {
+  strategy_setup: true,
+  parameters: true,
+  risk_management: true,
+  ai_refiner: true,
+  execution_controls: true,
+  execute_strategy: true,
 };
 
 const STRATEGY_TEMPLATE = `import backtrader as bt
@@ -263,17 +308,68 @@ function normalizeResults(value: unknown): BacktestResult[] {
   return asArray<BacktestResult>(value);
 }
 
+function loadSessionSnapshot(): BacktestSessionV2 | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(BACKTEST_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<BacktestSessionV2> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (Number(parsed.version) !== BACKTEST_SESSION_VERSION) return null;
+    return parsed as BacktestSessionV2;
+  } catch {
+    return null;
+  }
+}
+
+function persistSessionSnapshot(snapshot: BacktestSessionV2): void {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    window.localStorage.setItem(BACKTEST_SESSION_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function mergeUniqueLines(existing: string[], incoming: string[]): string[] {
+  if (!incoming.length) return existing.slice(-TERMINAL_LOG_CAP);
+  const seen = new Set(existing);
+  const next = [...existing];
+  for (const line of incoming) {
+    const normalized = String(line || '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    next.push(normalized);
+    seen.add(normalized);
+  }
+  return next.slice(-TERMINAL_LOG_CAP);
+}
+
+function isTerminalIngestStatus(status: HistoricalIngestJob['status'] | string | undefined): boolean {
+  const normalized = String(status || '').toUpperCase();
+  return normalized === 'COMPLETED'
+    || normalized === 'FAILED'
+    || normalized === 'NO_DATA'
+    || normalized === 'CANCELLED';
+}
+
 export default function BacktestPage() {
   const { strategies, catalog, setResults, setStrategies, setCatalog, updateResult } = useBacktestStore();
+  const sessionSnapshotRef = useRef<BacktestSessionV2 | null>(null);
+  if (sessionSnapshotRef.current === null) {
+    sessionSnapshotRef.current = loadSessionSnapshot();
+  }
+  const sessionSnapshot = sessionSnapshotRef.current;
 
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
-  const [executionLog, setExecutionLog] = useState<string[]>([]);
+  const [executionLog, setExecutionLog] = useState<string[]>(
+    () => asArray<string>(sessionSnapshot?.executionLog).slice(-TERMINAL_LOG_CAP),
+  );
   const [runningTaskIds, setRunningTaskIds] = useState<string[]>([]);
 
-  const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
+  const [selectedStrategyId, setSelectedStrategyId] = useState<string>(sessionSnapshot?.selectedStrategyId || '');
   const [strategyName, setStrategyName] = useState('');
-  const [strategyClassName, setStrategyClassName] = useState('');
+  const [strategyClassName, setStrategyClassName] = useState(sessionSnapshot?.strategyClassName || '');
   const [strategyClasses, setStrategyClasses] = useState<string[]>([]);
   const [strategySource, setStrategySource] = useState('');
   const [savedSource, setSavedSource] = useState('');
@@ -282,48 +378,53 @@ export default function BacktestPage() {
   const [versioningEnabled, setVersioningEnabled] = useState(false);
   const [newStrategyName, setNewStrategyName] = useState('');
 
-  const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>('mongodb');
-  const [catalogQuery, setCatalogQuery] = useState('');
-  const [instrumentToken, setInstrumentToken] = useState('');
-  const [timeframe, setTimeframe] = useState('1day');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-  const [selectedMongoOptionId, setSelectedMongoOptionId] = useState('');
-  const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
+  const [dataSourceMode, setDataSourceMode] = useState<DataSourceMode>(sessionSnapshot?.dataSourceMode || 'mongodb');
+  const [catalogQuery, setCatalogQuery] = useState(sessionSnapshot?.catalogQuery || '');
+  const [instrumentToken, setInstrumentToken] = useState(sessionSnapshot?.instrumentToken || '');
+  const [timeframe, setTimeframe] = useState(sessionSnapshot?.timeframe || '1day');
+  const [dateFrom, setDateFrom] = useState(sessionSnapshot?.dateFrom || '');
+  const [dateTo, setDateTo] = useState(sessionSnapshot?.dateTo || '');
+  const [selectedMongoOptionId, setSelectedMongoOptionId] = useState(sessionSnapshot?.selectedMongoOptionId || '');
+  const [queueItems, setQueueItems] = useState<QueueItem[]>(() => asArray<QueueItem>(sessionSnapshot?.queueItems));
 
-  const [capital, setCapital] = useState('100000');
-  const [commission, setCommission] = useState('0.0003');
-  const [slippage, setSlippage] = useState('0');
-  const [lotSize, setLotSize] = useState('1');
-  const [positionSize, setPositionSize] = useState('1');
-  const [maxPositions, setMaxPositions] = useState('1');
-  const [executionMode, setExecutionMode] = useState('market');
-  const [maxRetries, setMaxRetries] = useState('0');
-  const [taskTimeoutSeconds, setTaskTimeoutSeconds] = useState('300');
-  const [enforceMarketHours, setEnforceMarketHours] = useState(true);
+  const [capital, setCapital] = useState(sessionSnapshot?.capital || '100000');
+  const [commission, setCommission] = useState(sessionSnapshot?.commission || '0.0003');
+  const [slippage, setSlippage] = useState(sessionSnapshot?.slippage || '0');
+  const [lotSize, setLotSize] = useState(sessionSnapshot?.lotSize || '1');
+  const [positionSize, setPositionSize] = useState(sessionSnapshot?.positionSize || '1');
+  const [maxPositions, setMaxPositions] = useState(sessionSnapshot?.maxPositions || '1');
+  const [executionMode, setExecutionMode] = useState(sessionSnapshot?.executionMode || 'market');
+  const [maxRetries, setMaxRetries] = useState(sessionSnapshot?.maxRetries || '0');
+  const [taskTimeoutSeconds, setTaskTimeoutSeconds] = useState(sessionSnapshot?.taskTimeoutSeconds || '300');
+  const [enforceMarketHours, setEnforceMarketHours] = useState(
+    typeof sessionSnapshot?.enforceMarketHours === 'boolean' ? sessionSnapshot.enforceMarketHours : true,
+  );
   const [queueSubmitting, setQueueSubmitting] = useState(false);
 
-  const [symbolQuery, setSymbolQuery] = useState('');
+  const [symbolQuery, setSymbolQuery] = useState(sessionSnapshot?.symbolQuery || '');
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchWarning, setSearchWarning] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<InstrumentSearchResult[]>([]);
-  const [selectedSearchInstrument, setSelectedSearchInstrument] = useState<InstrumentSearchResult | null>(null);
-  const [ingestInterval, setIngestInterval] = useState('day');
-  const [ingestFrom, setIngestFrom] = useState('');
-  const [ingestTo, setIngestTo] = useState('');
+  const [selectedSearchInstrument, setSelectedSearchInstrument] = useState<InstrumentSearchResult | null>(
+    sessionSnapshot?.selectedSearchInstrument || null,
+  );
+  const [ingestInterval, setIngestInterval] = useState(sessionSnapshot?.ingestInterval || 'day');
+  const [ingestFrom, setIngestFrom] = useState(sessionSnapshot?.ingestFrom || '');
+  const [ingestTo, setIngestTo] = useState(sessionSnapshot?.ingestTo || '');
   const [ingestJob, setIngestJob] = useState<HistoricalIngestJob | null>(null);
+  const [activeIngestJobId, setActiveIngestJobId] = useState(sessionSnapshot?.activeIngestJobId || '');
+  const [lastCompletedIngestSelectionId, setLastCompletedIngestSelectionId] = useState(
+    sessionSnapshot?.lastCompletedIngestSelectionId || '',
+  );
   const [ingestStarting, setIngestStarting] = useState(false);
+  const [ingestCancelling, setIngestCancelling] = useState(false);
   const [ingestPollError, setIngestPollError] = useState<string | null>(null);
   const [ingestStaleWarning, setIngestStaleWarning] = useState<string | null>(null);
   const [mapperUpdating, setMapperUpdating] = useState(false);
-  const [controlSectionsOpen, setControlSectionsOpen] = useState<Record<ControlSectionKey, boolean>>({
-    strategy_setup: true,
-    parameters: true,
-    risk_management: true,
-    ai_refiner: true,
-    execution_controls: true,
-    execute_strategy: true,
-  });
+  const [controlSectionsOpen, setControlSectionsOpen] = useState<Record<ControlSectionKey, boolean>>(
+    sessionSnapshot?.controlSectionsOpen || DEFAULT_CONTROL_SECTIONS,
+  );
+  const [clockNowMs, setClockNowMs] = useState<number>(() => Date.now());
 
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const logCursor = useRef<Record<string, number>>({});
@@ -334,7 +435,7 @@ export default function BacktestPage() {
   const ingestPollErrorCount = useRef<Record<string, number>>({});
 
   const appendTerminal = (line: string) => {
-    setExecutionLog((prev) => [...prev.slice(-1000), line]);
+    setExecutionLog((prev) => mergeUniqueLines(prev, [line]));
   };
 
   const selectedCatalog = useMemo(() => {
@@ -361,6 +462,20 @@ export default function BacktestPage() {
       });
     });
   }, [catalog, catalogQuery]);
+  const catalogOptionsAll = useMemo<CatalogSelectionOption[]>(
+    () => catalog.flatMap((entry) =>
+      (entry.timeframes_available || []).map((tf) => ({
+        id: `${entry.instrument_token}|${tf.timeframe}|${tf.date_from}|${tf.date_to}`,
+        instrument_token: entry.instrument_token,
+        tradingsymbol: entry.tradingsymbol,
+        timeframe: tf.timeframe,
+        date_from: tf.date_from,
+        date_to: tf.date_to,
+        total_bars: tf.total_bars,
+        source: tf.data_source || entrySource(entry),
+      }))),
+    [catalog],
+  );
 
   const mongoOptions = useMemo<CatalogSelectionOption[]>(
     () => filteredCatalog.flatMap((entry) =>
@@ -378,8 +493,8 @@ export default function BacktestPage() {
   );
 
   const selectedMongoOption = useMemo(
-    () => mongoOptions.find((option) => option.id === selectedMongoOptionId) ?? null,
-    [mongoOptions, selectedMongoOptionId],
+    () => catalogOptionsAll.find((option) => option.id === selectedMongoOptionId) ?? null,
+    [catalogOptionsAll, selectedMongoOptionId],
   );
 
   const timeframeOptions = useMemo(() => {
@@ -394,20 +509,61 @@ export default function BacktestPage() {
     [strategies, selectedStrategyId],
   );
   const selectedStrategyImmutable = Boolean(selectedStrategy?.immutable);
+  const ingestStatusNormalized = String(ingestJob?.status || '').toUpperCase();
+  const ingestIsBusy = ingestStatusNormalized === 'PENDING'
+    || ingestStatusNormalized === 'RUNNING'
+    || ingestStatusNormalized === 'CANCEL_REQUESTED';
+  const ingestCanStop = ingestStatusNormalized === 'PENDING' || ingestStatusNormalized === 'RUNNING';
 
   const ingestDisabledReason = useMemo(() => {
-    if (ingestStarting) return 'Ingestion already in progress.';
+    if (ingestStarting || ingestIsBusy) return 'Ingestion already in progress.';
     if (!selectedSearchInstrument) return 'Select one instrument from search results.';
     if (!canIngestInstrument(selectedSearchInstrument)) return `Unsupported instrument type: ${selectedSearchInstrument.instrument_type || 'unknown'}.`;
     if (!ingestFrom || !ingestTo) return 'Choose both from and to dates.';
     if (ingestFrom > ingestTo) return 'From date cannot be after To date.';
     return null;
-  }, [ingestStarting, selectedSearchInstrument, ingestFrom, ingestTo]);
+  }, [ingestStarting, ingestIsBusy, selectedSearchInstrument, ingestFrom, ingestTo]);
 
   const ingestDateBounds = useMemo(
     () => deriveIngestDateBounds(selectedSearchInstrument),
     [selectedSearchInstrument],
   );
+  const zerodhaQueueReady = dataSourceMode !== 'zerodha_api'
+    || (Boolean(selectedMongoOptionId) && selectedMongoOptionId === lastCompletedIngestSelectionId);
+  const ingestTiming = useMemo(() => {
+    if (!ingestJob) return null;
+    const startedMs = ingestJob.started_at ? Date.parse(ingestJob.started_at) : NaN;
+    const startedValid = Number.isFinite(startedMs);
+    const elapsedSec = startedValid ? Math.max(0, Math.floor((clockNowMs - startedMs) / 1000)) : null;
+    const currentChunk = Number(ingestJob.current_chunk ?? 0);
+    const totalChunks = Number(ingestJob.total_chunks ?? 0);
+    const remainingChunks = totalChunks > currentChunk ? (totalChunks - currentChunk) : 0;
+    let estimateMode: 'estimating' | 'ready' = 'estimating';
+    let remainingSec: number | null = null;
+    let estimatedFinishAt: string | null = null;
+
+    const etaMs = ingestJob.estimated_finish_at ? Date.parse(ingestJob.estimated_finish_at) : NaN;
+    if (Number.isFinite(etaMs)) {
+      remainingSec = Math.max(0, Math.floor((etaMs - clockNowMs) / 1000));
+      estimatedFinishAt = new Date(etaMs).toISOString();
+      estimateMode = 'ready';
+    } else if (elapsedSec != null && elapsedSec > 0 && currentChunk > 0 && totalChunks > currentChunk) {
+      const avgSecPerChunk = elapsedSec / currentChunk;
+      if (Number.isFinite(avgSecPerChunk) && avgSecPerChunk > 0) {
+        remainingSec = Math.max(0, Math.floor(avgSecPerChunk * remainingChunks));
+        estimatedFinishAt = new Date(clockNowMs + (remainingSec * 1000)).toISOString();
+        estimateMode = 'ready';
+      }
+    }
+
+    return {
+      elapsedSec,
+      remainingChunks,
+      remainingSec,
+      estimatedFinishAt,
+      estimateMode,
+    };
+  }, [ingestJob, clockNowMs]);
 
   const connectTaskSocket = (taskId: string) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -486,20 +642,90 @@ export default function BacktestPage() {
         setCatalog(nextCatalog);
         setStrategies(nextStrategies);
 
-        const firstStrategy = nextStrategies[0] ?? null;
-        if (firstStrategy) {
-          setSelectedStrategyId(firstStrategy.relative_path || firstStrategy.name);
-          setStrategyName(stemFromStrategy(firstStrategy));
+        const strategyCandidate = selectedStrategyId || sessionSnapshot?.selectedStrategyId || '';
+        const matchedStrategy = nextStrategies.find((s) => (s.relative_path || s.name) === strategyCandidate) ?? null;
+        if (matchedStrategy) {
+          setSelectedStrategyId(matchedStrategy.relative_path || matchedStrategy.name);
+          setStrategyName(stemFromStrategy(matchedStrategy));
+        } else {
+          const firstStrategy = nextStrategies[0] ?? null;
+          if (firstStrategy) {
+            setSelectedStrategyId(firstStrategy.relative_path || firstStrategy.name);
+            setStrategyName(stemFromStrategy(firstStrategy));
+            if (strategyCandidate) {
+              appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Previously selected strategy is unavailable. Loaded first available strategy.`);
+            }
+          }
         }
-        const firstCatalog = nextCatalog[0] ?? null;
-        if (firstCatalog) {
-          setInstrumentToken(String(firstCatalog.instrument_token));
-          const firstTf = firstCatalog.timeframes_available?.[0];
-          if (firstTf) {
-            setTimeframe(firstTf.timeframe);
-            setDateFrom(firstTf.date_from);
-            setDateTo(firstTf.date_to);
-            setSelectedMongoOptionId(`${firstCatalog.instrument_token}|${firstTf.timeframe}|${firstTf.date_from}|${firstTf.date_to}`);
+
+        const catalogOptionsAll = nextCatalog.flatMap((entry) =>
+          (entry.timeframes_available || []).map((tf) => ({
+            id: `${entry.instrument_token}|${tf.timeframe}|${tf.date_from}|${tf.date_to}`,
+            entry,
+            tf,
+          })),
+        );
+        const mongoCandidate = selectedMongoOptionId || sessionSnapshot?.selectedMongoOptionId || '';
+        if (mongoCandidate) {
+          const matched = catalogOptionsAll.find((item) => item.id === mongoCandidate) ?? null;
+          if (matched) {
+            selectCatalogEntry(matched.entry, matched.tf);
+          } else {
+            setSelectedMongoOptionId('');
+            setInstrumentToken('');
+            setTimeframe('1day');
+            setDateFrom('');
+            setDateTo('');
+            appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Previously selected dataset is unavailable in refreshed catalog.`);
+          }
+        } else {
+          const firstCatalog = nextCatalog[0] ?? null;
+          if (firstCatalog) {
+            const firstTf = firstCatalog.timeframes_available?.[0];
+            if (firstTf) {
+              selectCatalogEntry(firstCatalog, firstTf);
+            }
+          }
+        }
+
+        const jobIdToResume = (activeIngestJobId || sessionSnapshot?.activeIngestJobId || '').trim();
+        if (jobIdToResume) {
+          try {
+            const doc = await getHistoricalIngestJob(jobIdToResume);
+            if (!mounted) return;
+            const job = doc as unknown as HistoricalIngestJob;
+            setIngestJob(job);
+            setActiveIngestJobId(isTerminalIngestStatus(job.status) ? '' : job.job_id);
+            if (job.status === 'COMPLETED' && job.request) {
+              const tf = INTERVAL_TO_TIMEFRAME[job.request.interval] || job.request.interval;
+              const matched = nextCatalog.find((c) => c.instrument_token === job.request?.instrument_token);
+              const matchedTf = matched?.timeframes_available?.find((x) => x.timeframe === tf)
+                ?? matched?.timeframes_available?.[0];
+              if (matched && matchedTf) {
+                setLastCompletedIngestSelectionId(
+                  `${matched.instrument_token}|${matchedTf.timeframe}|${matchedTf.date_from}|${matchedTf.date_to}`,
+                );
+              }
+            }
+            if (isTerminalIngestStatus(job.status)) {
+              appendTerminal(
+                `[${formatIst(new Date().toISOString())}] [INFO] Restored historical ingest job ${job.job_id} with terminal status ${job.status}.`,
+              );
+            } else {
+              appendTerminal(
+                `[${formatIst(new Date().toISOString())}] [INFO] Resumed tracking historical ingest job ${job.job_id}.`,
+              );
+            }
+            const backendLines = asArray<string>(job.log_lines);
+            if (backendLines.length) {
+              setExecutionLog((prev) => mergeUniqueLines(prev, backendLines));
+            }
+          } catch (err: unknown) {
+            if (!mounted) return;
+            setActiveIngestJobId('');
+            appendTerminal(
+              `[${formatIst(new Date().toISOString())}] [WARN] Could not restore ingest job ${jobIdToResume}: ${err instanceof Error ? err.message : 'not found'}.`,
+            );
           }
         }
       } catch (e: unknown) {
@@ -576,7 +802,6 @@ export default function BacktestPage() {
     if (dataSourceMode !== 'zerodha_api') {
       setSearchResults([]);
       setSearchWarning(null);
-      setSelectedSearchInstrument(null);
       return undefined;
     }
     if (symbolQuery.trim().length < 2) {
@@ -622,16 +847,20 @@ export default function BacktestPage() {
   }, [ingestDateBounds, dataSourceMode]);
 
   useEffect(() => {
-    if (!ingestJob?.job_id) return undefined;
-    if (ingestJob.status !== 'PENDING' && ingestJob.status !== 'RUNNING') return undefined;
+    const pollingJobId = (activeIngestJobId || ingestJob?.job_id || '').trim();
+    if (!pollingJobId) return undefined;
+    if (isTerminalIngestStatus(ingestJob?.status)) return undefined;
     let active = true;
     const timer = window.setInterval(async () => {
       try {
-        const doc = await getHistoricalIngestJob(ingestJob.job_id);
+        const doc = await getHistoricalIngestJob(pollingJobId);
         if (!active) return;
         const job = doc as unknown as HistoricalIngestJob;
         setIngestPollError(null);
         ingestPollErrorCount.current[job.job_id] = 0;
+        if (Array.isArray(job.log_lines) && job.log_lines.length) {
+          setExecutionLog((prev) => mergeUniqueLines(prev, job.log_lines || []));
+        }
 
         const signature = [
           job.status,
@@ -669,17 +898,16 @@ export default function BacktestPage() {
         }
 
         const noProgressCount = ingestNoProgressPolls.current[job.job_id] ?? 0;
-        if ((job.status === 'RUNNING' || job.status === 'PENDING') && noProgressCount >= 5) {
+        if ((job.status === 'RUNNING' || job.status === 'PENDING' || job.status === 'CANCEL_REQUESTED') && noProgressCount >= 5) {
           const warning = 'Ingest is still running but no progress has been reported recently.';
           setIngestStaleWarning(warning);
-          if (noProgressCount === 5) {
-            appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] ${warning}`);
-          }
+          if (noProgressCount === 5) appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] ${warning}`);
         }
 
         setIngestJob(job);
-        if (job.status === 'COMPLETED' || job.status === 'NO_DATA' || job.status === 'FAILED') {
+        if (isTerminalIngestStatus(job.status)) {
           setIngestStaleWarning(null);
+          setActiveIngestJobId('');
           if (job.status === 'COMPLETED') {
             appendTerminal(
               `[${formatIst(new Date().toISOString())}] [SUCCESS] Historical ingest completed (fetched=${job.rows_fetched ?? job.rows ?? 0}, saved=${job.saved_rows ?? 0}, inserted=${job.inserted ?? 0}, modified=${job.modified ?? 0}).`,
@@ -691,10 +919,17 @@ export default function BacktestPage() {
               const matched = nextCatalog.find((c) => c.instrument_token === request.instrument_token);
               const matchedTf = matched?.timeframes_available?.find((x) => x.timeframe === tf)
                 ?? matched?.timeframes_available?.[0];
-              if (matched && matchedTf) selectCatalogEntry(matched, matchedTf);
+              if (matched && matchedTf) {
+                selectCatalogEntry(matched, matchedTf);
+                setLastCompletedIngestSelectionId(
+                  `${matched.instrument_token}|${matchedTf.timeframe}|${matchedTf.date_from}|${matchedTf.date_to}`,
+                );
+              }
             }
           } else if (job.status === 'NO_DATA') {
             appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Historical ingest returned no candles.`);
+          } else if (job.status === 'CANCELLED') {
+            appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Historical ingest cancelled and partial rows cleaned up.`);
           } else {
             appendTerminal(`[${formatIst(new Date().toISOString())}] [ERROR] Historical ingest failed: ${job.error_message || 'Unknown error'}`);
           }
@@ -703,8 +938,8 @@ export default function BacktestPage() {
         if (!active) return;
         const message = e instanceof Error ? e.message : 'Failed to poll ingest job status';
         setIngestPollError(message);
-        const nextCount = (ingestPollErrorCount.current[ingestJob.job_id] ?? 0) + 1;
-        ingestPollErrorCount.current[ingestJob.job_id] = nextCount;
+        const nextCount = (ingestPollErrorCount.current[pollingJobId] ?? 0) + 1;
+        ingestPollErrorCount.current[pollingJobId] = nextCount;
         if (nextCount === 1 || nextCount % 3 === 0) {
           appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Ingest polling issue: ${message}`);
         }
@@ -715,7 +950,78 @@ export default function BacktestPage() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [ingestJob?.job_id, ingestJob?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeIngestJobId, ingestJob?.job_id, ingestJob?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const snapshot: BacktestSessionV2 = {
+      version: BACKTEST_SESSION_VERSION,
+      selectedStrategyId,
+      strategyClassName,
+      dataSourceMode,
+      selectedMongoOptionId,
+      instrumentToken,
+      timeframe,
+      dateFrom,
+      dateTo,
+      catalogQuery,
+      symbolQuery,
+      selectedSearchInstrument,
+      ingestInterval,
+      ingestFrom,
+      ingestTo,
+      queueItems,
+      capital,
+      commission,
+      slippage,
+      lotSize,
+      positionSize,
+      maxPositions,
+      executionMode,
+      maxRetries,
+      taskTimeoutSeconds,
+      enforceMarketHours,
+      controlSectionsOpen,
+      activeIngestJobId,
+      lastCompletedIngestSelectionId,
+      executionLog: executionLog.slice(-TERMINAL_LOG_CAP),
+    };
+    persistSessionSnapshot(snapshot);
+  }, [
+    selectedStrategyId,
+    strategyClassName,
+    dataSourceMode,
+    selectedMongoOptionId,
+    instrumentToken,
+    timeframe,
+    dateFrom,
+    dateTo,
+    catalogQuery,
+    symbolQuery,
+    selectedSearchInstrument,
+    ingestInterval,
+    ingestFrom,
+    ingestTo,
+    queueItems,
+    capital,
+    commission,
+    slippage,
+    lotSize,
+    positionSize,
+    maxPositions,
+    executionMode,
+    maxRetries,
+    taskTimeoutSeconds,
+    enforceMarketHours,
+    controlSectionsOpen,
+    activeIngestJobId,
+    lastCompletedIngestSelectionId,
+    executionLog,
+  ]);
 
   const saveCurrentStrategy = async () => {
     if (selectedStrategyImmutable) {
@@ -776,7 +1082,7 @@ export default function BacktestPage() {
     const token = parseToken(instrumentToken);
     if (token == null || !selectedCatalog) return null;
     const tfMeta = selectedCatalog.timeframes_available?.find((x) => x.timeframe === timeframe);
-    const source = tfMeta?.data_source || entrySource(selectedCatalog);
+    const source = selectedMongoOption?.source || tfMeta?.data_source || entrySource(selectedCatalog);
     return {
       instrument_token: token,
       tradingsymbol: selectedCatalog.tradingsymbol,
@@ -788,6 +1094,10 @@ export default function BacktestPage() {
   };
 
   const addSelectionToQueue = () => {
+    if (!zerodhaQueueReady) {
+      setPageError('For Zerodha mode, wait for fetch completion and select the fetched MongoDB dataset before adding to queue.');
+      return;
+    }
     const selection = currentSelection();
     if (!selection) {
       setPageError('Select a valid instrument and timeframe.');
@@ -897,6 +1207,7 @@ export default function BacktestPage() {
 
     setIngestStarting(true);
     try {
+      setLastCompletedIngestSelectionId('');
       const resp = await startHistoricalIngest({
         instrument_token: selectedSearchInstrument.instrument_token,
         tradingsymbol: selectedSearchInstrument.tradingsymbol,
@@ -923,6 +1234,7 @@ export default function BacktestPage() {
           interval: ingestInterval,
         },
       });
+      setActiveIngestJobId(resp.job_id);
       ingestChunkCursor.current[resp.job_id] = 0;
       ingestSavedRowsCursor.current[resp.job_id] = 0;
       ingestNoProgressPolls.current[resp.job_id] = 0;
@@ -933,6 +1245,21 @@ export default function BacktestPage() {
       setPageError(e instanceof Error ? e.message : 'Failed to start historical ingest');
     } finally {
       setIngestStarting(false);
+    }
+  };
+
+  const stopIngest = async () => {
+    if (!ingestJob?.job_id) return;
+    if (!ingestCanStop) return;
+    setIngestCancelling(true);
+    try {
+      await cancelHistoricalIngest(ingestJob.job_id);
+      setIngestJob((prev) => (prev ? { ...prev, status: 'CANCEL_REQUESTED', phase: 'CANCEL_REQUESTED' } : prev));
+      appendTerminal(`[${formatIst(new Date().toISOString())}] [WARN] Cancel requested for ingest job ${ingestJob.job_id}.`);
+    } catch (e: unknown) {
+      setPageError(e instanceof Error ? e.message : 'Failed to cancel historical ingest');
+    } finally {
+      setIngestCancelling(false);
     }
   };
 
@@ -977,6 +1304,7 @@ export default function BacktestPage() {
 
   const setAllControlSections = (open: boolean) => {
     setControlSectionsOpen({
+      ...DEFAULT_CONTROL_SECTIONS,
       strategy_setup: open,
       parameters: open,
       risk_management: open,
@@ -1132,7 +1460,7 @@ export default function BacktestPage() {
                       <button
                         key={option.id}
                         type="button"
-                        className="btn btn-topnav btn-sm"
+                        className="btn btn-dropdown btn-sm"
                         style={{
                           justifyContent: 'flex-start',
                           textAlign: 'left',
@@ -1160,6 +1488,13 @@ export default function BacktestPage() {
                     <input className="input" type="date" value={dateFrom} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateFrom(e.target.value)} />
                     <input className="input" type="date" value={dateTo} min={selectedTfMeta?.date_from} max={selectedTfMeta?.date_to} onChange={(e) => setDateTo(e.target.value)} />
                   </div>
+                  <button
+                    className="btn btn-topnav btn-sm"
+                    disabled={!selectedMongoOption}
+                    onClick={addSelectionToQueue}
+                  >
+                    Add to Queue
+                  </button>
                 </>
               ) : (
                 <>
@@ -1196,7 +1531,7 @@ export default function BacktestPage() {
                       <button
                         key={`${item.instrument_token}-${item.tradingsymbol}-${item.segment || ''}-${item.expiry || ''}-${item.strike || ''}`}
                         type="button"
-                        className="btn btn-topnav btn-sm"
+                        className="btn btn-dropdown btn-sm"
                         style={{
                           justifyContent: 'flex-start',
                           textAlign: 'left',
@@ -1240,10 +1575,35 @@ export default function BacktestPage() {
                   <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>
                     Available range for selected instrument: {ingestDateBounds.min} to {ingestDateBounds.max}
                   </div>
-                  <button className="btn btn-topnav btn-sm" disabled={Boolean(ingestDisabledReason)} onClick={startIngest}>
-                    {ingestStarting ? 'Starting...' : 'Fetch to MongoDB'}
-                  </button>
+                  <div className="backtest-inline-row">
+                    <button
+                      className="btn btn-topnav btn-sm"
+                      disabled={Boolean(ingestDisabledReason)}
+                      onClick={startIngest}
+                    >
+                      {ingestStarting ? 'Starting...' : 'Fetch to MongoDB'}
+                    </button>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      disabled={!ingestCanStop || ingestCancelling}
+                      onClick={stopIngest}
+                    >
+                      {ingestCancelling ? 'Stopping...' : 'Stop'}
+                    </button>
+                  </div>
                   {ingestDisabledReason ? <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{ingestDisabledReason}</div> : null}
+                  <button
+                    className="btn btn-topnav btn-sm"
+                    disabled={!selectedMongoOption || !zerodhaQueueReady}
+                    onClick={addSelectionToQueue}
+                  >
+                    Add to Queue
+                  </button>
+                  {!zerodhaQueueReady ? (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      Add to Queue is enabled after this fetch completes and the fetched MongoDB dataset is selected.
+                    </div>
+                  ) : null}
                   {ingestJob ? (
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
                       Job {ingestJob.job_id}: <b>{ingestJob.status}</b> ({ingestJob.phase || 'RUNNING'})
@@ -1253,6 +1613,14 @@ export default function BacktestPage() {
                       {' | '}inserted={ingestJob.inserted ?? 0}
                       {' | '}modified={ingestJob.modified ?? 0}
                       {ingestJob.error_message ? ` | ${ingestJob.error_message}` : ''}
+                    </div>
+                  ) : null}
+                  {ingestJob ? (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      Elapsed: {ingestTiming?.elapsedSec != null ? `${ingestTiming.elapsedSec}s` : 'Estimating...'}
+                      {' | '}Remaining chunks: {ingestTiming?.remainingChunks ?? 0}
+                      {' | '}ETA: {ingestTiming?.estimateMode === 'ready' && ingestTiming.estimatedFinishAt ? formatIst(ingestTiming.estimatedFinishAt) : 'Estimating...'}
+                      {' | '}Countdown: {ingestTiming?.estimateMode === 'ready' && ingestTiming.remainingSec != null ? `${ingestTiming.remainingSec}s` : 'Estimating...'}
                     </div>
                   ) : null}
                   {ingestStaleWarning ? (
@@ -1381,7 +1749,6 @@ export default function BacktestPage() {
           >
             <summary className="backtest-section-title backtest-section-title-nav">Execute Strategy</summary>
             <div className="backtest-button-row">
-              <button className="btn btn-topnav btn-sm" onClick={addSelectionToQueue}>Add to Queue</button>
               <button className="btn btn-topnav btn-sm" onClick={runNow} disabled={loading || !!runningTaskIds.length}>Run Now</button>
               <button className="btn btn-topnav btn-sm" onClick={handleRunQueue} disabled={queueSubmitting || !queueItems.length || !!runningTaskIds.length}>
                 {queueSubmitting ? 'Running...' : `Run Queue (${queueItems.length})`}
