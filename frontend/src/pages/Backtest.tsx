@@ -711,25 +711,6 @@ export default function BacktestPage() {
     };
   }, [ingestJob?.job_id, ingestJob?.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!runningTaskIds.length) return undefined;
-    // Slow fallback polling (WebSocket is primary).
-    const timer = window.setInterval(async () => {
-      try {
-        const refreshed = await getBacktests();
-        const next = normalizeResults(refreshed.results);
-        setResults(next);
-        const active = new Set(
-          next.filter((r) => r.status === 'RUNNING' || r.status === 'PENDING').map((r) => r.task_id),
-        );
-        setRunningTaskIds((prev) => prev.filter((id) => active.has(id)));
-      } catch {
-        // Keep running with existing WS streams.
-      }
-    }, 12000);
-    return () => window.clearInterval(timer);
-  }, [runningTaskIds, setResults]);
-
   const saveCurrentStrategy = async () => {
     const normalizedName = normalizeStrategyNameInput(strategyName);
     if (!normalizedName) return;

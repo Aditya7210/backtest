@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import Tooltip from './Tooltip';
 
 export interface SearchableOption {
   id: string;
@@ -13,6 +14,7 @@ interface Props {
   onChange: (value: string) => void;
   placeholder?: string;
   disabled?: boolean;
+  tooltipContent?: string;
 }
 
 export default function SearchableDropdown({
@@ -22,6 +24,7 @@ export default function SearchableDropdown({
   onChange,
   placeholder = 'Search...',
   disabled = false,
+  tooltipContent,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -45,18 +48,22 @@ export default function SearchableDropdown({
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return options.slice(0, 80);
-    return options
-      .filter((opt) => {
-        const hay = `${opt.label} ${opt.searchText || ''}`.toLowerCase();
-        return hay.includes(q);
-      })
-      .slice(0, 120);
+    if (!q) return options;
+    return options.filter((opt) => {
+      const hay = `${opt.label} ${opt.searchText || ''}`.toLowerCase();
+      return hay.includes(q);
+    });
   }, [options, query]);
 
   return (
     <div ref={rootRef} style={{ position: 'relative' }}>
-      <label className="stat-label">{label}</label>
+      {tooltipContent ? (
+        <Tooltip delayMs={2000} content={tooltipContent}>
+          <label className="stat-label">{label}</label>
+        </Tooltip>
+      ) : (
+        <label className="stat-label">{label}</label>
+      )}
       <button
         type="button"
         className="input"
@@ -133,4 +140,3 @@ export default function SearchableDropdown({
     </div>
   );
 }
-

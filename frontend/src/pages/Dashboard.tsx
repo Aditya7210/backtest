@@ -1111,6 +1111,7 @@ function DashboardModule({
             options={priceOptions}
             onChange={(next) => onUpdate(module.id, { priceId: next })}
             placeholder="Asset"
+            tooltipContent="Select chart data source. This changes loaded candles and downstream indicator calculations for this comparator module."
           />
         </div>
 
@@ -1157,6 +1158,7 @@ function DashboardModule({
             options={resultOptions}
             onChange={(next) => onUpdate(module.id, { tradeTaskId: next })}
             placeholder="Compare"
+            tooltipContent="Select a backtest result to compare. This updates tradebook rows, markers, and KPI context."
           />
         </div>
       </div>

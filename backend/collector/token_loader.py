@@ -13,8 +13,9 @@ from backend.utils.time_utils import today_ist
 
 
 # Collection universe controls.
-COLLECT_EQUITIES = True
+COLLECT_EQUITIES = False
 COLLECT_OPTIONS = True
+COLLECT_FUTURES = True
 COLLECT_VIX = True
 COLLECT_INDEX_SPOT_TOKENS = True
 EQUITY_UNIVERSE = "NIFTY500_PLUS_FNO"
@@ -31,12 +32,14 @@ NIFTY500_CONSTITUENTS_URL = (
 
 # Only these option underlyings are retained.
 OPTION_UNDERLYINGS = {"NIFTY", "BANKNIFTY"}
+FUTURES_UNDERLYINGS = {"NIFTY", "BANKNIFTY"}
 
 # Number of nearest expiries to include per underlying.
-EXPIRY_COUNT = 1
+EXPIRY_COUNT = 2
+FUTURES_EXPIRY_COUNT = 2
 
 # Keep CE/PE strikes around ATM. Set to 0 to collect the full selected expiry chain.
-STRIKES_AROUND_ATM = 0
+STRIKES_AROUND_ATM = 10
 
 # Optional index spot tokens used to estimate ATM strikes.
 INDEX_SPOT_SYMBOLS = ("NIFTY 50", "NIFTY BANK", "NIFTY", "BANKNIFTY")
@@ -341,6 +344,51 @@ def _apply_strike_window(
     return pd.concat(selected_frames, ignore_index=True)
 
 
+def _load_futures_tokens(
+    df: pd.DataFrame,
+    *,
+    underlyings: set[str],
+    expiry_count: int,
+) -> tuple[set[int], dict[int, dict[str, Any]]]:
+    exchange = _normalize_str_column(df, "exchange").str.upper()
+    instrument_type = _normalize_str_column(df, "instrument_type").str.upper()
+    name = _normalize_str_column(df, "name").str.upper()
+
+    fut_df = df.loc[
+        (exchange == "NFO")
+        & (instrument_type == "FUT")
+        & name.isin(set(underlyings))
+    ].copy()
+    if fut_df.empty:
+        return set(), {}
+
+    fut_df["name"] = _normalize_str_column(fut_df, "name").str.upper()
+    fut_df["expiry"] = pd.to_datetime(fut_df["expiry"], errors="coerce").dt.date
+    today = today_ist()
+    fut_df = fut_df[fut_df["expiry"].notna() & (fut_df["expiry"] >= today)]
+    if fut_df.empty:
+        return set(), {}
+    token_series = _coerce_token_series(fut_df["instrument_token"])
+    fut_df = fut_df.loc[token_series.index].copy()
+    fut_df["instrument_token"] = token_series
+
+    futures_meta: dict[int, dict[str, Any]] = {}
+    for underlying, group in fut_df.groupby("name", sort=False):
+        sorted_group = group.sort_values("expiry").head(max(1, int(expiry_count)))
+        for row in sorted_group.itertuples(index=False):
+            token = int(row.instrument_token)
+            expiry_val = row.expiry.isoformat() if isinstance(row.expiry, date) else ""
+            futures_meta[token] = {
+                "underlying": str(getattr(row, "name", "")).strip().upper(),
+                "expiry": expiry_val,
+                "tradingsymbol": str(getattr(row, "tradingsymbol", "")).strip().upper(),
+                "exchange": "NFO",
+                "segment": "NFO-FUT",
+            }
+
+    return set(futures_meta.keys()), futures_meta
+
+
 def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str, Any]:
     csv_path = (
         Path(instruments_csv_path).resolve()
@@ -371,11 +419,13 @@ def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str,
 
     collect_equities = _env_bool("LM_COLLECT_EQUITIES", COLLECT_EQUITIES)
     collect_options = _env_bool("LM_COLLECT_OPTIONS", COLLECT_OPTIONS)
+    collect_futures = _env_bool("LM_COLLECT_FUTURES", COLLECT_FUTURES)
     collect_vix = _env_bool("LM_COLLECT_VIX", COLLECT_VIX)
     collect_index_spots = _env_bool("LM_COLLECT_INDEX_SPOT_TOKENS", COLLECT_INDEX_SPOT_TOKENS)
     equity_universe_name = str(os.getenv("LM_EQUITY_UNIVERSE") or EQUITY_UNIVERSE).strip()
     equity_universe_path = _resolve_env_path("LM_EQUITY_UNIVERSE_PATH", EQUITY_UNIVERSE_PATH)
     expiry_count = _env_int("LM_OPTION_EXPIRY_COUNT", EXPIRY_COUNT, minimum=1)
+    futures_expiry_count = _env_int("LM_FUTURES_EXPIRY_COUNT", FUTURES_EXPIRY_COUNT, minimum=1)
     strikes_around_atm = _env_int("LM_STRIKES_AROUND_ATM", STRIKES_AROUND_ATM, minimum=0)
 
     equity_mask = (segment == "NSE") & (instrument_type == "EQ")
@@ -516,19 +566,35 @@ def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str,
             "expiry": expiry_value,
             "option_type": option_type,
             "tradingsymbol": symbol,
+            "underlying": str(getattr(row, "underlying", "")).strip().upper(),
+            "exchange": "NFO",
+            "segment": "NFO-OPT",
         }
         option_symbol_by_token[token] = symbol
 
+    futures_tokens: set[int] = set()
+    futures_meta: dict[int, dict[str, Any]] = {}
+    futures_symbol_by_token: dict[int, str] = {}
+    if collect_futures:
+        futures_tokens, futures_meta = _load_futures_tokens(
+            df,
+            underlyings=FUTURES_UNDERLYINGS,
+            expiry_count=futures_expiry_count,
+        )
+        futures_symbol_by_token = {token: meta["tradingsymbol"] for token, meta in futures_meta.items()}
+
     token_to_symbol: dict[int, str] = dict(equity_symbol_by_token)
+    token_to_symbol.update(futures_symbol_by_token)
     token_to_symbol.update(option_symbol_by_token)
     if vix_token is not None:
         token_to_symbol.setdefault(vix_token, "INDIA VIX")
 
-    total_tokens = len(equity_tokens) + len(options_tokens) + (1 if vix_token is not None else 0)
-    print(f"[token_loader] Config: equities={collect_equities}, options={collect_options}, vix={collect_vix}, "
-          f"index_spots={collect_index_spots}, expiry_count={expiry_count}, strikes_around_atm={strikes_around_atm}")
+    total_tokens = len(equity_tokens) + len(futures_tokens) + len(options_tokens) + (1 if vix_token is not None else 0)
+    print(f"[token_loader] Config: equities={collect_equities}, futures={collect_futures}, options={collect_options}, vix={collect_vix}, "
+          f"index_spots={collect_index_spots}, option_expiry_count={expiry_count}, futures_expiry_count={futures_expiry_count}, strikes_around_atm={strikes_around_atm}")
     print(f"[token_loader] Equity universe: {equity_universe_meta}")
     print(f"[token_loader] NSE equity/index tokens: {len(equity_tokens)}")
+    print(f"[token_loader] NFO futures tokens: {len(futures_tokens)}")
     print(f"[token_loader] NFO options tokens: {len(options_tokens)}")
     print(f"[token_loader] VIX token: {vix_token}")
     print(f"[token_loader] TOTAL subscription tokens: {total_tokens}")
@@ -543,6 +609,9 @@ def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str,
     return {
         "equity_tokens": equity_tokens,
         "equity_symbol_by_token": equity_symbol_by_token,
+        "futures_tokens": futures_tokens,
+        "futures_meta": futures_meta,
+        "futures_symbol_by_token": futures_symbol_by_token,
         "options_tokens": options_tokens,
         "options_meta": options_meta,
         "option_symbol_by_token": option_symbol_by_token,
@@ -550,6 +619,7 @@ def load_all_tokens(instruments_csv_path: str | Path | None = None) -> dict[str,
         "vix_token": vix_token,
         "token_counts": {
             "equity": len(equity_tokens),
+            "futures": len(futures_tokens),
             "options": len(options_tokens),
             "vix": 1 if vix_token is not None else 0,
             "total": total_tokens,

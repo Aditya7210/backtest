@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta
+import re
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend.database.connection import get_db
 from backend.database.repositories import bar_repository, instrument_repository
@@ -18,6 +19,8 @@ router = APIRouter(tags=["historical-data"])
 
 _ALLOWED_INTERVALS = {"minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute", "day"}
 _STALE_JOB_TIMEOUT_MINUTES = 20
+_DATE_ONLY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MIN_SUPPORTED_YEAR = 2000
 
 
 class HistoricalIngestRequest(BaseModel):
@@ -26,6 +29,26 @@ class HistoricalIngestRequest(BaseModel):
     from_date: str
     to_date: str
     interval: str = Field(default="day")
+
+    @field_validator("from_date", "to_date")
+    @classmethod
+    def _validate_date_only(cls, value: str) -> str:
+        raw = value.strip()
+        if not _DATE_ONLY_PATTERN.match(raw):
+            raise ValueError("Date must be in YYYY-MM-DD format.")
+        parsed = datetime.strptime(raw, "%Y-%m-%d")
+        max_year = datetime.now().year + 1
+        if parsed.year < _MIN_SUPPORTED_YEAR or parsed.year > max_year:
+            raise ValueError(f"Year must be between {_MIN_SUPPORTED_YEAR} and {max_year}.")
+        return raw
+
+    @field_validator("interval")
+    @classmethod
+    def _validate_interval(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned not in _ALLOWED_INTERVALS:
+            raise ValueError(f"Unsupported interval: {value}")
+        return cleaned
 
 
 def _map_ingest_error(exc: Exception) -> str:
@@ -107,9 +130,7 @@ async def get_historical_bars(
         bar.pop("_id", None)
         ts = bar.get("timestamp")
         if ts:
-            import calendar
-
-            bar["time"] = int(calendar.timegm(ts.timetuple()))
+            bar["time"] = int(ts.timestamp())
     return {"bars": bars, "total": len(bars)}
 
 
@@ -155,9 +176,7 @@ async def search_historical_instruments(
 @router.post("/historical/ingest")
 async def start_historical_ingest(request: HistoricalIngestRequest, background_tasks: BackgroundTasks):
     """Create and run a historical ingestion job in background."""
-    if request.interval not in _ALLOWED_INTERVALS:
-        raise HTTPException(status_code=422, detail=f"Unsupported interval: {request.interval}")
-    if request.from_date > request.to_date:
+    if datetime.strptime(request.from_date, "%Y-%m-%d") > datetime.strptime(request.to_date, "%Y-%m-%d"):
         raise HTTPException(status_code=422, detail="from_date must be <= to_date")
 
     job_id = str(uuid.uuid4())
@@ -176,6 +195,10 @@ async def start_historical_ingest(request: HistoricalIngestRequest, background_t
             "modified": 0,
             "current_chunk": 0,
             "total_chunks": 0,
+            "requested_from_date": request.from_date,
+            "requested_to_date": request.to_date,
+            "first_saved_trading_date": None,
+            "last_saved_trading_date": None,
             "error_message": None,
             "started_at": None,
             "completed_at": None,
@@ -249,6 +272,10 @@ async def _run_ingest_job(job_id: str, payload: dict[str, Any]) -> None:
                 "saved_rows": int(result.get("saved_rows", 0)),
                 "inserted": int(result.get("inserted", 0)),
                 "modified": int(result.get("modified", 0)),
+                "requested_from_date": result.get("requested_from_date", payload.get("from_date")),
+                "requested_to_date": result.get("requested_to_date", payload.get("to_date")),
+                "first_saved_trading_date": result.get("first_saved_trading_date"),
+                "last_saved_trading_date": result.get("last_saved_trading_date"),
                 "current_chunk": int(result.get("current_chunk", 0)),
                 "total_chunks": int(result.get("total_chunks", 0)),
                 "error_message": None,

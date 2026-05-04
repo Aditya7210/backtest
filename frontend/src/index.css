@@ -819,6 +819,66 @@ textarea:focus {
   background: #ffffff;
 }
 
+.continuous-page .card {
+  box-shadow: none;
+  border-color: #f1f5f9;
+}
+
+.continuous-page .card:hover {
+  box-shadow: none;
+  border-color: #e5e7eb;
+}
+
+.tooltip-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.tooltip-popover {
+  position: absolute;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: #111827;
+  color: #f8fafc;
+  font-size: 12px;
+  line-height: 1.35;
+  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.25);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 140ms ease, transform 140ms ease;
+  z-index: 120;
+}
+
+.tooltip-popover.open {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.tooltip-top {
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translate(-50%, 2px);
+}
+
+.tooltip-top.open {
+  transform: translate(-50%, 0);
+}
+
+.tooltip-bottom {
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translate(-50%, -2px);
+}
+
+.tooltip-bottom.open {
+  transform: translate(-50%, 0);
+}
+
 /* Backtest UI refinement (layout-only) */
 .backtest-page {
   width: 100%;

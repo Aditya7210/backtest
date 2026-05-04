@@ -90,11 +90,17 @@ def ingest(
     timeframe = _INTERVAL_TO_TIMEFRAME.get(interval, interval)
     instrument_type = _infer_instrument_type(tradingsymbol)
     db = get_sync_db()
+    requested_from = datetime.strptime(from_date, "%Y-%m-%d")
+    requested_to = datetime.strptime(to_date, "%Y-%m-%d")
+    requested_years = set(range(requested_from.year, requested_to.year + 1))
+    max_supported_year = datetime.now(tz=IST_TZ).year + 1
 
     rows_fetched = 0
     rows_saved = 0
     inserted = 0
     modified = 0
+    first_saved_trading_date: str | None = None
+    last_saved_trading_date: str | None = None
     current_chunk = 0
     total_chunks = 0
 
@@ -126,6 +132,22 @@ def ingest(
 
         deduped_by_ts: dict[str, UpdateOne] = {}
         for candle in candles:
+            ts = candle.get("date")
+            if isinstance(ts, datetime):
+                ts_ist = (ts.replace(tzinfo=IST_TZ) if ts.tzinfo is None else ts.astimezone(IST_TZ))
+                trading_date = ts_ist.strftime("%Y-%m-%d")
+                trading_year = int(trading_date[:4])
+                if trading_year < 2000 or trading_year > max_supported_year:
+                    raise ValueError(f"Refusing to ingest candle with out-of-range year {trading_year} ({trading_date}).")
+                if trading_year not in requested_years:
+                    raise ValueError(
+                        f"Refusing to ingest candle outside requested year range: requested={from_date}..{to_date}, got {trading_date}."
+                    )
+                if first_saved_trading_date is None or trading_date < first_saved_trading_date:
+                    first_saved_trading_date = trading_date
+                if last_saved_trading_date is None or trading_date > last_saved_trading_date:
+                    last_saved_trading_date = trading_date
+
             operation = _build_operation(
                 candle=candle,
                 instrument_token=instrument_token,
@@ -183,6 +205,10 @@ def ingest(
             "saved_rows": 0,
             "inserted": 0,
             "modified": 0,
+            "requested_from_date": from_date,
+            "requested_to_date": to_date,
+            "first_saved_trading_date": None,
+            "last_saved_trading_date": None,
             "current_chunk": current_chunk,
             "total_chunks": total_chunks,
         }
@@ -193,6 +219,10 @@ def ingest(
         "saved_rows": rows_saved,
         "inserted": inserted,
         "modified": modified,
+        "requested_from_date": from_date,
+        "requested_to_date": to_date,
+        "first_saved_trading_date": first_saved_trading_date,
+        "last_saved_trading_date": last_saved_trading_date,
         "current_chunk": current_chunk,
         "total_chunks": total_chunks,
     }

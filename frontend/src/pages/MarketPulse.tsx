@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { getCollectorStatus, getSnapshot, startCalculator, startCollector, stopCalculator, stopCollector } from '../services/api';
-import PageMetaBar from '../components/PageMetaBar';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { getCollectorStatus, getMarketView, getSnapshot, startCalculator, startCollector, stopCalculator, stopCollector } from '../services/api';
+import { basisFromSpotAndFuture, parseMarketViewPayload, type MarketViewPayload } from '../features/live-market/marketView';
+import Tooltip from '../components/Tooltip';
 
 type Snapshot = Record<string, unknown>;
 
@@ -25,73 +26,117 @@ function parseSnapshot(payload: unknown): Snapshot {
 
 export default function MarketPulsePage() {
   const [collectorStatus, setCollectorStatus] = useState<Record<string, unknown>>({});
-  const [adSnapshot, setAdSnapshot] = useState<Snapshot>({});
+  const [marketView, setMarketView] = useState<MarketViewPayload>({
+    generated_at: null,
+    market_view: { NIFTY: { spot: null, futures: [] }, BANKNIFTY: { spot: null, futures: [] } },
+  });
   const [pcrSnapshot, setPcrSnapshot] = useState<Snapshot>({});
   const [vixSnapshot, setVixSnapshot] = useState<Snapshot>({});
   const [atmSnapshot, setAtmSnapshot] = useState<Snapshot>({});
   const [underlying, setUnderlying] = useState<'NIFTY' | 'BANKNIFTY'>('NIFTY');
+  const [selectedExpiry, setSelectedExpiry] = useState<string>('ALL');
   const [error, setError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
 
+  const fetchAll = useCallback(async () => {
+    try {
+      const [status, marketViewResp, pcr, vix, atm] = await Promise.all([
+        getCollectorStatus(),
+        getMarketView(),
+        getSnapshot('pcr'),
+        getSnapshot('vix'),
+        getSnapshot('atm_oi'),
+      ]);
+      setCollectorStatus(asObj(status));
+      setMarketView(parseMarketViewPayload(marketViewResp));
+      setPcrSnapshot(parseSnapshot(pcr));
+      setVixSnapshot(parseSnapshot(vix));
+      setAtmSnapshot(parseSnapshot(atm));
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to load market pulse');
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchAll();
+  }, [fetchAll]);
+
   useEffect(() => {
     let mounted = true;
-    let timer: number | null = null;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
 
-    const fetchAll = async () => {
+    socket.onmessage = (event) => {
+      if (!mounted) return;
       try {
-        const [status, ad, pcr, vix, atm] = await Promise.all([
-          getCollectorStatus(),
-          getSnapshot('ad'),
-          getSnapshot('pcr'),
-          getSnapshot('vix'),
-          getSnapshot('atm_oi'),
-        ]);
-        if (!mounted) return;
-        setCollectorStatus(asObj(status));
-        setAdSnapshot(parseSnapshot(ad));
-        setPcrSnapshot(parseSnapshot(pcr));
-        setVixSnapshot(parseSnapshot(vix));
-        setAtmSnapshot(parseSnapshot(atm));
-        setError(null);
-      } catch (e: unknown) {
-        if (!mounted) return;
-        setError(e instanceof Error ? e.message : 'Failed to refresh market pulse');
+        const payload = asObj(JSON.parse(event.data) as unknown);
+        if (payload.type !== 'snapshot_update') return;
+        setPcrSnapshot(parseSnapshot(payload.pcr));
+        setVixSnapshot(parseSnapshot(payload.vix));
+        setAtmSnapshot(parseSnapshot(payload.atm_oi));
+      } catch {
+        // Ignore malformed payloads.
       }
     };
+    socket.onerror = () => {
+      if (mounted) setError((prev) => prev ?? 'Live stream connection issue. Showing latest loaded snapshot data.');
+    };
+    socket.onclose = () => {
+      if (mounted) setError((prev) => prev ?? 'Live stream disconnected. Reload page to reconnect.');
+    };
 
-    fetchAll();
-    timer = window.setInterval(fetchAll, 1000);
     return () => {
       mounted = false;
-      if (timer != null) window.clearInterval(timer);
+      socket.close();
     };
   }, []);
 
   const collector = asObj(collectorStatus.collector);
   const calculator = asObj(collectorStatus.calculator);
-  const collectorFile = asObj(collectorStatus.collector_file_status);
+  const collectorFile = {
+    ...asObj(collector),
+    ...asObj(collectorStatus.collector_file_status),
+  };
   const health = asObj(collectorStatus.collector_status_health);
-
-  const adData = useMemo(() => {
-    const universes = asObj(adSnapshot.universes);
-    const selected =
-      (underlying === 'BANKNIFTY' ? asObj(universes['NIFTY BANK']) : asObj(universes['NIFTY 50']));
-    return Object.keys(selected).length ? selected : adSnapshot;
-  }, [adSnapshot, underlying]);
+  const snapshotHealth = asObj(collectorStatus.snapshot_health);
 
   const optionChainRows = useMemo(() => {
-    const chainRoot = asObj(pcrSnapshot.option_chain);
+    const chainRoot = {
+      ...asObj(pcrSnapshot.option_chain),
+      ...asObj(atmSnapshot.option_chain),
+    };
     const rows = chainRoot[underlying];
     return Array.isArray(rows) ? rows : [];
-  }, [pcrSnapshot, underlying]);
+  }, [atmSnapshot, pcrSnapshot, underlying]);
+
+  const chainExpiries = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          optionChainRows
+            .map((r) => asObj(r))
+            .map((r) => (typeof r.expiry === 'string' ? r.expiry : ''))
+            .filter(Boolean),
+        ),
+      ).sort(),
+    [optionChainRows],
+  );
+
+  useEffect(() => {
+    if (selectedExpiry !== 'ALL' && !chainExpiries.includes(selectedExpiry)) setSelectedExpiry('ALL');
+  }, [selectedExpiry, chainExpiries]);
 
   const atm = underlying === 'BANKNIFTY'
     ? asNum(atmSnapshot.banknifty_atm_strike)
     : asNum(atmSnapshot.nifty_atm_strike);
 
   const visibleRows = useMemo(() => {
-    if (!optionChainRows.length) return [];
-    const mapped = optionChainRows
+    const sourceRows = selectedExpiry === 'ALL'
+      ? optionChainRows
+      : optionChainRows.filter((r) => asObj(r).expiry === selectedExpiry);
+    if (!sourceRows.length) return [];
+    const mapped = sourceRows
       .map((r) => asObj(r))
       .filter((r) => asNum(r.strike) != null)
       .sort((a, b) => (asNum(a.strike) ?? 0) - (asNum(b.strike) ?? 0));
@@ -102,16 +147,24 @@ export default function MarketPulsePage() {
       .slice(0, 25)
       .map((x) => x.r)
       .sort((a, b) => (asNum(a.strike) ?? 0) - (asNum(b.strike) ?? 0));
-  }, [optionChainRows, atm]);
+  }, [optionChainRows, atm, selectedExpiry]);
 
   const collectorLive = String(collector.status || '').toLowerCase() === 'running';
   const calculatorLive = String(calculator.status || '').toLowerCase() === 'running';
+  const collectorWarmingUp = Boolean(collector.warming_up);
+  const atmWarning = typeof atmSnapshot.warning === 'string' ? atmSnapshot.warning : null;
+  const staleWarnings = [
+    collectorWarmingUp ? 'Collector warming up: ticks are live, first persisted 1-minute bar appears after minute close.' : null,
+    health.collector_stale ? 'Collector heartbeat is stale.' : null,
+    health.calculator_stale ? 'Calculator heartbeat is stale.' : null,
+    health.snapshots_stale ? 'One or more snapshots are stale.' : null,
+  ].filter(Boolean) as string[];
 
   const runAction = async (actionId: string, fn: () => Promise<unknown>) => {
     setActionBusy(actionId);
     try {
       await fn();
-      setError(null);
+      await fetchAll();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Action failed');
     } finally {
@@ -120,16 +173,7 @@ export default function MarketPulsePage() {
   };
 
   return (
-    <div className="animate-in">
-      <div className="page-header">
-        <h1 className="page-title">Market Pulse</h1>
-        <p className="page-subtitle">Real-time collector, calculator and snapshot monitoring</p>
-        <PageMetaBar
-          items={['Collector Controls', 'Calculator Controls', 'Snapshot Monitoring']}
-          rightText="Auto refresh 1s"
-        />
-      </div>
-
+    <div className="animate-in continuous-page">
       <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
         <div className="card-header" style={{ marginBottom: 10 }}>
           <span className="card-title">Control Bar</span>
@@ -148,44 +192,102 @@ export default function MarketPulsePage() {
             disabled={collectorLive || actionBusy !== null}
             onClick={() => runAction('start-collector', startCollector)}
           >
-            {actionBusy === 'start-collector' ? 'Starting...' : 'Start Collector'}
+            <Tooltip delayMs={2000} content="Starts live WebSocket collection. This enables incoming ticks and 1-minute bar persistence, increasing live write load.">
+              <span>{actionBusy === 'start-collector' ? 'Starting...' : 'Start Collector'}</span>
+            </Tooltip>
           </button>
           <button
             className="btn btn-danger btn-sm"
             disabled={!collectorLive || actionBusy !== null}
             onClick={() => runAction('stop-collector', stopCollector)}
           >
-            {actionBusy === 'stop-collector' ? 'Stopping...' : 'Stop Collector'}
+            <Tooltip delayMs={2000} content="Stops live data ingestion. No new ticks/bars will arrive until restarted.">
+              <span>{actionBusy === 'stop-collector' ? 'Stopping...' : 'Stop Collector'}</span>
+            </Tooltip>
           </button>
           <button
             className="btn btn-success btn-sm"
             disabled={calculatorLive || actionBusy !== null}
             onClick={() => runAction('start-calc', startCalculator)}
           >
-            {actionBusy === 'start-calc' ? 'Starting...' : 'Start Calc'}
+            <Tooltip delayMs={2000} content="Starts snapshot calculations (PCR, ATM OI, VIX) and keeps live market-view lens fresh for pulse monitoring.">
+              <span>{actionBusy === 'start-calc' ? 'Starting...' : 'Start Calc'}</span>
+            </Tooltip>
           </button>
           <button
             className="btn btn-danger btn-sm"
             disabled={!calculatorLive || actionBusy !== null}
             onClick={() => runAction('stop-calc', stopCalculator)}
           >
-            {actionBusy === 'stop-calc' ? 'Stopping...' : 'Stop Calc'}
+            <Tooltip delayMs={2000} content="Stops snapshot calculations. Existing snapshots remain visible but freshness will degrade over time.">
+              <span>{actionBusy === 'stop-calc' ? 'Stopping...' : 'Stop Calc'}</span>
+            </Tooltip>
           </button>
         </div>
       </div>
 
       {error ? <div className="card" style={{ marginBottom: 'var(--space-lg)', color: 'var(--red)' }}>{error}</div> : null}
+      {staleWarnings.length || atmWarning ? (
+        <div className="card" style={{ marginBottom: 'var(--space-lg)', color: '#92400e' }}>
+          {[...staleWarnings, atmWarning].filter(Boolean).map((msg, idx) => (
+            <div key={`mp-warning-${idx}`}>{msg}</div>
+          ))}
+        </div>
+      ) : null}
 
       <div className="grid grid-4" style={{ marginBottom: 'var(--space-lg)' }}>
-        <div className="card"><div className="stat-label">Advances</div><div className="stat-value neutral">{asNum(adData.advances) ?? 0}</div></div>
-        <div className="card"><div className="stat-label">Declines</div><div className="stat-value neutral">{asNum(adData.declines) ?? 0}</div></div>
-        <div className="card"><div className="stat-label">A/D Ratio</div><div className="stat-value neutral">{(asNum(adData.ad_ratio) ?? 0).toFixed(4)}</div></div>
-        <div className="card"><div className="stat-label">VIX</div><div className="stat-value neutral">{(asNum(vixSnapshot.vix) ?? 0).toFixed(2)}</div></div>
+        <div className="card"><div className="stat-label">NIFTY Spot</div><div className="stat-value neutral">{marketView.market_view.NIFTY.spot?.price != null ? marketView.market_view.NIFTY.spot.price.toFixed(2) : '--'}</div></div>
+        <div className="card"><div className="stat-label">NIFTY Basis</div><div className="stat-value neutral">{basisFromSpotAndFuture(marketView.market_view.NIFTY.spot?.price ?? null, marketView.market_view.NIFTY.futures[0]?.price ?? null) != null ? `${(basisFromSpotAndFuture(marketView.market_view.NIFTY.spot?.price ?? null, marketView.market_view.NIFTY.futures[0]?.price ?? null) as number).toFixed(2)}` : '--'}</div></div>
+        <div className="card"><div className="stat-label">BANKNIFTY Spot</div><div className="stat-value neutral">{marketView.market_view.BANKNIFTY.spot?.price != null ? marketView.market_view.BANKNIFTY.spot.price.toFixed(2) : '--'}</div></div>
+        <div className="card"><div className="stat-label">BANKNIFTY Basis</div><div className="stat-value neutral">{basisFromSpotAndFuture(marketView.market_view.BANKNIFTY.spot?.price ?? null, marketView.market_view.BANKNIFTY.futures[0]?.price ?? null) != null ? `${(basisFromSpotAndFuture(marketView.market_view.BANKNIFTY.spot?.price ?? null, marketView.market_view.BANKNIFTY.futures[0]?.price ?? null) as number).toFixed(2)}` : '--'}</div></div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
+        <div className="card-header">
+          <span className="card-title">Market View</span>
+          <Tooltip delayMs={2000} content="Switches universe focus for market-view lens and option chain. This does not change collector subscriptions.">
+            <select style={{ width: 180 }} value={underlying} onChange={(e) => setUnderlying(e.target.value as 'NIFTY' | 'BANKNIFTY')}>
+              <option value="NIFTY">NIFTY 50</option>
+              <option value="BANKNIFTY">BANKNIFTY</option>
+            </select>
+          </Tooltip>
+        </div>
+        {(['NIFTY', 'BANKNIFTY'] as const).map((name) => {
+          const side = marketView.market_view[name];
+          const spot = side.spot?.price ?? null;
+          const futures = side.futures || [];
+          return (
+            <div key={`mp-view-${name}`} style={{ marginBottom: 12 }}>
+              <div className="stat-label" style={{ marginBottom: 4 }}>{name}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.max(2, futures.length + 1)}, minmax(0, 1fr))`, gap: 8 }}>
+                <div style={{ background: 'var(--bg-subtle)', borderRadius: 6, padding: '6px 10px' }}>
+                  <div className="stat-label">Spot</div>
+                  <div className="stat-value neutral" style={{ fontSize: '1rem' }}>{spot != null ? spot.toFixed(2) : '--'}</div>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{side.spot?.tradingsymbol || '--'}</div>
+                </div>
+                {futures.map((future, idx) => {
+                  const basis = basisFromSpotAndFuture(spot, future.price);
+                  return (
+                    <div key={`mp-view-fut-${name}-${idx}`} style={{ background: 'var(--bg-subtle)', borderRadius: 6, padding: '6px 10px' }}>
+                      <div className="stat-label">{idx === 0 ? 'Current Fut' : 'Next Fut'}</div>
+                      <div className="stat-value neutral" style={{ fontSize: '1rem' }}>{future.price != null ? future.price.toFixed(2) : '--'}</div>
+                      <div style={{ fontSize: '0.72rem', color: basis == null ? 'var(--text-muted)' : basis >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                        {basis != null ? `${basis >= 0 ? '+' : ''}${basis.toFixed(2)} basis` : '--'}
+                      </div>
+                      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{future.expiry || '--'}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       <div className="grid grid-4" style={{ marginBottom: 'var(--space-lg)' }}>
-        <div className="card"><div className="stat-label">NIFTY PCR</div><div className="stat-value neutral">{(asNum(pcrSnapshot.nifty_pcr) ?? 0).toFixed(4)}</div></div>
-        <div className="card"><div className="stat-label">BANKNIFTY PCR</div><div className="stat-value neutral">{(asNum(pcrSnapshot.banknifty_pcr) ?? 0).toFixed(4)}</div></div>
+        <div className="card"><div className="stat-label">VIX</div><div className="stat-value neutral">{(asNum(vixSnapshot.vix) ?? 0).toFixed(2)}</div></div>
+        <div className="card"><div className="stat-label">NIFTY PCR</div><div className="stat-value neutral">{asNum(pcrSnapshot.nifty_pcr) != null ? (asNum(pcrSnapshot.nifty_pcr) as number).toFixed(4) : '--'}</div></div>
+        <div className="card"><div className="stat-label">BANKNIFTY PCR</div><div className="stat-value neutral">{asNum(pcrSnapshot.banknifty_pcr) != null ? (asNum(pcrSnapshot.banknifty_pcr) as number).toFixed(4) : '--'}</div></div>
         <div className="card"><div className="stat-label">NIFTY ATM Strike</div><div className="stat-value neutral">{asNum(atmSnapshot.nifty_atm_strike) ?? '--'}</div></div>
         <div className="card"><div className="stat-label">BANKNIFTY ATM Strike</div><div className="stat-value neutral">{asNum(atmSnapshot.banknifty_atm_strike) ?? '--'}</div></div>
       </div>
@@ -193,25 +295,38 @@ export default function MarketPulsePage() {
       <div className="card" style={{ marginBottom: 'var(--space-lg)' }}>
         <div className="card-header">
           <span className="card-title">Runtime Status</span>
-          <select style={{ width: 180 }} value={underlying} onChange={(e) => setUnderlying(e.target.value as 'NIFTY' | 'BANKNIFTY')}>
-            <option value="NIFTY">NIFTY 50</option>
-            <option value="BANKNIFTY">BANKNIFTY</option>
-          </select>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-md)', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
           <div>Collector PID: {String(collector.pid ?? '--')}</div>
           <div>Calculator PID: {String(calculator.pid ?? '--')}</div>
           <div>Bars written: {String(collectorFile.bars_written ?? '--')}</div>
+          <div>Ticks seen: {String(collector.ticks_seen ?? '--')}</div>
           <div>Tokens subscribed: {String(collectorFile.tokens_subscribed ?? '--')}</div>
           <div>Last tick at: {String(collectorFile.last_tick_at ?? '--')}</div>
-          <div>Status freshness ok: {String(health.status_recent ?? '--')}</div>
+          <div>Last bar at: {String(collectorFile.last_bar_at ?? '--')}</div>
+          <div>Collector recent: {String(health.status_recent ?? '--')}</div>
+          <div>Tick recent: {String(health.tick_recent ?? '--')}</div>
+          <div>Bar recent: {String(health.bar_recent ?? '--')}</div>
+          <div>Calculator last cycle: {String(calculator.last_cycle_at ?? '--')}</div>
+          <div>Snapshots stale: {String(health.snapshots_stale ?? '--')}</div>
+          <div>ATM OI fresh: {String(!asObj(snapshotHealth.atm_oi).stale || false)}</div>
         </div>
       </div>
 
       <div className="card">
         <div className="card-header">
           <span className="card-title">Option Chain ({underlying})</span>
-          <span className="badge badge-info">{visibleRows.length} strikes</span>
+          <div style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
+            <Tooltip delayMs={2000} content="Filters option-chain rows by expiry. Narrowing expiry improves readability and can reveal expiry-specific OI structure.">
+              <select value={selectedExpiry} onChange={(e) => setSelectedExpiry(e.target.value)} style={{ width: 160 }}>
+                <option value="ALL">All Expiries</option>
+                {chainExpiries.map((x) => (
+                  <option key={x} value={x}>{x}</option>
+                ))}
+              </select>
+            </Tooltip>
+            <span className="badge badge-info">{visibleRows.length} strikes</span>
+          </div>
         </div>
         <div className="table-wrapper" style={{ maxHeight: 420, overflow: 'auto' }}>
           <table>
@@ -236,7 +351,7 @@ export default function MarketPulsePage() {
                     <td>{Math.round(asNum(row.ce_oi) ?? 0).toLocaleString()}</td>
                     <td>{(asNum(row.pe_ltp) ?? 0).toFixed(2)}</td>
                     <td>{Math.round(asNum(row.pe_oi) ?? 0).toLocaleString()}</td>
-                    <td>{(asNum(row.strike_pcr) ?? 0).toFixed(4)}</td>
+                    <td>{asNum(row.strike_pcr) != null ? (asNum(row.strike_pcr) as number).toFixed(4) : '--'}</td>
                   </tr>
                 );
               })}

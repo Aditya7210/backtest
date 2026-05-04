@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import {
+  isBusinessDay,
   ColorType,
   LineStyle,
   createChart,
@@ -8,6 +9,7 @@ import {
   type LineData,
   type Time,
 } from 'lightweight-charts';
+import { formatUnixIst } from '../features/time/ist';
 
 export interface LinePoint {
   time: number;
@@ -46,7 +48,24 @@ export default function LightweightLineChart({ title, series, height = 260 }: Pr
       width: containerRef.current.clientWidth,
       height,
       rightPriceScale: { borderColor: '#E5E7EB' },
-      timeScale: { borderColor: '#E5E7EB', timeVisible: true, secondsVisible: false },
+      timeScale: {
+        borderColor: '#E5E7EB',
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => {
+          if (typeof time === 'number') return formatUnixIst(time, 'time');
+          if (isBusinessDay(time)) return `${time.day}/${time.month}`;
+          return '';
+        },
+      },
+      localization: {
+        locale: 'en-IN',
+        timeFormatter: (time: Time) => {
+          if (typeof time === 'number') return formatUnixIst(time, 'datetime');
+          if (isBusinessDay(time)) return `${time.year}-${String(time.month).padStart(2, '0')}-${String(time.day).padStart(2, '0')}`;
+          return '';
+        },
+      },
     });
     chartRef.current = chart;
 
@@ -102,4 +121,3 @@ export default function LightweightLineChart({ title, series, height = 260 }: Pr
     </div>
   );
 }
-

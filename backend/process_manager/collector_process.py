@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from backend.database.sync_connection import get_sync_db
+from backend.utils.time_utils import now_ist_iso
 
 _collector_process: subprocess.Popen | None = None
 
@@ -39,6 +40,9 @@ def start_collector() -> dict[str, Any]:
         {"$set": {
             "collector.status": "running",
             "collector.pid": _collector_process.pid,
+            "collector.started_at": now_ist_iso(),
+            "collector.heartbeat_at": now_ist_iso(),
+            "collector.last_error": None,
         }},
         upsert=True,
     )
@@ -68,7 +72,11 @@ def stop_collector() -> dict[str, Any]:
     db = get_sync_db()
     db.collector_status.update_one(
         {"_id": "singleton"},
-        {"$set": {"collector.status": "stopped", "collector.pid": None}},
+        {"$set": {
+            "collector.status": "stopped",
+            "collector.pid": None,
+            "collector.heartbeat_at": now_ist_iso(),
+        }},
         upsert=True,
     )
 

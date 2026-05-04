@@ -20,8 +20,10 @@ class IndicatorSpec(BaseModel):
 class IndicatorComputeRequest(BaseModel):
     instrument_token: int
     timeframe: str
-    date_from: str
-    date_to: str
+    date_from: str | None = None
+    date_to: str | None = None
+    trading_date: str | None = None
+    limit: int | None = Field(default=None, ge=50, le=10000)
     indicators: list[IndicatorSpec]
 
 
@@ -54,7 +56,10 @@ async def compute_indicators(request: IndicatorComputeRequest):
         timeframe=request.timeframe,
         date_from=request.date_from,
         date_to=request.date_to,
+        trading_date=request.trading_date,
     )
+    if request.limit and len(bars) > request.limit:
+        bars = bars[-request.limit :]
     if not bars:
         return {"series": [], "warnings": ["No bars found for selected data range."]}
 
@@ -71,4 +76,3 @@ async def compute_indicators(request: IndicatorComputeRequest):
         raise HTTPException(status_code=500, detail=f"Indicator compute failed: {exc}") from exc
 
     return {"series": series, "warnings": warnings}
-

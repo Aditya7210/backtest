@@ -6,6 +6,28 @@ export interface OHLCVBar {
   low: number;
   close: number;
   volume: number;
+  oi?: number | null;
+}
+
+export type LiveTimeframe =
+  | '1min'
+  | '3min'
+  | '5min'
+  | '10min'
+  | '15min'
+  | '20min'
+  | '30min'
+  | '45min'
+  | '60min'
+  | '1day';
+
+export interface LiveTick {
+  instrument_token: number;
+  last_price: number;
+  volume_traded?: number;
+  oi?: number;
+  time: number;
+  timestamp?: string;
 }
 
 export interface Snapshot {
@@ -69,4 +91,67 @@ export interface Instrument {
   exchange: string;
   segment: string;
   instrument_type: string;
+}
+
+export interface LiveInstrumentItem {
+  instrument_token: number;
+  tradingsymbol: string;
+  instrument_type: string;
+  data_source: string;
+  timeframe: string;
+  trading_date: string;
+  first_bar_at?: string | null;
+  last_bar_at?: string | null;
+  first_bar_time?: number | null;
+  last_bar_time?: number | null;
+  total_bars: number;
+  last_close?: number | null;
+  exchange?: string;
+  segment?: string;
+  underlying?: string;
+  expiry?: string;
+  strike?: number | null;
+  option_type?: string;
+  is_active: boolean;
+  stale_seconds?: number | null;
+}
+
+export interface LiveUniverseHealth {
+  nifty_spot_present: boolean;
+  banknifty_spot_present: boolean;
+  nifty_option_tokens: number;
+  banknifty_option_tokens: number;
+  nifty_ce_count: number;
+  nifty_pe_count: number;
+  banknifty_ce_count: number;
+  banknifty_pe_count: number;
+  nifty_futures_count: number;
+  banknifty_futures_count: number;
+  active_instruments: number;
+  stale_instruments: number;
+  total_instruments: number;
+}
+
+export interface MarketViewSpot {
+  price: number | null;
+  tradingsymbol: string;
+  updated_at: string | null;
+}
+
+export interface MarketViewFuture {
+  price: number | null;
+  tradingsymbol: string;
+  expiry: string | null;
+  oi: number;
+  updated_at: string | null;
+}
+
+export interface MarketViewSide {
+  spot: MarketViewSpot | null;
+  futures: MarketViewFuture[];
+}
+
+export interface MarketViewResponse {
+  generated_at: string | null;
+  market_view: Record<'NIFTY' | 'BANKNIFTY', MarketViewSide>;
 }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import {
+  isBusinessDay,
   ColorType,
   CrosshairMode,
   LineStyle,
@@ -12,6 +13,7 @@ import {
   type Time,
 } from 'lightweight-charts';
 import type { OHLCVBar } from '../types/market';
+import { formatUnixIst } from '../features/time/ist';
 
 interface OverlaySeries {
   key: string;
@@ -20,10 +22,19 @@ interface OverlaySeries {
   data: Array<{ time: number; value: number }>;
 }
 
+interface CandleOverlaySeries {
+  key: string;
+  label: string;
+  bars: OHLCVBar[];
+  upColor?: string;
+  downColor?: string;
+}
+
 interface Props {
   bars: OHLCVBar[];
   symbol: string;
   overlays?: OverlaySeries[];
+  candleOverlays?: CandleOverlaySeries[];
   markers?: Array<{
     time: number;
     position: 'aboveBar' | 'belowBar' | 'inBar';
@@ -32,6 +43,7 @@ interface Props {
     text?: string;
   }>;
   onCrosshairTime?: (time: number | null) => void;
+  autoScroll?: boolean;
 }
 
 function toSeriesData(bars: OHLCVBar[]): CandlestickData<Time>[] {
@@ -49,13 +61,16 @@ export default function LightweightCandlestickChart({
   bars,
   symbol,
   overlays = [],
+  candleOverlays = [],
   markers = [],
   onCrosshairTime,
+  autoScroll = true,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const overlayRefs = useRef<Array<{ key: string; series: ISeriesApi<'Line'> }>>([]);
+  const candleOverlayRefs = useRef<Array<{ key: string; series: ISeriesApi<'Candlestick'> }>>([]);
   const data = useMemo(() => toSeriesData(bars), [bars]);
 
   useEffect(() => {
@@ -74,7 +89,24 @@ export default function LightweightCandlestickChart({
       width: containerRef.current.clientWidth,
       height: 420,
       rightPriceScale: { borderColor: '#E5E7EB' },
-      timeScale: { borderColor: '#E5E7EB', timeVisible: true, secondsVisible: false },
+      timeScale: {
+        borderColor: '#E5E7EB',
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => {
+          if (typeof time === 'number') return formatUnixIst(time, 'time');
+          if (isBusinessDay(time)) return `${time.day}/${time.month}`;
+          return '';
+        },
+      },
+      localization: {
+        locale: 'en-IN',
+        timeFormatter: (time: Time) => {
+          if (typeof time === 'number') return formatUnixIst(time, 'datetime');
+          if (isBusinessDay(time)) return `${time.year}-${String(time.month).padStart(2, '0')}-${String(time.day).padStart(2, '0')}`;
+          return '';
+        },
+      },
       crosshair: { mode: CrosshairMode.Normal },
     });
 
@@ -112,6 +144,7 @@ export default function LightweightCandlestickChart({
       chartRef.current = null;
       seriesRef.current = null;
       overlayRefs.current = [];
+      candleOverlayRefs.current = [];
     };
   }, [onCrosshairTime]);
 
@@ -142,11 +175,34 @@ export default function LightweightCandlestickChart({
     } else {
       markerApi.setMarkers?.([]);
     }
+    if (chartRef.current && autoScroll) {
+      chartRef.current.timeScale().scrollToRealTime();
+    }
   }, [data, markers]);
 
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
+
+    for (const entry of candleOverlayRefs.current) {
+      chart.removeSeries(entry.series);
+    }
+    candleOverlayRefs.current = [];
+
+    for (const overlay of candleOverlays) {
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: overlay.upColor ?? 'rgba(59,130,246,0.32)',
+        downColor: overlay.downColor ?? 'rgba(239,68,68,0.28)',
+        borderVisible: false,
+        wickUpColor: overlay.upColor ?? 'rgba(59,130,246,0.45)',
+        wickDownColor: overlay.downColor ?? 'rgba(239,68,68,0.4)',
+        priceLineVisible: false,
+        lastValueVisible: false,
+        title: overlay.label,
+      });
+      candleSeries.setData(toSeriesData(overlay.bars));
+      candleOverlayRefs.current.push({ key: overlay.key, series: candleSeries });
+    }
 
     for (const entry of overlayRefs.current) {
       chart.removeSeries(entry.series);
@@ -171,7 +227,7 @@ export default function LightweightCandlestickChart({
     }
 
     chart.timeScale().fitContent();
-  }, [overlays]);
+  }, [candleOverlays, overlays]);
 
   return (
     <div>

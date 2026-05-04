@@ -1,6 +1,15 @@
 /* API service — all backend HTTP calls */
 
 const BASE = '/api';
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function normalizeDateOnlyInput(value: unknown, field: string): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!DATE_ONLY_PATTERN.test(raw)) {
+    throw new Error(`Invalid ${field}. Expected YYYY-MM-DD.`);
+  }
+  return raw;
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -33,11 +42,59 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const getMarketBars = (token: number, tf = '1min', date?: string) =>
   request<{ bars: unknown[] }>(`/market/bars/${token}?timeframe=${tf}${date ? `&trading_date=${date}` : ''}`);
 
+export const getLatestMarketTick = (token: number) =>
+  request<{ instrument_token: number; tick: Record<string, unknown> | null }>(`/market/tick/${token}`);
+
 export const getSnapshot = (type: string) =>
   request<Record<string, unknown>>(`/market/snapshot/${type}`);
 
 export const getAllSnapshots = () =>
   request<Record<string, unknown>>('/market/snapshots/all');
+
+export const getLiveInstruments = (params?: {
+  q?: string;
+  instrument_type?: string;
+  universe?: string;
+  underlying?: string;
+  expiry?: string;
+  timeframe?: string;
+  trading_date?: string;
+  data_source?: string;
+  active_only?: boolean;
+  stale_threshold_seconds?: number;
+  limit?: number;
+}) => {
+  const qs = new URLSearchParams();
+  if (params?.q) qs.set('q', params.q);
+  if (params?.instrument_type) qs.set('instrument_type', params.instrument_type);
+  if (params?.universe) qs.set('universe', params.universe);
+  if (params?.underlying) qs.set('underlying', params.underlying);
+  if (params?.expiry) qs.set('expiry', params.expiry);
+  if (params?.timeframe) qs.set('timeframe', params.timeframe);
+  if (params?.trading_date) qs.set('trading_date', params.trading_date);
+  if (params?.data_source) qs.set('data_source', params.data_source);
+  if (typeof params?.active_only === 'boolean') qs.set('active_only', String(params.active_only));
+  if (params?.stale_threshold_seconds != null) qs.set('stale_threshold_seconds', String(params.stale_threshold_seconds));
+  if (params?.limit != null) qs.set('limit', String(params.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return request<Record<string, unknown>>(`/live/instruments${suffix}`);
+};
+
+export const getLiveUniverseHealth = (params?: {
+  trading_date?: string;
+  timeframe?: string;
+  stale_threshold_seconds?: number;
+}) => {
+  const qs = new URLSearchParams();
+  if (params?.trading_date) qs.set('trading_date', params.trading_date);
+  if (params?.timeframe) qs.set('timeframe', params.timeframe);
+  if (params?.stale_threshold_seconds != null) qs.set('stale_threshold_seconds', String(params.stale_threshold_seconds));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return request<Record<string, unknown>>(`/live/universe-health${suffix}`);
+};
+
+export const getMarketView = () =>
+  request<Record<string, unknown>>('/live/market-view');
 
 /* Historical Data */
 export const getCatalog = () =>
@@ -64,7 +121,16 @@ export const updateMapperInstruments = () =>
 export const startHistoricalIngest = (body: unknown) =>
   request<{ job_id: string; status: string }>('/historical/ingest', {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: (() => {
+      const payload = (body && typeof body === 'object') ? { ...(body as Record<string, unknown>) } : {};
+      if ('from_date' in payload) {
+        payload.from_date = normalizeDateOnlyInput(payload.from_date, 'from_date');
+      }
+      if ('to_date' in payload) {
+        payload.to_date = normalizeDateOnlyInput(payload.to_date, 'to_date');
+      }
+      return JSON.stringify(payload);
+    })(),
   });
 
 export const getHistoricalIngestJob = (jobId: string) =>

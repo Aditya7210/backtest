@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
+import re
 from typing import Any, Callable, Iterator
 
 from kiteconnect import KiteConnect
@@ -19,6 +20,9 @@ _INTERVAL_CHUNK_DAYS: dict[str, int] = {
     "60minute": 365,
     "day": 3650,
 }
+_DATE_ONLY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_ISO_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d:[0-5]\d(?:\.\d{1,6})?(?:Z|[+-][0-2]\d:[0-5]\d)?$")
+_MIN_SUPPORTED_YEAR = 2000
 
 
 def build_kite_client() -> KiteConnect:
@@ -28,13 +32,25 @@ def build_kite_client() -> KiteConnect:
 
 
 def _parse_date(value: str, *, end_of_day: bool = False) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value.strip())
-        if end_of_day and parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and parsed.microsecond == 0:
-            return parsed.replace(hour=23, minute=59, second=59, microsecond=0)
-        return parsed
-    except Exception as exc:
-        raise ValueError(f"Invalid date format: {value}") from exc
+    raw = value.strip()
+    parsed: datetime
+    if _DATE_ONLY_PATTERN.match(raw):
+        parsed = datetime.strptime(raw, "%Y-%m-%d")
+    elif _SAFE_ISO_PATTERN.match(raw):
+        safe = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(safe)
+    else:
+        raise ValueError(f"Invalid date format: {value}. Use YYYY-MM-DD or full ISO datetime.")
+
+    max_supported_year = datetime.now().year + 1
+    if parsed.year < _MIN_SUPPORTED_YEAR or parsed.year > max_supported_year:
+        raise ValueError(
+            f"Invalid year {parsed.year}. Supported range is {_MIN_SUPPORTED_YEAR}..{max_supported_year}."
+        )
+
+    if end_of_day and parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0 and parsed.microsecond == 0:
+        return parsed.replace(hour=23, minute=59, second=59, microsecond=0)
+    return parsed
 
 
 def _build_chunks(from_date: str, to_date: str, interval: str) -> list[tuple[datetime, datetime]]:

@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from backend.database.sync_connection import get_sync_db
+from backend.utils.time_utils import now_ist_iso
 
 _calculator_process: subprocess.Popen | None = None
 
@@ -34,6 +35,9 @@ def start_calculator() -> dict[str, Any]:
         {"$set": {
             "calculator.status": "running",
             "calculator.pid": _calculator_process.pid,
+            "calculator.started_at": now_ist_iso(),
+            "calculator.heartbeat_at": now_ist_iso(),
+            "calculator.last_error": None,
         }},
         upsert=True,
     )
@@ -61,7 +65,11 @@ def stop_calculator() -> dict[str, Any]:
     db = get_sync_db()
     db.collector_status.update_one(
         {"_id": "singleton"},
-        {"$set": {"calculator.status": "stopped", "calculator.pid": None}},
+        {"$set": {
+            "calculator.status": "stopped",
+            "calculator.pid": None,
+            "calculator.heartbeat_at": now_ist_iso(),
+        }},
         upsert=True,
     )
 
