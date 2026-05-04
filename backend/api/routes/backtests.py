@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sys
 import uuid
 from typing import Any
 
@@ -294,6 +295,10 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load strategy module: {strategy_name}")
         mod = importlib.util.module_from_spec(spec)
+        # Backtrader meta classes may resolve classes via sys.modules[cls.__module__].
+        # Register the dynamic module before execution so custom indicators/classes
+        # declared inside strategy files can be instantiated safely.
+        sys.modules[strategy_name] = mod
         spec.loader.exec_module(mod)
 
         strategy_class = _resolve_strategy_class(mod, config.get("strategy_class_name"))
@@ -310,6 +315,16 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
             return
 
         await backtest_repository.append_log(task_id, f"Selected strategy class: {strategy_class.__name__}")
+        selected_timeframe = str(config.get("timeframe", "") or "").lower()
+        if "intraday" in strategy_class.__name__.lower() and selected_timeframe in {"1day", "day", "d"}:
+            await backtest_repository.append_log(
+                task_id,
+                (
+                    "Selected strategy class appears intraday but dataset timeframe is daily. "
+                    "Execution can run, but signal behavior may be invalid for session-time rules."
+                ),
+                "WARNING",
+            )
 
         from Backtesting.backtest_core import (
             execute_backtest_dataframe,
@@ -402,7 +417,15 @@ async def _run_backtest_background(task_id: str, config: dict[str, Any]) -> None
         else:
             error_message = f"{type(last_error).__name__}: {last_error}"
 
-        await backtest_repository.append_log(task_id, error_message, "ERROR")
+        # Avoid duplicating the same terminal line twice for the final attempt.
+        last_attempt_message = None
+        if last_error is not None:
+            if isinstance(last_error, asyncio.TimeoutError):
+                last_attempt_message = f"Execution timed out after {timeout_seconds}s."
+            else:
+                last_attempt_message = f"{type(last_error).__name__}: {last_error}"
+        if error_message != last_attempt_message:
+            await backtest_repository.append_log(task_id, error_message, "ERROR")
         await backtest_repository.update_result(task_id, {
             "status": "FAILED",
             "error_message": error_message,

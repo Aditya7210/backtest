@@ -39,9 +39,7 @@ class NiftyIntradayOptionBuyingStrategy(bt.Strategy):
         self.ema20 = bt.indicators.EMA(self.c, period=self.p.ema_period)
         self.vol_sma = bt.indicators.SMA(self.v, period=self.p.volume_sma_period)
 
-        self.vwap = bt.indicators.SumN(self.c * self.v, period=self.p.vwap_period) / bt.indicators.SumN(
-            self.v, period=self.p.vwap_period
-        )
+        self.vwap = SafeRollingVWAP(self.data, period=self.p.vwap_period)
 
         self.order = None
         self.entry_price = None
@@ -212,3 +210,22 @@ class NiftyIntradayOptionBuyingStrategy(bt.Strategy):
                 self.close()
             elif price > self.vwap[0]:
                 self.close()
+
+
+class SafeRollingVWAP(bt.Indicator):
+    """VWAP that tolerates zero-volume windows to avoid division crashes."""
+
+    lines = ("vwap",)
+    params = (("period", 75),)
+
+    def __init__(self):
+        self._pv_sum = bt.indicators.SumN(self.data.close * self.data.volume, period=self.p.period)
+        self._v_sum = bt.indicators.SumN(self.data.volume, period=self.p.period)
+
+    def next(self):
+        volume_sum = float(self._v_sum[0])
+        if volume_sum <= 0.0:
+            # Fall back to close when the rolling window has no trade volume.
+            self.lines.vwap[0] = float(self.data.close[0])
+            return
+        self.lines.vwap[0] = float(self._pv_sum[0]) / volume_sum
