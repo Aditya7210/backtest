@@ -1,11 +1,155 @@
 """Repository for OHLCV bars — insert/query from MongoDB bars collection."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.database.connection import get_db
 from backend.utils.time_utils import now_ist_iso, today_ist
+
+IST = ZoneInfo("Asia/Kolkata")
+SESSION_OPEN_HOUR = 9
+SESSION_OPEN_MINUTE = 15
+SUPPORTED_DERIVED_TIMEFRAMES: dict[str, int | str] = {
+    "1min": 1,
+    "3min": 3,
+    "5min": 5,
+    "10min": 10,
+    "15min": 15,
+    "20min": 20,
+    "30min": 30,
+    "45min": 45,
+    "60min": 60,
+    "1day": "day",
+}
+_TIMEFRAME_ALIASES: dict[str, str] = {
+    "minute": "1min",
+    "1m": "1min",
+    "3minute": "3min",
+    "5minute": "5min",
+    "10minute": "10min",
+    "15minute": "15min",
+    "20minute": "20min",
+    "30minute": "30min",
+    "45minute": "45min",
+    "60minute": "60min",
+    "hour": "60min",
+    "day": "1day",
+    "d": "1day",
+}
+
+
+def _normalize_timeframe(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "1day"
+    return _TIMEFRAME_ALIASES.get(raw, raw)
+
+
+def _to_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _bucket_start_ist(ts_utc: datetime, minutes: int) -> datetime:
+    ts_ist = _to_utc(ts_utc).astimezone(IST)
+    session_anchor = ts_ist.replace(
+        hour=SESSION_OPEN_HOUR,
+        minute=SESSION_OPEN_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    delta_minutes = int((ts_ist - session_anchor).total_seconds() // 60)
+    if delta_minutes < 0:
+        delta_minutes = 0
+    bucket_offset = (delta_minutes // minutes) * minutes
+    return (session_anchor + timedelta(minutes=bucket_offset)).astimezone(timezone.utc)
+
+
+def _bucket_key_day(ts_utc: datetime) -> tuple[str, datetime]:
+    ts_ist = _to_utc(ts_utc).astimezone(IST)
+    trading_date = ts_ist.date().isoformat()
+    bucket_ts = ts_ist.replace(
+        hour=SESSION_OPEN_HOUR,
+        minute=SESSION_OPEN_MINUTE,
+        second=0,
+        microsecond=0,
+    ).astimezone(timezone.utc)
+    return trading_date, bucket_ts
+
+
+def _merge_bucket_row(existing: dict[str, Any] | None, row: dict[str, Any], *, bucket_ts: datetime) -> dict[str, Any]:
+    if existing is None:
+        return {
+            "timestamp": bucket_ts,
+            "trading_date": row.get("trading_date", ""),
+            "instrument_token": row.get("instrument_token"),
+            "tradingsymbol": row.get("tradingsymbol"),
+            "instrument_type": row.get("instrument_type"),
+            "exchange": row.get("exchange"),
+            "segment": row.get("segment"),
+            "underlying": row.get("underlying"),
+            "expiry": row.get("expiry"),
+            "strike": row.get("strike"),
+            "option_type": row.get("option_type"),
+            "open": float(row.get("open") or 0.0),
+            "high": float(row.get("high") or 0.0),
+            "low": float(row.get("low") or 0.0),
+            "close": float(row.get("close") or 0.0),
+            "volume": float(row.get("volume") or 0.0),
+            "ingest_status": "derived",
+            "data_source": "derived_from_1min",
+            "derived_from_timeframe": "1min",
+        }
+    existing["high"] = max(float(existing.get("high") or 0.0), float(row.get("high") or 0.0))
+    existing["low"] = min(float(existing.get("low") or 0.0), float(row.get("low") or 0.0))
+    existing["close"] = float(row.get("close") or existing.get("close") or 0.0)
+    existing["volume"] = float(existing.get("volume") or 0.0) + float(row.get("volume") or 0.0)
+    return existing
+
+
+def _derive_from_one_minute(rows: list[dict[str, Any]], target_timeframe: str) -> list[dict[str, Any]]:
+    if target_timeframe == "1min":
+        return rows
+    if target_timeframe not in SUPPORTED_DERIVED_TIMEFRAMES:
+        return []
+    if target_timeframe == "1day":
+        by_day: dict[str, dict[str, Any]] = {}
+        bucket_ts_by_day: dict[str, datetime] = {}
+        for row in rows:
+            ts = row.get("timestamp")
+            if not isinstance(ts, datetime):
+                continue
+            day_key, bucket_ts = _bucket_key_day(ts)
+            bucket_ts_by_day[day_key] = bucket_ts
+            by_day[day_key] = _merge_bucket_row(by_day.get(day_key), row, bucket_ts=bucket_ts)
+        out: list[dict[str, Any]] = []
+        for day_key in sorted(by_day.keys()):
+            merged = by_day[day_key]
+            merged["trading_date"] = day_key
+            merged["timestamp"] = bucket_ts_by_day[day_key]
+            merged["timeframe"] = "1day"
+            out.append(merged)
+        return out
+
+    minutes = int(SUPPORTED_DERIVED_TIMEFRAMES[target_timeframe])  # type: ignore[arg-type]
+    by_bucket: dict[datetime, dict[str, Any]] = {}
+    for row in rows:
+        ts = row.get("timestamp")
+        if not isinstance(ts, datetime):
+            continue
+        bucket_ts = _bucket_start_ist(ts, minutes)
+        by_bucket[bucket_ts] = _merge_bucket_row(by_bucket.get(bucket_ts), row, bucket_ts=bucket_ts)
+
+    out: list[dict[str, Any]] = []
+    for bucket_ts in sorted(by_bucket.keys()):
+        merged = by_bucket[bucket_ts]
+        merged["timestamp"] = bucket_ts
+        merged["timeframe"] = target_timeframe
+        out.append(merged)
+    return out
 
 
 async def insert_bars(bars: list[dict[str, Any]]) -> int:
@@ -49,11 +193,12 @@ async def get_bars(
     date_to: str | None = None,
     trading_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Query bars for a specific instrument + timeframe + date range."""
+    """Query bars for instrument/timeframe/date range, with on-demand derived TF fallback."""
     db = get_db()
+    normalized_tf = _normalize_timeframe(timeframe)
     query: dict[str, Any] = {
         "instrument_token": token,
-        "timeframe": timeframe,
+        "timeframe": normalized_tf,
     }
     if trading_date:
         query["trading_date"] = trading_date
@@ -65,15 +210,27 @@ async def get_bars(
             date_filter["$lte"] = date_to
         query["trading_date"] = date_filter
 
-    cursor = db.bars.find(query).sort("timestamp", 1)
-    return await cursor.to_list(length=None)
+    bars = await db.bars.find(query).sort("timestamp", 1).to_list(length=None)
+    if bars or normalized_tf == "1min":
+        return bars
+
+    if normalized_tf not in SUPPORTED_DERIVED_TIMEFRAMES:
+        return []
+
+    one_min_query = dict(query)
+    one_min_query["timeframe"] = "1min"
+    one_minute_rows = await db.bars.find(one_min_query).sort("timestamp", 1).to_list(length=None)
+    if not one_minute_rows:
+        return []
+    return _derive_from_one_minute(one_minute_rows, normalized_tf)
 
 
 async def get_latest_bar(token: int, timeframe: str) -> dict[str, Any] | None:
     """Get the most recent bar for an instrument."""
     db = get_db()
+    normalized_tf = _normalize_timeframe(timeframe)
     return await db.bars.find_one(
-        {"instrument_token": token, "timeframe": timeframe},
+        {"instrument_token": token, "timeframe": normalized_tf},
         sort=[("timestamp", -1)],
     )
 
@@ -85,18 +242,20 @@ async def get_bars_by_type(
 ) -> list[dict[str, Any]]:
     """Get all bars of a specific instrument type for a trading date."""
     db = get_db()
+    normalized_tf = _normalize_timeframe(timeframe)
     cursor = db.bars.find({
         "instrument_type": instrument_type,
-        "timeframe": timeframe,
+        "timeframe": normalized_tf,
         "trading_date": trading_date,
     }).sort("timestamp", 1)
     return await cursor.to_list(length=None)
 
 
-async def get_available_catalog() -> list[dict[str, Any]]:
-    """Returns distinct instruments + date ranges + timeframes available for backtesting."""
-    db = get_db()
-    pipeline = [
+def _catalog_pipeline(match: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    pipeline: list[dict[str, Any]] = []
+    if match:
+        pipeline.append({"$match": match})
+    pipeline.extend([
         {"$group": {
             "_id": {
                 "instrument_token": "$instrument_token",
@@ -113,11 +272,12 @@ async def get_available_catalog() -> list[dict[str, Any]]:
                 "$ifNull": ["$_id.tradingsymbol", {"$toString": "$_id.instrument_token"}],
             },
         }},
+        {"$sort": {"symbol_fallback": 1}},
         {"$group": {
             "_id": {
                 "instrument_token": "$_id.instrument_token",
-                "tradingsymbol": "$symbol_fallback",
             },
+            "tradingsymbol": {"$first": "$symbol_fallback"},
             "timeframes": {"$push": {
                 "timeframe": "$_id.timeframe",
                 "date_from": "$date_from",
@@ -135,13 +295,51 @@ async def get_available_catalog() -> list[dict[str, Any]]:
         {"$project": {
             "_id": 0,
             "instrument_token": "$_id.instrument_token",
-            "tradingsymbol": "$_id.tradingsymbol",
+            "tradingsymbol": "$tradingsymbol",
             "timeframes_available": "$timeframes",
         }},
         {"$sort": {"tradingsymbol": 1}},
-    ]
+    ])
+    return pipeline
+
+
+async def get_available_catalog(*, use_cache: bool = True) -> list[dict[str, Any]]:
+    """Returns distinct instruments + date ranges + timeframes available for backtesting."""
+    db = get_db()
+    if use_cache:
+        cached_docs = await db.historical_catalog.find({}, {"_id": 0}).sort("tradingsymbol", 1).to_list(length=None)
+        if cached_docs:
+            return cached_docs
+
+    pipeline = _catalog_pipeline()
     cursor = db.bars.aggregate(pipeline)
-    return await cursor.to_list(length=None)
+    docs = [{k: v for k, v in row.items() if k != "_id"} for row in await cursor.to_list(length=None)]
+    if use_cache and docs:
+        await db.historical_catalog.delete_many({})
+        await db.historical_catalog.insert_many([dict(doc) for doc in docs], ordered=False)
+    return docs
+
+
+async def rebuild_catalog_cache() -> int:
+    """Rebuild full materialized historical catalog cache from bars collection."""
+    db = get_db()
+    docs = [{k: v for k, v in row.items() if k != "_id"} for row in await db.bars.aggregate(_catalog_pipeline()).to_list(length=None)]
+    await db.historical_catalog.delete_many({})
+    if docs:
+        await db.historical_catalog.insert_many([dict(doc) for doc in docs], ordered=False)
+    return len(docs)
+
+
+async def refresh_catalog_for_instrument(token: int) -> None:
+    """Refresh a single instrument entry in materialized catalog cache."""
+    db = get_db()
+    docs = [
+        {k: v for k, v in row.items() if k != "_id"}
+        for row in await db.bars.aggregate(_catalog_pipeline({"instrument_token": token})).to_list(length=None)
+    ]
+    await db.historical_catalog.delete_many({"instrument_token": token})
+    if docs:
+        await db.historical_catalog.insert_many([dict(doc) for doc in docs], ordered=False)
 
 
 async def get_symbol_for_token(token: int) -> str | None:
@@ -166,9 +364,10 @@ async def delete_bars(
 ) -> int:
     """Delete bars in a date range (for re-ingestion)."""
     db = get_db()
+    normalized_tf = _normalize_timeframe(timeframe)
     result = await db.bars.delete_many({
         "instrument_token": token,
-        "timeframe": timeframe,
+        "timeframe": normalized_tf,
         "trading_date": {"$gte": date_from, "$lte": date_to},
     })
     return result.deleted_count
@@ -179,6 +378,66 @@ async def delete_bars_by_ingest_job(ingest_job_id: str) -> int:
     db = get_db()
     result = await db.bars.delete_many({"ingest_job_id": ingest_job_id})
     return result.deleted_count
+
+
+async def get_existing_trading_dates(
+    *,
+    token: int,
+    timeframe: str,
+    date_from: str,
+    date_to: str,
+) -> set[str]:
+    """Return existing trading_date values for token/timeframe within requested range."""
+    db = get_db()
+    normalized_tf = _normalize_timeframe(timeframe)
+    values = await db.bars.distinct(
+        "trading_date",
+        {
+            "instrument_token": token,
+            "timeframe": normalized_tf,
+            "trading_date": {"$gte": date_from, "$lte": date_to},
+        },
+    )
+    return {str(v) for v in values if v}
+
+
+def compute_missing_date_spans(
+    *,
+    date_from: str,
+    date_to: str,
+    existing_trading_dates: set[str],
+) -> list[tuple[str, str]]:
+    """
+    Compute missing weekday spans in [date_from, date_to].
+
+    Note: this is date-level completeness, not candle-count completeness.
+    """
+    start = datetime.strptime(date_from, "%Y-%m-%d").date()
+    end = datetime.strptime(date_to, "%Y-%m-%d").date()
+    if start > end:
+        return []
+
+    missing_days: list[date] = []
+    cursor = start
+    while cursor <= end:
+        iso = cursor.isoformat()
+        if cursor.weekday() < 5 and iso not in existing_trading_dates:
+            missing_days.append(cursor)
+        cursor += timedelta(days=1)
+
+    if not missing_days:
+        return []
+
+    spans: list[tuple[str, str]] = []
+    span_start = missing_days[0]
+    prev = missing_days[0]
+    for day in missing_days[1:]:
+        if (day - prev).days > 1:
+            spans.append((span_start.isoformat(), prev.isoformat()))
+            span_start = day
+        prev = day
+    spans.append((span_start.isoformat(), prev.isoformat()))
+    return spans
 
 
 def _coerce_int(value: Any) -> int | None:

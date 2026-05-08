@@ -50,6 +50,10 @@ export interface Trade {
   symbol?: string;
   entry_date: string;
   exit_date: string;
+  entry_time_ist?: string | null;
+  exit_time_ist?: string | null;
+  entry_time_unix?: number | null;
+  exit_time_unix?: number | null;
   direction: string;
   entry_action?: string;
   exit_action?: string;
@@ -72,6 +76,8 @@ export interface Trade {
 export interface OrderEvent {
   event_id?: string;
   time: string;
+  event_time_ist?: string | null;
+  event_time_unix?: number | null;
   action: string;
   status: string;
   requested_size?: number | null;
@@ -108,19 +114,21 @@ export interface InstrumentSearchResult {
 export interface HistoricalIngestJob {
   job_id: string;
   status: 'PENDING' | 'RUNNING' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'FAILED' | 'NO_DATA';
-  phase?: 'PENDING' | 'FETCHING' | 'SAVING' | 'CLEANUP' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'FAILED' | 'NO_DATA' | 'STALE' | string;
+  phase?: 'PENDING' | 'FETCHING' | 'NORMALIZING' | 'SAVING' | 'COMMITTING' | 'CATALOG_REFRESH' | 'CLEANUP' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'COMPLETED' | 'FAILED' | 'NO_DATA' | 'STALE' | string;
   request?: {
     instrument_token: number;
     tradingsymbol: string;
     from_date: string;
     to_date: string;
     interval: string;
+    mode?: 'skip_existing' | 'overwrite' | 'append_only' | string;
   };
   rows?: number;
   rows_fetched?: number;
   saved_rows?: number;
   inserted?: number;
   modified?: number;
+  skipped_existing_dates?: number;
   current_chunk?: number;
   total_chunks?: number;
   error_message?: string | null;
@@ -133,6 +141,16 @@ export interface HistoricalIngestJob {
   estimated_finish_at?: string | null;
   ingest_job_id?: string | null;
   log_lines?: string[];
+  performance?: {
+    fetch_seconds?: number;
+    normalize_seconds?: number;
+    write_seconds?: number;
+    commit_seconds?: number;
+    catalog_refresh_seconds?: number;
+    rows_per_second?: number;
+    chunks_per_second?: number;
+    mode?: string;
+  };
 }
 
 export interface CatalogEntry {

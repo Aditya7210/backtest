@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import re
 from typing import Any, Callable, Iterator
@@ -112,35 +113,72 @@ def iter_historical_chunks(
     chunks = _build_chunks(from_date, to_date, interval)
     total = len(chunks)
     rows_fetched = 0
+    fetch_concurrency = max(1, min(3, int(settings.ZERODHA_HISTORICAL_FETCH_CONCURRENCY or 1)))
 
-    for idx, (chunk_from, chunk_to) in enumerate(chunks, start=1):
-        rows = _fetch_chunk_with_retry(
+    if fetch_concurrency == 1 or total <= 1:
+        for idx, (chunk_from, chunk_to) in enumerate(chunks, start=1):
+            rows = _fetch_chunk_with_retry(
+                kite,
+                instrument_token=instrument_token,
+                chunk_from=chunk_from,
+                chunk_to=chunk_to,
+                interval=interval,
+            )
+            rows_fetched += len(rows)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "FETCHING",
+                        "current_chunk": idx,
+                        "total_chunks": total,
+                        "rows": rows_fetched,
+                        "rows_fetched": rows_fetched,
+                        "fetched_in_chunk": len(rows),
+                    }
+                )
+            yield {
+                "current_chunk": idx,
+                "total_chunks": total,
+                "chunk_from": chunk_from,
+                "chunk_to": chunk_to,
+                "rows": rows,
+                "rows_fetched": rows_fetched,
+            }
+        return
+
+    def _fetch_one(chunk_window: tuple[datetime, datetime]) -> list[dict[str, Any]]:
+        chunk_from, chunk_to = chunk_window
+        return _fetch_chunk_with_retry(
             kite,
             instrument_token=instrument_token,
             chunk_from=chunk_from,
             chunk_to=chunk_to,
             interval=interval,
         )
-        rows_fetched += len(rows)
-        if progress_callback:
-            progress_callback(
-                {
-                    "phase": "FETCHING",
-                    "current_chunk": idx,
-                    "total_chunks": total,
-                    "rows": rows_fetched,
-                    "rows_fetched": rows_fetched,
-                    "fetched_in_chunk": len(rows),
-                }
-            )
-        yield {
-            "current_chunk": idx,
-            "total_chunks": total,
-            "chunk_from": chunk_from,
-            "chunk_to": chunk_to,
-            "rows": rows,
-            "rows_fetched": rows_fetched,
-        }
+
+    with ThreadPoolExecutor(max_workers=fetch_concurrency) as pool:
+        for idx, rows in enumerate(pool.map(_fetch_one, chunks), start=1):
+            chunk_from, chunk_to = chunks[idx - 1]
+            rows_fetched += len(rows)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "FETCHING",
+                        "current_chunk": idx,
+                        "total_chunks": total,
+                        "rows": rows_fetched,
+                        "rows_fetched": rows_fetched,
+                        "fetched_in_chunk": len(rows),
+                    }
+                )
+            yield {
+                "current_chunk": idx,
+                "total_chunks": total,
+                "chunk_from": chunk_from,
+                "chunk_to": chunk_to,
+                "rows": rows,
+                "rows_fetched": rows_fetched,
+            }
 
 
 def fetch_historical(

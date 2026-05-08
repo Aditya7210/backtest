@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import LightweightCandlestickChart from '../components/LightweightCandlestickChart';
 import LightweightLineChart, { type LinePoint } from '../components/LightweightLineChart';
 import SearchableDropdown, { type SearchableOption } from '../components/SearchableDropdown';
+import { formatTradeTimestampIst, parseTradeTimestampToUnix } from '../features/time/ist';
 import { computeIndicators, getBacktest, getBacktests, getCatalog, getHistoricalBars, getIndicators } from '../services/api';
 import type { BacktestResult, CatalogEntry, OrderEvent, Trade } from '../types/backtest';
 import type { IndicatorMetadata, IndicatorSelection, IndicatorSeries } from '../types/indicators';
@@ -115,8 +116,25 @@ function normalizeResultTrades(resultLike: unknown): Trade[] {
   const normalized: Trade[] = [];
   for (const row of source) {
     const obj = asObj(row);
-    const entry_date = pickFirstText(obj, ['entry_date', 'Entry Date', 'entryDate', 'open_time', 'entry_time', 'timestamp']);
-    const exit_date = pickFirstText(obj, ['exit_date', 'Close Date', 'Exit Date', 'exitDate', 'close_time', 'exit_time']);
+    const entry_date = pickFirstText(obj, [
+      'entry_time_ist',
+      'entry_date',
+      'Entry Date',
+      'entryDate',
+      'open_time',
+      'entry_time',
+      'timestamp',
+      'time',
+    ]);
+    const exit_date = pickFirstText(obj, [
+      'exit_time_ist',
+      'exit_date',
+      'Close Date',
+      'Exit Date',
+      'exitDate',
+      'close_time',
+      'exit_time',
+    ]);
     const direction = normalizeDirection(
       pickFirstText(obj, ['direction', 'Direction', 'side', 'type']) || obj.direction || obj.Direction,
     );
@@ -133,6 +151,10 @@ function normalizeResultTrades(resultLike: unknown): Trade[] {
       symbol: pickFirstText(obj, ['symbol', 'Symbol']) || undefined,
       entry_date,
       exit_date,
+      entry_time_ist: pickFirstText(obj, ['entry_time_ist']) || entry_date || undefined,
+      exit_time_ist: pickFirstText(obj, ['exit_time_ist']) || exit_date || undefined,
+      entry_time_unix: pickFirstNumber(obj, ['entry_time_unix']) ?? normalizeTradeTimestampToUnix(entry_date) ?? undefined,
+      exit_time_unix: pickFirstNumber(obj, ['exit_time_unix']) ?? normalizeTradeTimestampToUnix(exit_date) ?? undefined,
       direction,
       entry_action,
       exit_action,
@@ -164,13 +186,15 @@ function normalizeOrderEvents(resultLike: unknown): OrderEvent[] {
   const normalized: OrderEvent[] = [];
   for (const row of source) {
     const obj = asObj(row);
-    const time = pickFirstText(obj, ['time', 'timestamp', 'event_time']);
+    const time = pickFirstText(obj, ['event_time_ist', 'time', 'timestamp', 'event_time', 'created_at', 'executed_at']);
     const action = pickFirstText(obj, ['action', 'type']);
     const status = pickFirstText(obj, ['status']);
     if (!time && !action) continue;
     normalized.push({
       event_id: pickFirstText(obj, ['event_id', 'id']) || undefined,
       time: time || '-',
+      event_time_ist: pickFirstText(obj, ['event_time_ist']) || time || undefined,
+      event_time_unix: pickFirstNumber(obj, ['event_time_unix']) ?? normalizeTradeTimestampToUnix(time) ?? undefined,
       action: action || 'UNKNOWN',
       status: status || 'UNKNOWN',
       requested_size: pickFirstNumber(obj, ['requested_size']) ?? undefined,
@@ -309,13 +333,7 @@ function parseBars(rawBars: unknown): OHLCVBar[] {
 }
 
 function normalizeTradeTimestampToUnix(input: string | null | undefined): number | null {
-  const raw = (input || '').trim();
-  if (!raw) return null;
-  const hasTz = /([zZ]|[+-]\d{2}:\d{2})$/.test(raw);
-  const normalized = hasTz ? raw : `${raw.replace(' ', 'T')}+05:30`;
-  const millis = Date.parse(normalized);
-  if (!Number.isFinite(millis)) return null;
-  return Math.floor(millis / 1000);
+  return parseTradeTimestampToUnix(input);
 }
 
 function nearestCandleTime(targetUnix: number, candleTimes: number[], toleranceSeconds: number): number | null {
@@ -947,23 +965,31 @@ function DashboardModule({
     };
   }, [module.plotSignals, visibleBars, selectedTrades, selectedOrderEvents, candleTimes, selectedPrice]);
 
-  const closedTradeRows = useMemo(() => {
+  const closedTradeBook = useMemo(() => {
     const rows: Array<{
       id: number;
       direction: 'LONG' | 'SHORT';
       entryAction: string;
       entryTime: string;
+      entryTimeRaw: string;
+      entryTimeUnix: number | null;
+      entryTimeInvalid: boolean;
       entryPrice: number | null;
       exitAction: string;
       exitTime: string;
+      exitTimeRaw: string;
+      exitTimeUnix: number | null;
+      exitTimeInvalid: boolean;
       exitPrice: number | null;
       qty: number | null;
       netPnl: number | null;
       barsHeld: number | null;
       asset: string;
+      sortUnix: number;
       isLatest: boolean;
     }> = [];
     let id = 1;
+    let invalidTimestampCount = 0;
     for (const trade of selectedTrades) {
       const direction = directionKind(trade.direction) === 'short' ? 'SHORT' : 'LONG';
       const entryAction = String(trade.entry_action || (direction === 'SHORT' ? 'SELL_SHORT' : 'BUY')).toUpperCase();
@@ -972,30 +998,55 @@ function DashboardModule({
       const actionKey = `${entryAction}|${exitAction}|${direction}`;
       if (tradeActionFilter !== 'ALL' && !actionKey.includes(tradeActionFilter)) continue;
       if (tradeAssetFilter.trim() && !asset.toLowerCase().includes(tradeAssetFilter.trim().toLowerCase())) continue;
+
+      const entryRaw = String(trade.entry_date || trade.entry_time_ist || '').trim();
+      const exitRaw = String(trade.exit_date || trade.exit_time_ist || '').trim();
+      const entryUnix = Number.isFinite(trade.entry_time_unix) ? Number(trade.entry_time_unix) : normalizeTradeTimestampToUnix(entryRaw);
+      const exitUnix = Number.isFinite(trade.exit_time_unix) ? Number(trade.exit_time_unix) : normalizeTradeTimestampToUnix(exitRaw);
+      const entryInvalid = Boolean(entryRaw) && entryUnix == null;
+      const exitInvalid = Boolean(exitRaw) && exitUnix == null;
+      if (entryInvalid) invalidTimestampCount += 1;
+      if (exitInvalid) invalidTimestampCount += 1;
+
       rows.push({
         id: id++,
         direction,
         entryAction,
-        entryTime: trade.entry_date || '-',
+        entryTime: formatTradeTimestampIst(entryRaw || null),
+        entryTimeRaw: entryRaw,
+        entryTimeUnix: entryUnix,
+        entryTimeInvalid: entryInvalid,
         entryPrice: Number.isFinite(trade.entry_price) ? trade.entry_price : null,
         exitAction,
-        exitTime: trade.exit_date || '-',
+        exitTime: formatTradeTimestampIst(exitRaw || null),
+        exitTimeRaw: exitRaw,
+        exitTimeUnix: exitUnix,
+        exitTimeInvalid: exitInvalid,
         exitPrice: Number.isFinite(trade.exit_price) ? trade.exit_price : null,
         qty: Number.isFinite(trade.quantity ?? trade.size) ? Number(trade.quantity ?? trade.size) : null,
         netPnl: Number.isFinite(trade.net_pnl ?? trade.pnl) ? Number(trade.net_pnl ?? trade.pnl) : null,
         barsHeld: Number.isFinite(trade.bars_held) ? Number(trade.bars_held) : null,
         asset,
+        sortUnix: exitUnix ?? entryUnix ?? -1,
         isLatest: false,
       });
     }
-    const reversed = rows.slice().reverse();
-    return reversed.map((row, idx) => ({ ...row, isLatest: idx < 3 }));
+    rows.sort((a, b) => b.sortUnix - a.sortUnix || b.id - a.id);
+    return {
+      rows: rows.map((row, idx) => ({ ...row, isLatest: idx < 3 })),
+      invalidTimestampCount,
+    };
   }, [selectedTrades, selectedPrice, selectedResult, tradeActionFilter, tradeAssetFilter]);
 
-  const orderEventRows = useMemo(() => {
+  const closedTradeRows = closedTradeBook.rows;
+
+  const orderEventBook = useMemo(() => {
     const rows: Array<{
       id: number;
       time: string;
+      rawTime: string;
+      eventUnix: number | null;
+      timeInvalid: boolean;
       action: string;
       status: string;
       qty: number | null;
@@ -1004,18 +1055,29 @@ function DashboardModule({
       posAfter: number | null;
       reason: string;
       asset: string;
+      sortUnix: number;
       isLatest: boolean;
     }> = [];
     let id = 1;
+    let invalidTimestampCount = 0;
     for (const event of selectedOrderEvents) {
       const action = String(event.action || 'UNKNOWN').toUpperCase();
       const status = String(event.status || 'UNKNOWN').toUpperCase();
       const asset = selectedPrice?.tradingsymbol || selectedResult?.symbol || '-';
       if (tradeActionFilter !== 'ALL' && !(action.includes(tradeActionFilter) || status.includes(tradeActionFilter))) continue;
       if (tradeAssetFilter.trim() && !asset.toLowerCase().includes(tradeAssetFilter.trim().toLowerCase())) continue;
+
+      const rawTime = String(event.time || event.event_time_ist || '').trim();
+      const eventUnix = Number.isFinite(event.event_time_unix) ? Number(event.event_time_unix) : normalizeTradeTimestampToUnix(rawTime);
+      const timeInvalid = Boolean(rawTime) && eventUnix == null;
+      if (timeInvalid) invalidTimestampCount += 1;
+
       rows.push({
         id: id++,
-        time: event.time || '-',
+        time: formatTradeTimestampIst(rawTime || null),
+        rawTime,
+        eventUnix,
+        timeInvalid,
         action,
         status,
         qty: Number.isFinite(event.executed_size ?? event.requested_size) ? Number(event.executed_size ?? event.requested_size) : null,
@@ -1024,12 +1086,40 @@ function DashboardModule({
         posAfter: Number.isFinite(event.position_after) ? Number(event.position_after) : null,
         reason: event.reason || '-',
         asset,
+        sortUnix: eventUnix ?? -1,
         isLatest: false,
       });
     }
-    const reversed = rows.slice().reverse();
-    return reversed.map((row, idx) => ({ ...row, isLatest: idx < 3 }));
+    rows.sort((a, b) => b.sortUnix - a.sortUnix || b.id - a.id);
+    return {
+      rows: rows.map((row, idx) => ({ ...row, isLatest: idx < 3 })),
+      invalidTimestampCount,
+    };
   }, [selectedOrderEvents, selectedPrice, selectedResult, tradeActionFilter, tradeAssetFilter]);
+
+  const orderEventRows = orderEventBook.rows;
+
+  const tradebookDiagnostics = useMemo(() => {
+    const selectedCount = module.tradebookMode === 'order_events' ? selectedOrderEvents.length : selectedTrades.length;
+    const renderedCount = module.tradebookMode === 'order_events' ? orderEventRows.length : closedTradeRows.length;
+    const invalidTimestampCount = module.tradebookMode === 'order_events'
+      ? orderEventBook.invalidTimestampCount
+      : closedTradeBook.invalidTimestampCount;
+    return {
+      selectedCount,
+      renderedCount,
+      skippedCount: Math.max(0, selectedCount - renderedCount),
+      invalidTimestampCount,
+    };
+  }, [
+    module.tradebookMode,
+    selectedOrderEvents.length,
+    selectedTrades.length,
+    orderEventRows.length,
+    closedTradeRows.length,
+    orderEventBook.invalidTimestampCount,
+    closedTradeBook.invalidTimestampCount,
+  ]);
 
   const tradebookActionOptions = useMemo(() => {
     if (module.tradebookMode === 'order_events') {
@@ -1328,6 +1418,10 @@ function DashboardModule({
             {visibleBars.length ? ` | chart ${new Date(visibleBars[0].time * 1000).toLocaleDateString('en-IN')} to ${new Date(visibleBars[visibleBars.length - 1].time * 1000).toLocaleDateString('en-IN')}` : ''}
             | markers {markerResult.diagnostics.markersPlotted} (raw {markerResult.diagnostics.rawMarkers}, collapsed {markerResult.diagnostics.collapsedMarkers})
             | outside {markerResult.diagnostics.outsideVisibleRange} | unmatched {markerResult.diagnostics.unmatchedTimestamps}
+            | tradebook selected {tradebookDiagnostics.selectedCount}
+            | rendered {tradebookDiagnostics.renderedCount}
+            | skipped {tradebookDiagnostics.skippedCount}
+            | invalid_ts {tradebookDiagnostics.invalidTimestampCount}
             {crosshairTime ? ` | cursor ${new Date(crosshairTime * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}` : ''}
           </div>
 
@@ -1443,10 +1537,20 @@ function DashboardModule({
                         <span className={`trd-badge ${row.direction === 'LONG' ? 'buy' : 'sell'}`}>{row.direction}</span>
                       </td>
                       <td className="trd-mono">{row.entryAction}</td>
-                      <td className="trd-mono">{row.entryTime}</td>
+                      <td
+                        className={`trd-mono ${row.entryTimeInvalid ? 'trd-warning-cell' : ''}`}
+                        title={row.entryTimeInvalid ? `Unparsed timestamp: ${row.entryTimeRaw || '-'}` : row.entryTimeRaw}
+                      >
+                        {row.entryTime}
+                      </td>
                       <td className="trd-mono">{row.entryPrice != null ? row.entryPrice.toFixed(2) : '-'}</td>
                       <td className="trd-mono">{row.exitAction}</td>
-                      <td className="trd-mono">{row.exitTime}</td>
+                      <td
+                        className={`trd-mono ${row.exitTimeInvalid ? 'trd-warning-cell' : ''}`}
+                        title={row.exitTimeInvalid ? `Unparsed timestamp: ${row.exitTimeRaw || '-'}` : row.exitTimeRaw}
+                      >
+                        {row.exitTime}
+                      </td>
                       <td className="trd-mono">{row.exitPrice != null ? row.exitPrice.toFixed(2) : '-'}</td>
                       <td className="trd-mono">{row.qty != null ? row.qty.toFixed(2) : '-'}</td>
                       <td className={`trd-mono ${(row.netPnl ?? 0) < 0 ? 'trd-neg' : 'trd-pos'}`}>{row.netPnl != null ? row.netPnl.toFixed(2) : '-'}</td>
@@ -1456,7 +1560,12 @@ function DashboardModule({
                   orderEventRows.map((row) => (
                     <tr key={`${module.id}-evt-${row.id}-${row.time}`} className={row.isLatest ? 'trd-row-latest' : ''}>
                       <td>{row.id}</td>
-                      <td className="trd-mono">{row.time}</td>
+                      <td
+                        className={`trd-mono ${row.timeInvalid ? 'trd-warning-cell' : ''}`}
+                        title={row.timeInvalid ? `Unparsed timestamp: ${row.rawTime || '-'}` : row.rawTime}
+                      >
+                        {row.time}
+                      </td>
                       <td className="trd-mono">{row.action}</td>
                       <td className="trd-mono">{row.status}</td>
                       <td className="trd-mono">{row.qty != null ? row.qty.toFixed(2) : '-'}</td>
@@ -1994,6 +2103,7 @@ export default function Dashboard() {
         .trd-mono { font-family: var(--font-mono); }
         .trd-pos { color: #0f766e; }
         .trd-neg { color: #b91c1c; }
+        .trd-warning-cell { color: #b45309; }
 
         .trd-skeleton-wrap { display: grid; gap: 8px; }
         .trd-skeleton {

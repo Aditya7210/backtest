@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     LM_COLLECT_VIX: bool = True
     LM_COLLECT_INDEX_SPOT_TOKENS: bool = True
 
+    # Historical ingest performance controls
+    HISTORICAL_WRITE_BATCH_SIZE: int = 5000
+    HISTORICAL_PROGRESS_UPDATE_SECONDS: float = 1.25
+    HISTORICAL_CANCEL_CHECK_SECONDS: float = 1.0
+    ZERODHA_HISTORICAL_FETCH_CONCURRENCY: int = 1
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

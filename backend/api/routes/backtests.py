@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
 import uuid
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -14,6 +17,10 @@ from backend.database.repositories import backtest_repository, bar_repository, s
 from backend.models.backtest import BacktestRequest
 
 router = APIRouter(tags=["backtests"])
+IST = ZoneInfo("Asia/Kolkata")
+_NAIVE_TS_PATTERN = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2})(?::(\d{2})(?::(\d{2}))?)?)?$"
+)
 
 
 def _to_float(value: Any) -> float | None:
@@ -24,6 +31,84 @@ def _to_float(value: Any) -> float | None:
     return num
 
 
+def _pick_first_value(row: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _to_unix_seconds(value: Any, *, naive_as_ist: bool = True) -> int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not float(value) == float("inf") and not float(value) == float("-inf"):
+            numeric = float(value)
+            if numeric != numeric:
+                return None
+            abs_val = abs(numeric)
+            return int(numeric / 1000.0) if abs_val > 1_000_000_000_000 else int(numeric)
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if re.fullmatch(r"[+-]?\d+(\.\d+)?", raw):
+        numeric = float(raw)
+        if numeric != numeric:
+            return None
+        abs_val = abs(numeric)
+        return int(numeric / 1000.0) if abs_val > 1_000_000_000_000 else int(numeric)
+
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+
+    has_zone = bool(re.search(r"[+-]\d{2}:\d{2}$", raw))
+    if has_zone:
+        try:
+            dt = datetime.fromisoformat(raw)
+            return int(dt.astimezone(timezone.utc).timestamp())
+        except Exception:
+            return None
+
+    naive_match = _NAIVE_TS_PATTERN.match(raw)
+    if naive_match and naive_as_ist:
+        year = int(naive_match.group(1))
+        month = int(naive_match.group(2))
+        day = int(naive_match.group(3))
+        hour = int(naive_match.group(4) or "0")
+        minute = int(naive_match.group(5) or "0")
+        second = int(naive_match.group(6) or "0")
+        try:
+            naive = datetime(year, month, day, hour, minute, second, tzinfo=IST)
+            return int(naive.astimezone(timezone.utc).timestamp())
+        except Exception:
+            return None
+
+    try:
+        dt = datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST if naive_as_ist else timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp())
+
+
+def _format_ist(unix_seconds: int | None) -> str | None:
+    if unix_seconds is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(unix_seconds), tz=timezone.utc).astimezone(IST)
+    except Exception:
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _normalize_trade_rows(raw_rows: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_rows, list):
         return []
@@ -31,6 +116,20 @@ def _normalize_trade_rows(raw_rows: Any) -> list[dict[str, Any]]:
     for row in raw_rows:
         if not isinstance(row, dict):
             continue
+        entry_raw = _pick_first_value(
+            row,
+            ["entry_date", "Entry Date", "entryDate", "open_time", "entry_time", "timestamp", "time"],
+        )
+        exit_raw = _pick_first_value(
+            row,
+            ["exit_date", "Close Date", "Exit Date", "exitDate", "close_time", "exit_time"],
+        )
+        entry_unix = _to_unix_seconds(entry_raw, naive_as_ist=True)
+        exit_unix = _to_unix_seconds(exit_raw, naive_as_ist=True)
+        entry_ist = _format_ist(entry_unix)
+        exit_ist = _format_ist(exit_unix)
+        entry_date = entry_ist or (str(entry_raw).strip() if entry_raw is not None else "")
+        exit_date = exit_ist or (str(exit_raw).strip() if exit_raw is not None else "")
         direction_raw = str(
             row.get("direction")
             or row.get("Direction")
@@ -44,8 +143,12 @@ def _normalize_trade_rows(raw_rows: Any) -> list[dict[str, Any]]:
             "trade_id": str(row.get("trade_id") or ""),
             "instrument_token": row.get("instrument_token"),
             "symbol": str(row.get("symbol") or row.get("Symbol") or ""),
-            "entry_date": str(row.get("entry_date") or row.get("Entry Date") or row.get("entryDate") or ""),
-            "exit_date": str(row.get("exit_date") or row.get("Close Date") or row.get("Exit Date") or ""),
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "entry_time_ist": entry_ist,
+            "exit_time_ist": exit_ist,
+            "entry_time_unix": entry_unix,
+            "exit_time_unix": exit_unix,
             "direction": direction,
             "entry_action": entry_action,
             "exit_action": exit_action,
@@ -73,10 +176,16 @@ def _normalize_order_events(raw_rows: Any) -> list[dict[str, Any]]:
     for row in raw_rows:
         if not isinstance(row, dict):
             continue
+        event_raw = _pick_first_value(row, ["time", "timestamp", "event_time", "created_at", "executed_at"])
+        event_unix = _to_unix_seconds(event_raw, naive_as_ist=True)
+        event_ist = _format_ist(event_unix)
+        display_time = event_ist or (str(event_raw).strip() if event_raw is not None else "")
         normalized.append(
             {
                 "event_id": str(row.get("event_id") or ""),
-                "time": str(row.get("time") or ""),
+                "time": display_time,
+                "event_time_ist": event_ist,
+                "event_time_unix": event_unix,
                 "action": str(row.get("action") or ""),
                 "status": str(row.get("status") or ""),
                 "requested_size": _to_float(row.get("requested_size")),

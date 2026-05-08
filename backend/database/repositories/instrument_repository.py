@@ -335,44 +335,87 @@ def _search_rank(item: dict[str, Any], raw_query: str, normalized_query: str) ->
     return (tier, alias_order, exchange_bias, symbol_len, int(item.get("instrument_token", 0)), symbol)
 
 
-def search_mapper_files(query: str, limit: int = 50) -> dict[str, Any]:
+def search_mapper_files(query: str, limit: int = 50, include_archive: bool = False) -> dict[str, Any]:
     q = query.strip()
     if len(q) < 2:
-        return {"items": [], "source": "mapper_csv", "warning": "Type at least 2 characters to search."}
+        return {
+            "items": [],
+            "source": "latest_plus_archive_mapper_csv" if include_archive else "latest_mapper_csv",
+            "warning": "Type at least 2 characters to search.",
+            "include_archive": bool(include_archive),
+            "searched_latest_rows": 0,
+            "searched_archive_rows": 0,
+        }
 
     mapper_dir = _mapper_dir()
     latest_path = _latest_csv_path()
     archive_path = _archive_csv_path()
+
+    if not latest_path.exists():
+        if include_archive and archive_path.exists():
+            archive_missing = _missing_required_columns(archive_path)
+            if archive_missing:
+                return {
+                    "items": [],
+                    "source": "latest_plus_archive_mapper_csv",
+                    "warning": f"archive missing columns: {', '.join(archive_missing)}",
+                    "include_archive": True,
+                    "searched_latest_rows": 0,
+                    "searched_archive_rows": 0,
+                }
+        else:
+            return {
+                "items": [],
+                "source": "latest_mapper_csv",
+                "warning": "Latest mapper file missing. Update mapper before searching.",
+                "include_archive": False,
+                "searched_latest_rows": 0,
+                "searched_archive_rows": 0,
+            }
+
     if not latest_path.exists() and not archive_path.exists():
         return {
             "items": [],
-            "source": "mapper_csv",
+            "source": "latest_plus_archive_mapper_csv" if include_archive else "latest_mapper_csv",
             "warning": f"Instrument mapper files not found at {mapper_dir}",
+            "include_archive": bool(include_archive),
+            "searched_latest_rows": 0,
+            "searched_archive_rows": 0,
         }
 
-    latest_missing = _missing_required_columns(latest_path) if latest_path.exists() else []
-    archive_missing = _missing_required_columns(archive_path) if archive_path.exists() else []
-    if latest_missing or archive_missing:
-        problems: list[str] = []
-        if latest_missing:
-            problems.append(f"latest missing columns: {', '.join(latest_missing)}")
-        if archive_missing:
-            problems.append(f"archive missing columns: {', '.join(archive_missing)}")
+    latest_missing = _missing_required_columns(latest_path) if latest_path.exists() else list(_MAPPER_REQUIRED)
+    if latest_missing:
         return {
             "items": [],
-            "source": "mapper_csv",
-            "warning": "; ".join(problems),
+            "source": "latest_plus_archive_mapper_csv" if include_archive else "latest_mapper_csv",
+            "warning": f"latest missing columns: {', '.join(latest_missing)}",
+            "include_archive": bool(include_archive),
+            "searched_latest_rows": 0,
+            "searched_archive_rows": 0,
+        }
+
+    archive_missing: list[str] = []
+    if include_archive and archive_path.exists():
+        archive_missing = _missing_required_columns(archive_path)
+    if archive_missing:
+        return {
+            "items": [],
+            "source": "latest_plus_archive_mapper_csv",
+            "warning": f"archive missing columns: {', '.join(archive_missing)}",
+            "include_archive": True,
+            "searched_latest_rows": 0,
+            "searched_archive_rows": 0,
         }
 
     needle = q.upper()
     normalized_query = _normalize_query(q)
     alias_targets = set(_alias_targets_list(normalized_query))
     latest_rows = _load_csv_rows(latest_path)
-    archive_rows = _load_csv_rows(archive_path)
-    merged = _merge_latest_archive(latest_rows, archive_rows)
+    archive_rows = _load_csv_rows(archive_path) if include_archive and archive_path.exists() else []
+    search_rows = _merge_latest_archive(latest_rows, archive_rows) if include_archive else latest_rows
 
     filtered = [
-        row for row in merged
+        row for row in search_rows
         if (
             needle in row["tradingsymbol"]
             or needle in str(row.get("name", "")).upper()
@@ -389,7 +432,21 @@ def search_mapper_files(query: str, limit: int = 50) -> dict[str, Any]:
         item["available_from"] = available_from
         item["available_to"] = available_to
         items.append(item)
-    return {"items": items, "source": "mapper_csv", "warning": None}
+
+    warning: str | None = None
+    if include_archive and not archive_path.exists():
+        warning = f"Archive mapper file not found at {archive_path}. Searched latest only."
+    elif include_archive:
+        warning = "Archive results may contain stale/expired instruments."
+
+    return {
+        "items": items,
+        "source": "latest_plus_archive_mapper_csv" if include_archive else "latest_mapper_csv",
+        "warning": warning,
+        "include_archive": bool(include_archive),
+        "searched_latest_rows": len(latest_rows),
+        "searched_archive_rows": len(archive_rows),
+    }
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -478,7 +535,7 @@ async def get_all_equity() -> list[dict[str, Any]]:
 
 
 async def search_with_fallback(query: str, limit: int = 50) -> dict[str, Any]:
-    """Search MongoDB instruments first, fallback to mapper latest+archive CSV."""
+    """Search MongoDB instruments first, fallback to latest mapper CSV."""
     db = get_db()
     mongo_count = await db.instruments.count_documents({})
     q = query.strip()
@@ -489,6 +546,6 @@ async def search_with_fallback(query: str, limit: int = 50) -> dict[str, Any]:
         items = await search(q, limit)
         return {"items": items, "source": "mongo", "warning": None}
 
-    response = search_mapper_files(q, limit)
-    response["warning"] = response.get("warning") or "MongoDB instruments empty. Using mapper CSV files."
+    response = search_mapper_files(q, limit, include_archive=False)
+    response["warning"] = response.get("warning") or "MongoDB instruments empty. Using latest mapper CSV file."
     return response

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
+from backend.database.bootstrap import ensure_core_indexes
 from backend.database.connection import connect_db, close_db, get_db
 
 
@@ -14,6 +15,7 @@ from backend.database.connection import connect_db, close_db, get_db
 async def lifespan(app: FastAPI):
     """Startup/shutdown events — connect MongoDB, reset stale status (E-07)."""
     await connect_db()
+    await ensure_core_indexes()
 
     # Reset collector/calculator status on startup (E-07: stale PID after restart)
     try:

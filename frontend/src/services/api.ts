@@ -100,6 +100,11 @@ export const getMarketView = () =>
 export const getCatalog = () =>
   request<{ catalog: unknown[] }>('/historical/catalog');
 
+export const rebuildHistoricalCatalog = () =>
+  request<{ status: string; entries: number }>('/historical/catalog/rebuild', {
+    method: 'POST',
+  });
+
 export const getHistoricalBars = (token: number, tf: string, from: string, to: string) =>
   request<{ bars: unknown[]; total: number }>(`/historical/bars/${token}?timeframe=${tf}&date_from=${from}&date_to=${to}`);
 

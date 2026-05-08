@@ -352,6 +352,24 @@ function isTerminalIngestStatus(status: HistoricalIngestJob['status'] | string |
     || normalized === 'CANCELLED';
 }
 
+function formatIngestPhase(phase: string | undefined): string {
+  const key = String(phase || '').toUpperCase();
+  if (key === 'PENDING') return 'Queued';
+  if (key === 'FETCHING') return 'Fetching from Zerodha';
+  if (key === 'NORMALIZING') return 'Normalizing candles';
+  if (key === 'SAVING') return 'Uploading to MongoDB';
+  if (key === 'COMMITTING') return 'Committing rows';
+  if (key === 'CATALOG_REFRESH') return 'Refreshing catalog';
+  if (key === 'CLEANUP') return 'Cleanup';
+  if (key === 'CANCEL_REQUESTED') return 'Cancel requested';
+  if (key === 'CANCELLED') return 'Cancelled';
+  if (key === 'COMPLETED') return 'Completed';
+  if (key === 'FAILED') return 'Failed';
+  if (key === 'NO_DATA') return 'No data';
+  if (key === 'STALE') return 'Stale';
+  return key || 'Running';
+}
+
 export default function BacktestPage() {
   const { strategies, catalog, setResults, setStrategies, setCatalog, updateResult } = useBacktestStore();
   const sessionSnapshotRef = useRef<BacktestSessionV2 | null>(null);
@@ -1214,6 +1232,7 @@ export default function BacktestPage() {
         from_date: ingestFrom,
         to_date: ingestTo,
         interval: ingestInterval,
+        mode: 'skip_existing',
       });
       setIngestJob({
         job_id: resp.job_id,
@@ -1499,7 +1518,7 @@ export default function BacktestPage() {
               ) : (
                 <>
                   <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                    Instrument search uses mapper files: <code>zerodha_instruments_latest.csv</code> + <code>zerodha_instruments_archive.csv</code>.
+                    Instrument search uses <code>zerodha_instruments_latest.csv</code>. Archive is retained only for mapper deduplication/history.
                   </div>
                   <label className="stat-label">Search Zerodha Instrument</label>
                   <div className="backtest-inline-row">
@@ -1606,13 +1625,25 @@ export default function BacktestPage() {
                   ) : null}
                   {ingestJob ? (
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                      Job {ingestJob.job_id}: <b>{ingestJob.status}</b> ({ingestJob.phase || 'RUNNING'})
+                      Job {ingestJob.job_id}: <b>{ingestJob.status}</b> ({formatIngestPhase(ingestJob.phase)})
                       {' | '}chunk={ingestJob.current_chunk ?? 0}/{ingestJob.total_chunks ?? 0}
                       {' | '}fetched={ingestJob.rows_fetched ?? ingestJob.rows ?? 0}
                       {' | '}saved={ingestJob.saved_rows ?? 0}
                       {' | '}inserted={ingestJob.inserted ?? 0}
                       {' | '}modified={ingestJob.modified ?? 0}
+                      {' | '}skipped days={ingestJob.skipped_existing_dates ?? 0}
                       {ingestJob.error_message ? ` | ${ingestJob.error_message}` : ''}
+                    </div>
+                  ) : null}
+                  {ingestJob ? (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      rows/s: {Number(ingestJob.performance?.rows_per_second ?? 0).toFixed(2)}
+                      {' | '}chunks/s: {Number(ingestJob.performance?.chunks_per_second ?? 0).toFixed(3)}
+                      {' | '}fetch: {Number(ingestJob.performance?.fetch_seconds ?? 0).toFixed(2)}s
+                      {' | '}normalize: {Number(ingestJob.performance?.normalize_seconds ?? 0).toFixed(2)}s
+                      {' | '}write: {Number(ingestJob.performance?.write_seconds ?? 0).toFixed(2)}s
+                      {' | '}commit: {Number(ingestJob.performance?.commit_seconds ?? 0).toFixed(2)}s
+                      {' | '}catalog: {Number(ingestJob.performance?.catalog_refresh_seconds ?? 0).toFixed(2)}s
                     </div>
                   ) : null}
                   {ingestJob ? (

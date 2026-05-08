@@ -1,12 +1,14 @@
 """Historical data ingestion manager: fetch chunk-by-chunk and store in MongoDB."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from pymongo import UpdateOne
 
+from backend.config import settings
 from backend.database.sync_connection import get_sync_db
 from backend.historical.zerodha_fetcher import build_kite_client, iter_historical_chunks
 
@@ -22,7 +24,6 @@ _INTERVAL_TO_TIMEFRAME = {
     "day": "1day",
 }
 IST_TZ = ZoneInfo("Asia/Kolkata")
-WRITE_BATCH_SIZE = 1000
 
 
 class IngestCancelled(RuntimeError):
@@ -108,6 +109,9 @@ def ingest(
     requested_to = datetime.strptime(to_date, "%Y-%m-%d")
     requested_years = set(range(requested_from.year, requested_to.year + 1))
     max_supported_year = datetime.now(tz=IST_TZ).year + 1
+    write_batch_size = max(200, int(settings.HISTORICAL_WRITE_BATCH_SIZE))
+    cancel_check_seconds = max(0.1, float(settings.HISTORICAL_CANCEL_CHECK_SECONDS))
+    ingest_started_at = time.perf_counter()
 
     rows_fetched = 0
     rows_saved = 0
@@ -117,6 +121,10 @@ def ingest(
     last_saved_trading_date: str | None = None
     current_chunk = 0
     total_chunks = 0
+    fetch_seconds = 0.0
+    normalize_seconds = 0.0
+    write_seconds = 0.0
+    cancel_probe = {"last_check": 0.0, "value": False}
 
     def _emit(message: str) -> None:
         if event_callback:
@@ -135,27 +143,56 @@ def ingest(
             "requested_to_date": to_date,
             "first_saved_trading_date": first_saved_trading_date,
             "last_saved_trading_date": last_saved_trading_date,
+            "fetch_seconds": fetch_seconds,
+            "normalize_seconds": normalize_seconds,
+            "write_seconds": write_seconds,
         }
 
     def _raise_if_cancelled(checkpoint: str) -> None:
-        if should_cancel and should_cancel():
+        if not should_cancel:
+            return
+        now_tick = time.monotonic()
+        if (now_tick - cancel_probe["last_check"]) < cancel_check_seconds:
+            if cancel_probe["value"]:
+                _emit(f"Cancellation detected at {checkpoint}.")
+                raise IngestCancelled("Cancellation requested", stats=_stats_snapshot())
+            return
+        cancel_probe["last_check"] = now_tick
+        cancel_probe["value"] = bool(should_cancel())
+        if cancel_probe["value"]:
             _emit(f"Cancellation detected at {checkpoint}.")
             raise IngestCancelled("Cancellation requested", stats=_stats_snapshot())
 
+    def _throughput() -> tuple[float, float]:
+        elapsed = max(0.001, time.perf_counter() - ingest_started_at)
+        rows_per_second = float(rows_saved) / elapsed
+        chunks_per_second = float(current_chunk) / elapsed if current_chunk > 0 else 0.0
+        return rows_per_second, chunks_per_second
+
     _raise_if_cancelled("start")
 
-    for chunk in iter_historical_chunks(
-        kite,
-        instrument_token,
-        from_date,
-        to_date,
-        interval,
-    ):
+    chunk_stream = iter_historical_chunks(
+        kite=kite,
+        instrument_token=instrument_token,
+        from_date=from_date,
+        to_date=to_date,
+        interval=interval,
+    )
+    while True:
+        _raise_if_cancelled("before_chunk_fetch")
+        fetch_started = time.perf_counter()
+        try:
+            chunk = next(chunk_stream)
+        except StopIteration:
+            break
+        fetch_seconds += max(0.0, time.perf_counter() - fetch_started)
+
         _raise_if_cancelled("before_chunk")
         current_chunk = int(chunk.get("current_chunk", 0))
         total_chunks = int(chunk.get("total_chunks", 0))
         candles = chunk.get("rows") or []
         rows_fetched += len(candles)
+        rows_per_second, chunks_per_second = _throughput()
 
         if progress_callback:
             progress_callback(
@@ -168,9 +205,15 @@ def ingest(
                     "saved_rows": rows_saved,
                     "inserted": inserted,
                     "modified": modified,
+                    "fetch_seconds": fetch_seconds,
+                    "normalize_seconds": normalize_seconds,
+                    "write_seconds": write_seconds,
+                    "rows_per_second": rows_per_second,
+                    "chunks_per_second": chunks_per_second,
                 }
             )
 
+        normalize_started = time.perf_counter()
         deduped_by_ts: dict[str, UpdateOne] = {}
         for candle in candles:
             ts = candle.get("date")
@@ -201,6 +244,8 @@ def ingest(
                 continue
             deduped_by_ts[str(candle.get("date"))] = operation
 
+        normalize_seconds += max(0.0, time.perf_counter() - normalize_started)
+        rows_per_second, chunks_per_second = _throughput()
         operations = list(deduped_by_ts.values())
         if not operations:
             continue
@@ -208,7 +253,7 @@ def ingest(
         if progress_callback:
             progress_callback(
                 {
-                    "phase": "SAVING",
+                    "phase": "NORMALIZING",
                     "current_chunk": current_chunk,
                     "total_chunks": total_chunks,
                     "rows": rows_fetched,
@@ -216,17 +261,25 @@ def ingest(
                     "saved_rows": rows_saved,
                     "inserted": inserted,
                     "modified": modified,
+                    "fetch_seconds": fetch_seconds,
+                    "normalize_seconds": normalize_seconds,
+                    "write_seconds": write_seconds,
+                    "rows_per_second": rows_per_second,
+                    "chunks_per_second": chunks_per_second,
                 }
             )
 
-        for offset in range(0, len(operations), WRITE_BATCH_SIZE):
+        for offset in range(0, len(operations), write_batch_size):
             _raise_if_cancelled("before_write_batch")
-            batch = operations[offset: offset + WRITE_BATCH_SIZE]
+            batch = operations[offset: offset + write_batch_size]
+            write_started = time.perf_counter()
             result = db.bars.bulk_write(batch, ordered=False)
+            write_seconds += max(0.0, time.perf_counter() - write_started)
             inserted += int(result.upserted_count)
             modified += int(result.modified_count)
             rows_saved += len(batch)
             _raise_if_cancelled("after_write_batch")
+            rows_per_second, chunks_per_second = _throughput()
             if progress_callback:
                 progress_callback(
                     {
@@ -238,6 +291,11 @@ def ingest(
                         "saved_rows": rows_saved,
                         "inserted": inserted,
                         "modified": modified,
+                        "fetch_seconds": fetch_seconds,
+                        "normalize_seconds": normalize_seconds,
+                        "write_seconds": write_seconds,
+                        "rows_per_second": rows_per_second,
+                        "chunks_per_second": chunks_per_second,
                     }
                 )
 
@@ -257,7 +315,13 @@ def ingest(
             "last_saved_trading_date": None,
             "current_chunk": current_chunk,
             "total_chunks": total_chunks,
+            "fetch_seconds": fetch_seconds,
+            "normalize_seconds": normalize_seconds,
+            "write_seconds": write_seconds,
+            "rows_per_second": 0.0,
+            "chunks_per_second": 0.0,
         }
+    rows_per_second, chunks_per_second = _throughput()
     return {
         "status": "ok",
         "rows": rows_fetched,
@@ -271,4 +335,9 @@ def ingest(
         "last_saved_trading_date": last_saved_trading_date,
         "current_chunk": current_chunk,
         "total_chunks": total_chunks,
+        "fetch_seconds": fetch_seconds,
+        "normalize_seconds": normalize_seconds,
+        "write_seconds": write_seconds,
+        "rows_per_second": rows_per_second,
+        "chunks_per_second": chunks_per_second,
     }
